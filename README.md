@@ -32,33 +32,17 @@
 
 ---
 
-## ⚠️ 安全须知（务必先读）
-
-本机器人调用 Codex 时固定使用 **`approvalPolicy: "never"` + `sandbox: "danger-full-access"`** —— 即 **无任何人工审批、对磁盘完全访问**。这意味着：
-
-> **任何能在项目群里给机器人发消息的人，都能在你这台机器上、以你的身份、在该项目目录里执行任意命令（读写文件、联网、运行脚本）。**
-
-因此：
-
-- 只把**你信任的人**拉进项目群；
-- 在**你自己掌控的机器/账号**上运行，最好是隔离的开发机或容器；
-- 绑定的项目目录里不要放你不愿被读写的敏感数据；
-- 它不是多租户托管服务，是给你（和你信任的小团队）自用的桥。
-
----
-
 ## 📦 前置条件
 
 | 依赖 | 说明 | 获取方式 |
 |------|------|----------|
 | **Node.js ≥ 20** | 运行时 | <https://nodejs.org> 或 `nvm install 20` |
-| **Codex CLI** | 后端，bridge 会 spawn `codex app-server` | `npm i -g @openai/codex`，或安装 Codex.app，或用环境变量 `CODEX_BIN` 指向已有二进制 |
-| **Codex 已登录** | app-server 需要 `~/.codex/auth.json` | 运行 `codex login` |
-| **飞书 / Lark 账号** | 且该租户允许「扫码创建应用」（个人/开发者租户一般可以；部分企业租户由管理员限制） | 首次 `run` 时扫码即可创建 |
-| **lark-cli**（可选，但用「文档评论回复」**强烈建议装**） | 仅「文档评论回复」用到：要回答「总结本文 / 这段写得对吗」这类**需要读文档正文**的问题时，Codex 靠 `lark-cli` 去读文档（回复本身由桥用 SDK 以机器人身份发，不依赖它）。不装也能跑，但机器人只能凭评论里给到的上下文作答，读不到正文。 | 安装并 `lark-cli auth login` 登录（与本机 lark-* 技能同款的那个 lark-cli），确保 Codex 能在 PATH 上直接调用 |
+| **Codex CLI** | 后端，bridge 会 spawn `codex app-server` | `npm i -g @openai/codex`，或装 Codex.app，或用 `CODEX_BIN` 指向已有二进制 |
+| **Codex 已登录** | app-server 需要 `~/.codex/auth.json` | `codex login` |
+| **飞书 / Lark 账号** | 租户需允许「扫码创建应用」（个人/开发者租户一般可以） | 首次 `run` 时扫码创建 |
+| **lark-cli**（可选） | 仅「文档评论回复」需读文档正文时用到；不装也能跑，只是读不到正文 | `lark-cli auth login`，确保在 PATH 上 |
 
-> 机器人**收发消息、回卡片、发评论回复**全部走 `@larksuiteoapi/node-sdk` 长连接，核心功能**不依赖** `lark-cli`。`lark-cli` 只是「文档评论回复」里让 Codex **读文档正文**的途径——见上表。
-> ⚠️ `lark-cli` 以**你的用户身份**登录，所以 Codex 只应用它来**读**；prompt 已明确禁止 Codex 用它发评论（否则评论会署成你本人，而不是机器人）。
+> 收发消息、回卡片、发评论回复均走 `@larksuiteoapi/node-sdk` 长连接，**不依赖** `lark-cli`。⚠️ `lark-cli` 以**你的身份**登录，仅供 Codex **读**文档；prompt 已禁止用它发评论（否则评论会署你本人）。
 
 ---
 
@@ -236,6 +220,21 @@ src/
 ```
 
 架构与实现细节见 [`docs/design/feishu-codex-bridge-design.md`](docs/design/feishu-codex-bridge-design.md) 与 [`docs/design/implementation-plan.md`](docs/design/implementation-plan.md)。
+
+---
+
+## ⚠️ 安全须知
+
+本机器人调用 Codex 时固定使用 **`approvalPolicy: "never"` + `sandbox: "danger-full-access"`** —— 即 **无任何人工审批、对磁盘完全访问**。这意味着：
+
+> **任何能在项目群里给机器人发消息的人，都能在你这台机器上、以你的身份、在该项目目录里执行任意命令（读写文件、联网、运行脚本）。**
+
+因此：
+
+- 只把**你信任的人**拉进项目群；
+- 在**你自己掌控的机器/账号**上运行，最好是隔离的开发机或容器；
+- 绑定的项目目录里不要放你不愿被读写的敏感数据；
+- 它不是多租户托管服务，是给你（和你信任的小团队）自用的桥。
 
 ---
 

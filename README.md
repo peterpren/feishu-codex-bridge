@@ -61,10 +61,10 @@
 
 ```bash
 # 推荐：全局安装到稳定路径（后台常驻服务需要稳定的 CLI 路径）
-npm i -g @modelzen/feishu-codex-bridge
+npm i -g @clayz/feishu-codex-bridge
 
 # 或：只想先试一下 / 只为完成首次扫码（免安装，单次运行）
-npx -y @modelzen/feishu-codex-bridge@latest start
+npx -y @clayz/feishu-codex-bridge@latest start
 ```
 
 > 装好后命令名是 `feishu-codex-bridge`（不带 scope）。

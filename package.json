@@ -1,5 +1,5 @@
 {
-  "name": "@modelzen/feishu-codex-bridge",
+  "name": "@clayz/feishu-codex-bridge",
   "version": "0.0.1",
   "description": "Bridge Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
   "type": "module",

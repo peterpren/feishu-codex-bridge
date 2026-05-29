@@ -10,6 +10,13 @@ export interface BridgeOptions {
   fallbackCwd: string;
 }
 
+export interface BridgeHandle {
+  channel: LarkChannel;
+  /** Graceful teardown: close every codex session (no orphan app-servers) then
+   *  drop the long connection. Idempotent enough for a signal handler. */
+  shutdown: () => Promise<void>;
+}
+
 /**
  * Bring up the long-connection bot. Wires the `message` handler (group @bot →
  * 会话配置卡 → reply_in_thread topic → codex → streaming card) and the
@@ -17,7 +24,7 @@ export interface BridgeOptions {
  * share run state via the orchestrator. Long-connection is required for
  * `card.action.trigger` (lark-cli doesn't deliver it).
  */
-export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
+export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   const app = opts.cfg.accounts.app;
   const channel = createLarkChannel({
     appId: app.id,
@@ -46,5 +53,13 @@ export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
 
   await channel.connect();
   log.info('ws', 'connected', { appId: app.id, fallbackCwd: opts.fallbackCwd });
-  return channel;
+
+  let closed = false;
+  const shutdown = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await orchestrator.shutdown();
+    await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
+  };
+  return { channel, shutdown };
 }

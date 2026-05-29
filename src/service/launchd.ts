@@ -66,7 +66,7 @@ export function buildPlist(): string {
   <array>
     <string>${escapeXml(nodePath)}</string>
     <string>${escapeXml(cliBinPath)}</string>
-    <string>start</string>
+    <string>run</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

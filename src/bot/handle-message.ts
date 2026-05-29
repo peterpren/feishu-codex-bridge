@@ -77,6 +77,9 @@ interface RunReaction {
 export interface Orchestrator {
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   dispatcher: CardDispatcher;
+  /** Close every live codex session (SIGKILLs the app-server children) so a
+   *  graceful exit leaves no orphan processes. */
+  shutdown: () => Promise<void>;
 }
 
 /**
@@ -1106,7 +1109,16 @@ export function createOrchestrator(
     }
   }
 
-  return { onMessage, dispatcher };
+  async function shutdown(): Promise<void> {
+    const live = [...sessions.values()];
+    sessions.clear();
+    // close() SIGKILLs each app-server child; settle all so one hang/throw
+    // doesn't block reaping the rest.
+    await Promise.allSettled(live.map((t) => t.close()));
+    log.info('bridge', 'shutdown', { closed: live.length });
+  }
+
+  return { onMessage, dispatcher, shutdown };
 }
 
 /** Resolve a message's thread_id via raw API (reply response omits it). */

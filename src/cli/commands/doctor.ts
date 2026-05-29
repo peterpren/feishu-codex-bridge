@@ -2,7 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { paths } from '../../config/paths';
+import { paths, useBotDir } from '../../config/paths';
+import { ensureRegistry, currentBot } from '../../config/bots';
 import { resolveCodexBin, codexVersion } from '../../agent/codex-appserver/locate';
 
 interface Check {
@@ -48,12 +49,26 @@ export async function runDoctor(): Promise<void> {
       : { name: 'lark-cli', ok: false, detail: '未找到（onboarding 会装到私有目录）' },
   );
 
-  // bridge config
-  checks.push(
-    existsSync(paths.configFile)
-      ? { name: 'bridge 配置', ok: true, detail: paths.configFile }
-      : { name: 'bridge 配置', ok: false, detail: '未配置，运行 `feishu-codex-bridge start` 完成 onboarding' },
-  );
+  // bridge config — resolve the current bot (migrating a legacy flat install)
+  // and check ITS config dir, not the top-level one.
+  const reg = await ensureRegistry();
+  const cur = currentBot(reg);
+  if (cur) useBotDir(cur.appId);
+  if (cur && existsSync(paths.configFile)) {
+    checks.push({
+      name: 'bridge 配置',
+      ok: true,
+      detail: `当前机器人「${cur.name}」(${cur.appId})  共 ${reg.bots.length} 个`,
+    });
+  } else if (cur) {
+    checks.push({ name: 'bridge 配置', ok: false, detail: `配置文件缺失：${paths.configFile}` });
+  } else {
+    checks.push({
+      name: 'bridge 配置',
+      ok: false,
+      detail: '未配置，运行 `feishu-codex-bridge run`（或 `bot init`）扫码创建',
+    });
+  }
 
   // render
   console.log('\n🩺 feishu-codex-bridge 自检\n');

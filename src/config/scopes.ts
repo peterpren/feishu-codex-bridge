@@ -22,8 +22,8 @@ export const REQUIRED_SCOPES = [
   'im:message.group_msg', // ALL group messages (高敏感) — required for 免@ (respond without @)
   'im:message.p2p_msg:readonly', // DM console messages
   'im:message:send_as_bot', // reply_in_thread / send cards
-  'im:message.pin:write_only', // Pin the welcome/command card to the group's Pins tab (im.v1.pin.create)
-  'im:message.reaction:write_only', // ⏳/🫳 run-status emoji reactions (best-effort, requested up front so it works)
+  'im:message.pins:write_only', // Pin the welcome/command card to the group's Pins tab (im.v1.pin.create) — NOTE: plural `pins`
+  'im:message.reactions:write_only', // ⏳/🫳 run-status emoji reactions (best-effort) — NOTE: plural `reactions`
   'im:resource', // upload/download images & resources
   'im:chat:create', // create the project group
   'im:chat:update', // transfer ownership on unbind

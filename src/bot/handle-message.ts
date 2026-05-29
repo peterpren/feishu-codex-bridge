@@ -139,7 +139,7 @@ export function createOrchestrator(
 
   // Feishu gives bots no way to mark a message "已读" (read receipts are a
   // human-client signal), so a reaction stands in for one. Best-effort — a
-  // missing im:message.reaction:write scope just means no reaction appears.
+  // missing im:message.reactions:write_only scope just means no reaction appears.
   async function addReaction(messageId: string, emoji: string): Promise<string | undefined> {
     try {
       const r = await channel.rawClient.im.v1.messageReaction.create({

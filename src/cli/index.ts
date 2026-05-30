@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { runDoctor } from './commands/doctor';
 import { runRun } from './commands/run';
@@ -7,10 +10,23 @@ import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/s
 
 const program = new Command();
 
+// Read the real version from package.json at runtime. The bundled entry lives at
+// dist/cli.js, so package.json sits one level up — same in the published tarball
+// and in a local build. Falling back to '0.0.0' keeps `--version` from crashing
+// if the file is ever missing; a hardcoded literal silently lies after a bump.
+function readVersion(): string {
+  try {
+    const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    return (JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: string }).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
 program
   .name('feishu-codex-bridge')
   .description('把飞书/Lark 桥接到本机 Codex（项目=群, 话题=会话）')
-  .version('0.0.1');
+  .version(readVersion());
 
 // ── 进程 / 守护 ──────────────────────────────────────────────
 program

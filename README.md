@@ -114,7 +114,7 @@ feishu-codex-bridge bot rm <名>     # 移除一个机器人配置
 
 启动时若有缺失权限，会**自动打开浏览器**到形如 `https://open.feishu.cn/app/<app_id>/auth?q=...` 的页面（同时在终端打印链接），**一次性勾选全部 → 确认**即可（即时生效、无需重启）。`start`（后台 daemon）会阻塞到这步开通完成才装服务。
 
-本桥需要的全部权限以 [`src/config/scopes.ts`](src/config/scopes.ts) 的 `REQUIRED_SCOPES` 为权威清单，包含：收群 @ 消息 / 全量群消息（免 @）/ 私聊消息、以机器人身份发消息与回话题、消息置顶、表情回复、上传下载资源、建群 / 转让群主、群公告读写、置顶横幅、群标签页、交互卡片。**这些都在首次开通链接里一并申请，正常用不会再遇到「权限不足」。**
+本桥需要的全部权限以 [`src/config/scopes.ts`](src/config/scopes.ts) 的 `REQUIRED_SCOPES` 为权威清单，包含：收群 @ 消息 / 全量群消息（免 @）/ 私聊消息、以机器人身份发消息与回话题、消息置顶、表情回复、上传下载资源、建群 / 转让群主 / 设群管理员、群公告读写、置顶横幅、群标签页、交互卡片。**这些都在首次开通链接里一并申请，正常用不会再遇到「权限不足」。**
 
 > 「**文档评论回复**」功能另需 `docs:document.comment:read`、`docs:document.comment:create`、`wiki:wiki:readonly` 三项（见 `COMMENT_SCOPES`）。它们**已预勾选进同一个开通链接**，但**不属于** `REQUIRED_SCOPES` —— 不开通也不会卡住后台服务安装，只是该功能静默关闭。
 

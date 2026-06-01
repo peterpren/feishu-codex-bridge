@@ -29,6 +29,7 @@ export const REQUIRED_SCOPES = [
   'im:resource', // upload/download images & resources
   'im:chat:create', // create the project group
   'im:chat:update', // transfer ownership on unbind
+  'im:chat.managers:write_only', // promote the project creator to group admin (im.v1.chat.managers.add_managers)
   'im:chat.announcement:read', // read group announcement blocks (list)
   'im:chat.announcement:write_only', // write group announcement blocks (create/delete)
   'im:chat.top_notice:write_only', // pin the announcement to the top banner

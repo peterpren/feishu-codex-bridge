@@ -9,6 +9,7 @@ import {
   isAdmin,
   isChatAllowed,
   isUserAllowed,
+  secretKeyForApp,
   type AppConfig,
   type AppPreferences,
   type PendingPolicy,
@@ -62,6 +63,9 @@ import { resolveCodexBin, codexVersion } from '../agent/codex-appserver/locate';
 import { serviceStdoutPath, serviceStderrPath } from '../service/launchd';
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
+import { getSecret } from '../config/keystore';
+import { buildScopeGrantUrl } from '../config/scopes';
+import { validateAppCredentials } from '../utils/feishu-auth';
 import { getProjectByChatId, listProjects, removeProject, updateProject, type Project } from '../project/registry';
 import { createProject } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
@@ -785,6 +789,16 @@ export function createOrchestrator(
     .on(DM.doctor, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const codexBin = resolveCodexBin();
+      // 飞书权限自检：读 keystore 里的 App Secret → 换 tenant_access_token → 查已开通
+      // scope（application/v6/scopes 的 grant_status，含 im:message.group_msg 等事件订阅
+      // 类）。任一步失败时 missingScopes 留 undefined，卡片显示「无法自动检查」而非误报
+      // 缺失。复用 onboarding 同一条校验路径，单一事实源。
+      const app = cfg.accounts.app;
+      const secret = await getSecret(secretKeyForApp(app.id)).catch(() => undefined);
+      const scopeCheck = secret
+        ? await validateAppCredentials(app.id, secret, app.tenant).catch(() => undefined)
+        : undefined;
+      const missingScopes = scopeCheck?.missingScopes;
       const info: DoctorInfo = {
         codexOk: await backend.isAvailable().catch(() => false),
         codexVer: codexBin ? codexVersion(codexBin) : null,
@@ -795,6 +809,13 @@ export function createOrchestrator(
         logStdout: serviceStdoutPath(),
         logStderr: serviceStderrPath(),
         configFile: paths.configFile,
+        missingScopes,
+        // 缺失时预选缺失项（精准开通）；查不到/全开通时预选全部必需 scope 供核对。
+        scopeGrantUrl: buildScopeGrantUrl(
+          app.id,
+          app.tenant,
+          missingScopes && missingScopes.length ? missingScopes : undefined,
+        ),
       };
       // A reply card (not a patch of the menu) so the diagnosis persists below
       // the console; re-open the menu by messaging the bot.

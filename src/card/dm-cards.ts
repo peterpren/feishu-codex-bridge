@@ -202,6 +202,18 @@ export interface DoctorInfo {
   logStderr: string;
   /** current bot's config.json path */
   configFile: string;
+  /**
+   * 飞书权限自检：尚未开通的必需 scope（来自 application/v6/scopes 的 grant_status，
+   * 含 im:message.group_msg 等事件订阅类）。`undefined` = 没查成（凭证失效 / 网络
+   * 不通 / 接口不可用），与 `[]`（全部已开通）严格区分，卡片据此分三态渲染——
+   * 绝不把"查不到"误报成"缺失"。
+   */
+  missingScopes?: string[];
+  /**
+   * 开放平台「权限管理」一键开通页：缺失时预选缺失项、否则预选全部必需 scope。
+   * 用户点开即已勾好待申请权限，保存即生效（自建应用无需审核）。
+   */
+  scopeGrantUrl: string;
 }
 
 /** Friendly label for a long-connection state; unknown states show raw. */
@@ -218,6 +230,35 @@ function connLabel(state: string): string {
     default:
       return state;
   }
+}
+
+/** One-line 飞书权限 status for the copy-paste codex prompt (plain text). */
+function scopeStatusText(i: DoctorInfo): string {
+  if (i.missingScopes === undefined) return '未能自动检查（凭证失效或网络问题）';
+  if (i.missingScopes.length === 0) return '必需权限齐全';
+  return `缺失 ${i.missingScopes.length} 项：${i.missingScopes.join(' ')}`;
+}
+
+/**
+ * 「飞书权限」诊断块：把 {@link DoctorInfo.missingScopes} 的三态渲染成一行状态，
+ * 缺失或查不到时再附一个直达开放平台、已预选待开通 scope 的「去开通」按钮——
+ * 用户点开即勾好、保存即生效，无需自己对照清单。
+ */
+function scopeDiagnosis(i: DoctorInfo): CardElement[] {
+  if (i.missingScopes === undefined) {
+    return [
+      md('- 飞书权限：⚠️ 无法自动检查（凭证失效或网络不通）'),
+      actions([linkButton('🔑 去权限页核对', i.scopeGrantUrl)]),
+    ];
+  }
+  if (i.missingScopes.length === 0) {
+    return [md('- 飞书权限：✅ 必需权限已全部开通')];
+  }
+  return [
+    md(`- 飞书权限：❌ 缺 ${i.missingScopes.length} 项 —— 开通前相关功能（收发消息 / 卡片 / 建群等）不可用`),
+    note(`待开通：${i.missingScopes.join('　')}`),
+    actions([linkButton('🔑 一键去开通这些权限', i.scopeGrantUrl)]),
+  ];
 }
 
 /**
@@ -240,6 +281,7 @@ function codexDiagnosePrompt(i: DoctorInfo): string {
     '【运行快照】',
     `- codex 可用：${i.codexOk ? '是' : '否'}`,
     `- 飞书长连接：${i.conn}`,
+    `- 飞书权限：${scopeStatusText(i)}`,
     '',
     '【请你做的事】',
     '1. 读取并分析日志，找出最近的报错或异常堆栈：',
@@ -264,6 +306,8 @@ function codexDiagnosePrompt(i: DoctorInfo): string {
  */
 export function buildDoctorCard(i: DoctorInfo): CardObject {
   const prompt = codexDiagnosePrompt(i);
+  // codex 不可用、或明确查到缺权限 → 橙色警示；"没查成"(undefined) 不算硬故障，保持蓝。
+  const hasProblem = !i.codexOk || (i.missingScopes !== undefined && i.missingScopes.length > 0);
   return card(
     [
       md('**初步诊断**'),
@@ -271,6 +315,7 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
         `- Codex：${i.codexOk ? `✅ 可用${i.codexVer ? `（${i.codexVer}）` : ''}` : '❌ 不可用（检查 CODEX_BIN / PATH）'}`,
       ),
       md(`- 飞书长连接：${connLabel(i.conn)}`),
+      ...scopeDiagnosis(i),
       note(`bridge v${i.bridgeVer}　·　Node ${i.node}　·　${i.platform}`),
       hr(),
       md('**日志路径**'),
@@ -285,7 +330,7 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
         linkButton('🐞 提 Issue', `${REPO}/issues`),
       ]),
     ],
-    { header: { title: '🩺 诊断', template: i.codexOk ? 'blue' : 'orange' } },
+    { header: { title: '🩺 诊断', template: hasProblem ? 'orange' : 'blue' } },
   );
 }
 

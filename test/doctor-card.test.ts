@@ -12,6 +12,8 @@ function info(over: Partial<DoctorInfo> = {}): DoctorInfo {
     logStdout: '/Users/me/.feishu-codex-bridge/service.log',
     logStderr: '/Users/me/.feishu-codex-bridge/service.err.log',
     configFile: '/Users/me/.feishu-codex-bridge/bots/cli_x/config.json',
+    missingScopes: [], // healthy baseline: all required scopes granted
+    scopeGrantUrl: 'https://open.feishu.cn/app/cli_x/auth?q=',
     ...over,
   };
 }
@@ -23,6 +25,21 @@ function codeBlock(card: object): string {
   if (!m) throw new Error('no fenced code block in doctor card');
   // unescape the JSON string back into the literal prompt text
   return JSON.parse(`"${m[1]}"`) as string;
+}
+
+/** Every open_url default_url anywhere in the card tree. */
+function collectUrls(card: object): string[] {
+  const urls: string[] = [];
+  const walk = (n: unknown): void => {
+    if (Array.isArray(n)) n.forEach(walk);
+    else if (n && typeof n === 'object') {
+      const o = n as Record<string, unknown>;
+      if (o.type === 'open_url' && typeof o.default_url === 'string') urls.push(o.default_url);
+      Object.values(o).forEach(walk);
+    }
+  };
+  walk(card);
+  return urls;
 }
 
 describe('buildDoctorCard', () => {
@@ -90,5 +107,42 @@ describe('buildDoctorCard', () => {
     walk(buildDoctorCard(info()));
     expect(urls).toContain('https://github.com/modelzen/feishu-codex-bridge');
     expect(urls).toContain('https://github.com/modelzen/feishu-codex-bridge/issues');
+  });
+});
+
+describe('buildDoctorCard — 飞书权限自检', () => {
+  const GRANT = 'https://open.feishu.cn/app/cli_x/auth?q=im%3Amessage.group_msg%2Ccardkit%3Acard%3Awrite';
+
+  it('lists missing scopes with an orange header and a one-click grant button', () => {
+    const card = buildDoctorCard(
+      info({ missingScopes: ['im:message.group_msg', 'cardkit:card:write'], scopeGrantUrl: GRANT }),
+    );
+    const json = JSON.stringify(card);
+    expect((card as { header: { template: string } }).header.template).toBe('orange');
+    expect(json).toContain('缺 2 项');
+    expect(json).toContain('im:message.group_msg');
+    expect(json).toContain('cardkit:card:write');
+    expect(collectUrls(card)).toContain(GRANT); // grant button → developer-console auth page
+  });
+
+  it('confirms all granted (no grant button, stays blue) when missingScopes is empty', () => {
+    const card = buildDoctorCard(info({ missingScopes: [], scopeGrantUrl: GRANT }));
+    expect((card as { header: { template: string } }).header.template).toBe('blue');
+    expect(JSON.stringify(card)).toContain('必需权限已全部开通');
+    expect(collectUrls(card)).not.toContain(GRANT); // nothing to grant → no button
+  });
+
+  it('says 无法自动检查 with a verify button, header stays blue, when the check could not run', () => {
+    const card = buildDoctorCard(info({ missingScopes: undefined, scopeGrantUrl: GRANT }));
+    expect(JSON.stringify(card)).toContain('无法自动检查');
+    // undefined = "couldn't check", NOT a hard failure → header stays blue (codex still ok)
+    expect((card as { header: { template: string } }).header.template).toBe('blue');
+    expect(collectUrls(card)).toContain(GRANT);
+  });
+
+  it('carries the scope status into the copy-paste codex prompt (all three states)', () => {
+    expect(codeBlock(buildDoctorCard(info({ missingScopes: ['im:resource'] })))).toContain('缺失 1 项');
+    expect(codeBlock(buildDoctorCard(info({ missingScopes: [] })))).toContain('必需权限齐全');
+    expect(codeBlock(buildDoctorCard(info({ missingScopes: undefined })))).toContain('未能自动检查');
   });
 });

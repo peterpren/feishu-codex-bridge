@@ -5,6 +5,7 @@ import { Command } from 'commander';
 import { runDoctor } from './commands/doctor';
 import { runRun } from './commands/run';
 import { runStart, runStop, runRestart, runStatus, runLogs } from './commands/daemon';
+import { runUpdate } from './commands/update';
 import { runBotInit, runBotList, runBotUse, runBotRm } from './commands/bot';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
 
@@ -70,6 +71,14 @@ program
   .option('-f, --follow', '持续跟随日志')
   .action(async (options: { follow?: boolean }) => {
     await runLogs(Boolean(options.follow));
+  });
+
+program
+  .command('update')
+  .description('更新到最新版（npm i -g），并自动重启后台 daemon')
+  .option('--check', '只检查有无新版，不安装')
+  .action(async (options: { check?: boolean }) => {
+    await runUpdate({ check: Boolean(options.check) });
   });
 
 // ── 飞书机器人管理 ───────────────────────────────────────────

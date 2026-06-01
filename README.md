@@ -83,7 +83,10 @@ feishu-codex-bridge status     # 状态 / pid / 日志路径 / 上次退出码
 feishu-codex-bridge logs -f    # 跟踪日志
 feishu-codex-bridge restart    # 重启
 feishu-codex-bridge stop       # 停止并关闭开机自启
+feishu-codex-bridge update     # 更新到最新版（npm i -g）并自动重启 daemon（--check 只查不装）
 ```
+
+> 💡 升级很省事：装了后台 daemon 的，直接 `feishu-codex-bridge update` 一条命令 = 拉最新版 + 自动 `restart`；也可在**私聊管理台**点 **⬆️ 版本更新** 按钮，机器人自更新后重启服务。
 
 `start` 会**先在当前终端完成 init**（没配置则扫码），并**阻塞到授权完成**——权限全部开通、且你确认已订阅事件/发布版本——才真正装服务，绝不会装一个收不到消息的空壳。daemon 体跑的就是 `run`。
 
@@ -193,6 +196,7 @@ feishu-codex-bridge bot rm <名>     # 移除一个机器人配置
 feishu-codex-bridge run                前台启动（没配置先扫码 init；Ctrl+C 优雅退出）
 feishu-codex-bridge start              后台 daemon 启动（装 launchd 开机自启；阻塞到授权完成）
 feishu-codex-bridge stop|restart|status|logs   后台 daemon 生命周期
+feishu-codex-bridge update             更新到最新版并自动重启 daemon（--check 只查不装）
 feishu-codex-bridge bot init|list|use|rm       多飞书机器人：注册 / 列表 / 切当前 / 移除
 feishu-codex-bridge doctor             本地自检：codex / 登录 / lark-cli / 当前机器人
 ```
@@ -220,7 +224,7 @@ src/
   project/    项目注册表、建群/公告/标签页 onboarding、生命周期
   config/     加密密钥库、密钥解析、配置存储、多机器人注册表、scope 清单、路径
   core/       watchdog、单实例锁、日志
-  cli/        commander 命令（run / start / stop / restart / status / logs / bot / doctor / secrets）
+  cli/        commander 命令（run / start / stop / restart / status / logs / update / bot / doctor / secrets）
   service/    launchd 后台服务
 ```
 

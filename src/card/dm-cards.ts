@@ -25,6 +25,8 @@ export const DM = {
   settings: 'dm.settings',
   doctor: 'dm.doctor',
   reconnect: 'dm.reconnect',
+  update: 'dm.update',
+  updateDo: 'dm.update.do',
   rmConfirm: 'dm.rmConfirm',
   rmDo: 'dm.rmDo',
   rmCancel: 'dm.rmCancel',
@@ -58,10 +60,121 @@ export function buildDmMenuCard(): CardObject {
       actions([
         button('🩺 诊断', { a: DM.doctor }),
         button('🔄 重连', { a: DM.reconnect }),
+        button('⬆️ 版本更新', { a: DM.update }),
       ]),
     ],
     { header: { title: '🤖 Codex Bridge 管理台', template: 'blue' } },
   );
+}
+
+/** State for the version-update card across its phases (check → install → done). */
+export interface UpdateCardState {
+  phase: 'checking' | 'checked' | 'updating' | 'done' | 'error';
+  current?: string;
+  latest?: string | null;
+  /** checked phase: handler-computed `isNewer(latest, current)` */
+  hasUpdate?: boolean;
+  /** checked phase: running from a git checkout — steer to git pull, not npm */
+  dev?: boolean;
+  /** done/updating/error phase: version we updated from */
+  from?: string;
+  /** done phase: version we updated to */
+  to?: string;
+  /** done phase: whether the background daemon will be restarted now */
+  willRestart?: boolean;
+  /** error phase: tail of npm output */
+  message?: string;
+}
+
+const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
+
+/**
+ * Version-update console card. A single builder renders every phase so the same
+ * card updates in place: 查询中 → 查询结果(有/无更新/源码态) → 更新中 → 完成/失败.
+ * The 「立即更新」button (checked + hasUpdate) carries DM.updateDo.
+ */
+export function buildUpdateCard(state: UpdateCardState): CardObject {
+  switch (state.phase) {
+    case 'checking':
+      return card([md('⏳ 正在查询最新版本…'), note('从 npm registry 拉取版本信息，请稍候。')], {
+        header: { title: '⬆️ 版本更新', template: 'turquoise' },
+      });
+
+    case 'checked': {
+      const cur = state.current ?? '?';
+      if (!state.latest) {
+        return card(
+          [
+            md(`当前版本：**v${cur}**`),
+            md('⚠️ 查不到最新版本（网络或 npm registry 问题）。'),
+            actions([button('🔄 重试', { a: DM.update }), button('⬅️ 菜单', { a: DM.menu })]),
+          ],
+          { header: { title: '⬆️ 版本更新', template: 'red' } },
+        );
+      }
+      if (!state.hasUpdate) {
+        return card(
+          [md(`✅ 已是最新版本：**v${cur}**`), backToMenu()],
+          { header: { title: '⬆️ 版本更新', template: 'green' } },
+        );
+      }
+      const head = [
+        md(`发现新版本 🎉`),
+        note(`当前 v${cur}  →  最新 v${state.latest}`),
+      ];
+      if (state.dev) {
+        return card(
+          [
+            ...head,
+            md('检测到**源码开发模式**（仓库内有 .git）。请在终端用 `git pull && npm i` 更新，而不是全局安装。'),
+            backToMenu(),
+          ],
+          { header: { title: '⬆️ 版本更新', template: 'orange' } },
+        );
+      }
+      return card(
+        [
+          ...head,
+          note('点「立即更新」会执行 `npm i -g` 并自动重启后台服务（约数十秒）。'),
+          actions([
+            button('⬆️ 立即更新', { a: DM.updateDo }, 'primary'),
+            button('⬅️ 菜单', { a: DM.menu }),
+          ]),
+        ],
+        { header: { title: '⬆️ 版本更新', template: 'blue' } },
+      );
+    }
+
+    case 'updating':
+      return card(
+        [
+          md(`⏳ 正在更新到最新版…`),
+          note(`从 v${state.from ?? '?'} 升级中，下载安装约数十秒，请勿重复点击。`),
+        ],
+        { header: { title: '⬆️ 版本更新', template: 'turquoise' } },
+      );
+
+    case 'done': {
+      const tail = state.willRestart
+        ? note('正在重启后台服务以生效 —— 重启期间本卡片停止更新；稍后发我任意消息可重开管理台。')
+        : note('前台模式：请在终端手动重启 `run` 进程使新版本生效。');
+      return card(
+        [md(`✅ 已更新 **v${state.from ?? '?'} → v${state.to ?? '?'}**`), tail],
+        { header: { title: '⬆️ 版本更新', template: 'green' } },
+      );
+    }
+
+    case 'error':
+      return card(
+        [
+          md('❌ **更新失败**'),
+          state.message ? note(state.message) : note('npm 安装未成功。'),
+          md('可在终端手动执行：`npm i -g ' + '@modelzen/feishu-codex-bridge@latest`（必要时加 sudo）。'),
+          actions([button('🔄 重试', { a: DM.update }), button('⬅️ 菜单', { a: DM.menu })]),
+        ],
+        { header: { title: '⬆️ 版本更新', template: 'red' } },
+      );
+  }
 }
 
 /** Interactive new-project form: project name + optional CWD, submit/cancel. */

@@ -43,9 +43,19 @@ import {
   buildProjectListCard,
   buildRmConfirmCard,
   buildSettingsCard,
+  buildUpdateCard,
   DM,
   GS,
 } from '../card/dm-cards';
+import {
+  currentVersion,
+  daemonRunning,
+  installLatest,
+  isDevSource,
+  isNewer,
+  latestVersion,
+  restartDaemon,
+} from '../service/update';
 import { getProjectByChatId, listProjects, removeProject, updateProject, type Project } from '../project/registry';
 import { createProject } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
@@ -780,6 +790,63 @@ export function createOrchestrator(
       await channel
         .send(evt.chatId, { markdown: `🔄 长连接状态：**${conn}**\nSDK 会自动重连；若长期断开，请在终端重跑 \`feishu-codex-bridge run\`（前台）或 \`feishu-codex-bridge restart\`（后台守护）。` }, { replyTo: evt.messageId })
         .catch(() => undefined);
+    })
+    // 版本更新（检查）：查 npm 最新版，渲染结果。npm view 走异步 execFile —— 卡片
+    // 回调里**绝不能** spawnSync，否则冻结整条 event loop。先 settle 再更新，避开
+    // 点击回调窗口；checking→checked 是顺序 await，天然有序。
+    .on(DM.update, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void (async () => {
+        await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+        await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'checking' })).catch(
+          () => undefined,
+        );
+        const current = currentVersion();
+        const latest = await latestVersion().catch(() => null);
+        const hasUpdate = !!latest && isNewer(latest, current);
+        log.info('console', 'update-check', { current, latest, hasUpdate });
+        await updateManagedCard(
+          channel,
+          evt.messageId,
+          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+        ).catch((e) => log.fail('console', e, { phase: 'update-check' }));
+      })();
+    })
+    // 版本更新（执行）：npm i -g 最新版（async spawn），成功后**先发完成卡再**重启
+    // daemon —— restart 会 kill 掉当前这个 daemon 进程（卡片回调就跑在它里面），所以
+    // 必须等完成卡渲染落地后再触发 restart，否则用户看不到结果。
+    .on(DM.updateDo, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void (async () => {
+        await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+        const from = currentVersion();
+        await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'updating', from })).catch(
+          () => undefined,
+        );
+        const res = await installLatest();
+        if (!res.ok) {
+          log.info('console', 'update-failed', { from });
+          await updateManagedCard(
+            channel,
+            evt.messageId,
+            buildUpdateCard({ phase: 'error', from, message: res.message }),
+          ).catch((e) => log.fail('console', e, { phase: 'update-error' }));
+          return;
+        }
+        const to = currentVersion();
+        const willRestart = daemonRunning();
+        log.info('console', 'update-done', { from, to, willRestart });
+        await updateManagedCard(
+          channel,
+          evt.messageId,
+          buildUpdateCard({ phase: 'done', from, to, willRestart }),
+        ).catch((e) => log.fail('console', e, { phase: 'update-done' }));
+        if (willRestart) {
+          // 给完成卡一点渲染时间，再让 launchd 重启（kill 自己）。
+          await new Promise((r) => setTimeout(r, 800));
+          await restartDaemon().catch((e) => log.fail('console', e, { phase: 'update-restart' }));
+        }
+      })();
     })
     .on(DM.rmConfirm, async ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;

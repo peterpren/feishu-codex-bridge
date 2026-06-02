@@ -18,6 +18,7 @@ export async function runBotInit(name?: string): Promise<void> {
   }
   console.log('\n下一步（飞书开放平台后台，需手动一次 https://open.feishu.cn/app ）：');
   console.log('  1) 事件与回调 → 长连接 → 订阅：im.message.receive_v1 / card.action.trigger / application.bot.menu_v6');
+  console.log('     （可选）「加进已有群」功能再订阅：im.chat.member.bot.added_v1 / im.chat.member.bot.deleted_v1');
   console.log('  2) 创建并发布应用版本');
   console.log('\n`bot list` 查看全部；`bot use <名>` 切换当前；`run` 前台跑 / `start` 后台常驻。\n');
 }

@@ -49,6 +49,35 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
   // reply in the same comment thread.
   channel.on('comment', orchestrator.onComment);
+  // A human added the bot to a group → DM the (admin) adder a bind card to
+  // register it as a `joined` project.
+  channel.on('botAdded', orchestrator.onBotAddedToChat);
+  // The SDK exposes no named event for bot-*removed* (im.chat.member.bot.deleted_v1),
+  // so tap its private raw EventDispatcher: register() merges by event key, so
+  // this adds our handler without clobbering the SDK's built-ins. Guarded +
+  // best-effort — if the SDK's internals change on a bump we log and degrade to
+  // manual unbind (the console's 删除项目 still works).
+  try {
+    const tap = (
+      channel as unknown as {
+        dispatcher?: { register?: (h: Record<string, (raw: unknown) => void>) => unknown };
+      }
+    ).dispatcher;
+    if (tap?.register) {
+      tap.register({
+        'im.chat.member.bot.deleted_v1': (raw: unknown) => {
+          const ev = raw as { chat_id?: string; event?: { chat_id?: string } };
+          const chatId = ev?.chat_id ?? ev?.event?.chat_id;
+          if (chatId) void orchestrator.onBotRemovedFromChat(chatId);
+        },
+      });
+      log.info('ws', 'bot-removed-tap');
+    } else {
+      log.info('ws', 'bot-removed-tap-unavailable');
+    }
+  } catch (err) {
+    log.fail('ws', err, { phase: 'bot-removed-tap' });
+  }
   channel.on('reject', (evt) => log.info('intake', 'reject', { reason: evt.reason, msgId: evt.messageId }));
   channel.on('error', (err) => log.fail('ws', err));
   channel.on('reconnecting', () => log.info('ws', 'reconnecting'));

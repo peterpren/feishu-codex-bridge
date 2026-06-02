@@ -4,7 +4,7 @@ import {
   getShowToolCalls,
   type AppConfig,
 } from '../config/schema';
-import type { Project } from '../project/registry';
+import { defaultNoMention, type Project } from '../project/registry';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
 import { actions, button, card, form, hr, input, linkButton, md, note, submitButton, type CardElement, type CardObject } from './cards';
@@ -25,6 +25,7 @@ export const DM = {
   menu: 'dm.menu',
   newProject: 'dm.newProject',
   newProjectSubmit: 'dm.newProject.submit',
+  joinGroupSubmit: 'dm.joinGroup.submit',
   projects: 'dm.projects',
   settings: 'dm.settings',
   doctor: 'dm.doctor',
@@ -215,6 +216,14 @@ export interface DoctorInfo {
    * 用户点开即已勾好待申请权限，保存即生效（自建应用无需审核）。
    */
   scopeGrantUrl: string;
+  /**
+   * 「加入存量群」可选 scope（{@link JOIN_GROUP_SCOPES}）尚未开通的项，三态同
+   * {@link missingScopes}（undefined = 查不到）。不属必需，仅在诊断卡里提示，
+   * 让存量用户能发现并开通。
+   */
+  missingJoinScopes?: string[];
+  /** 一键开通页，预选「加入存量群」那两项 scope。 */
+  joinScopeGrantUrl: string;
 }
 
 /** Friendly label for a long-connection state; unknown states show raw. */
@@ -260,6 +269,33 @@ function scopeDiagnosis(i: DoctorInfo): CardElement[] {
     note(`待开通：\n${i.missingScopes.map((s) => `· ${labelScope(s)}`).join('\n')}`),
     actions([linkButton('🔑 一键去开通这些权限', i.scopeGrantUrl)]),
   ];
+}
+
+/**
+ * 「加入存量群」诊断块：这俩 scope 是 opt-in（不在 REQUIRED_SCOPES 里，所以
+ * 启动/凭据校验都不会提示），事件又没法查——存量用户最容易漏。这里把 scope
+ * 状态显式渲染出来、缺失时给「去开通」按钮，并恒附一条无法自动检测的事件提醒。
+ */
+function joinFeatureDiagnosis(i: DoctorInfo): CardElement[] {
+  const out: CardElement[] = [md('**加入存量群（可选）**')];
+  if (i.missingJoinScopes === undefined) {
+    out.push(md('- 权限：⚠️ 未能自动检查（凭据失效或网络不通）'), actions([linkButton('🔑 去开通', i.joinScopeGrantUrl)]));
+  } else if (i.missingJoinScopes.length === 0) {
+    out.push(md('- 权限：✅ 已开通（`im:chat:readonly` / `im:chat.members:write_only`）'));
+  } else {
+    out.push(
+      md(`- 权限：❌ 缺 ${i.missingJoinScopes.length} 项 —— 开通后才能把我加进已有群（绑定 / 退群）`),
+      note(`待开通：\n${i.missingJoinScopes.map((s) => `· ${labelScope(s)}`).join('\n')}`),
+      actions([linkButton('🔑 一键开通这两项权限', i.joinScopeGrantUrl)]),
+    );
+  }
+  out.push(
+    note(
+      '⚠️ 还需在后台「事件与回调」手动订阅 `im.chat.member.bot.added_v1`（被拉进群→推送绑定卡）和 ' +
+        '`im.chat.member.bot.deleted_v1`（被移出群→自动解绑）—— 飞书无查询接口，这里无法自动检测。',
+    ),
+  );
+  return out;
 }
 
 /**
@@ -319,6 +355,8 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
       ...scopeDiagnosis(i),
       note(`bridge v${i.bridgeVer}　·　Node ${i.node}　·　${i.platform}`),
       hr(),
+      ...joinFeatureDiagnosis(i),
+      hr(),
       md('**日志路径**'),
       note(`后台守护输出：\`${i.logStdout}\``),
       note(`后台守护错误：\`${i.logStderr}\``),
@@ -355,17 +393,48 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
   return card(elements, { header: { title: '➕ 新建项目', template: 'turquoise' } });
 }
 
-/** Shown after a project is created — a terminal "留痕" record with a
- * jump-to-group button so the admin can hop straight into the new group and
- * start working. (Re-open the console any time by messaging the bot.) */
+/**
+ * Bind-an-existing-group form. Reached when a human adds the bot to a group and
+ * the bot DMs the adder. Mirrors {@link buildNewProjectFormCard} but the name
+ * input is pre-filled with the group's name (still editable — lets the user
+ * dodge a name clash), and the submit buttons carry the group's `chatId` so the
+ * handler binds *this* group instead of creating a new one.
+ */
+export function buildJoinGroupFormCard(
+  opts: { chatId: string; name?: string; cwd?: string; error?: string },
+): CardObject {
+  const elements: CardElement[] = [];
+  if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
+  elements.push(
+    md('我已被加入这个群。填一下要绑定的项目信息即可开始用。'),
+    md('项目名默认用群名，可改。**文件夹路径留空** = 自动新建空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
+    form('join_group', [
+      input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
+      input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
+      actions([
+        submitButton('👥 绑定·多话题群', { a: DM.joinGroupSubmit, kind: 'multi', chatId: opts.chatId }, 'primary', 'submit_multi'),
+        submitButton('💬 绑定·单会话群', { a: DM.joinGroupSubmit, kind: 'single', chatId: opts.chatId }, 'primary', 'submit_single'),
+      ]),
+    ]),
+  );
+  return card(elements, { header: { title: '🔗 绑定已有群', template: 'turquoise' } });
+}
+
+/** Shown after a project is created/bound — a terminal "留痕" record with a
+ * jump-to-group button so the admin can hop straight into the group and start
+ * working. (Re-open the console any time by messaging the bot.) */
 export function buildNewProjectDoneCard(p: Project): CardObject {
+  const joined = (p.origin ?? 'created') === 'joined';
+  const verb = joined ? '已绑定群' : '已创建项目';
+  const title = joined ? '🔗 绑定已有群' : '➕ 新建项目';
   const elements: CardElement[] = [
-    md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
+    md(`✅ ${verb} **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
     note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
-    md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
+    md(p.chatId ? '👉 去群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
   ];
   if (p.chatId) elements.push(actions([linkButton('💬 打开群聊', openChatUrl(p.chatId), 'primary')]));
-  return card(elements, { header: { title: '➕ 新建项目', template: 'green' } });
+  return card(elements, { header: { title, template: 'green' } });
 }
 
 /** Project list: each project shows its bound group + a jump-to-group link,
@@ -388,7 +457,7 @@ export function buildProjectListCard(
     elements.push(
       note(
         p.chatId
-          ? `💬 群：**${p.name}**   ·   ${kindLabel(p.kind)}   ·   免@：${(p.noMention ?? true) ? '开' : '关'}`
+          ? `💬 群：**${p.name}**   ·   ${kindLabel(p.kind)}${(p.origin ?? 'created') === 'joined' ? ' · 🔗已加入' : ''}   ·   免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`
           : '⚠️ 未绑定群',
       ),
     );
@@ -413,11 +482,15 @@ export function buildProjectListCard(
   return card(elements, { header: { title: '📁 项目列表', template: 'wathet' } });
 }
 
-export function buildRmConfirmCard(name: string): CardObject {
+export function buildRmConfirmCard(name: string, origin?: 'created' | 'joined'): CardObject {
+  const note_ =
+    (origin ?? 'created') === 'joined'
+      ? '仅解绑（移除注册），**不删代码目录**。确认后**我会退出该群**（群是你们的，不会解散）。'
+      : '仅解绑（移除注册 + 撤销置顶横幅），**不删代码目录**。群主会转给你，再由你自行在飞书解散群。';
   return card(
     [
       md(`确定删除项目 **${name}**？`),
-      note('仅解绑（移除注册 + 撤销置顶横幅），**不删代码目录**。群主会转给你，再由你自行在飞书解散群。'),
+      note(note_),
       actions([
         button('✅ 确认删除', { a: DM.rmDo, n: name }, 'danger'),
         button('取消', { a: DM.rmCancel }),
@@ -488,9 +561,9 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
  * (read-only label); 免@ is a live toggle. Uses option buttons (never lock) like
  * {@link buildSettingsCard}. Admin-gated by the handler.
  */
-export function buildGroupSettingsCard(project: Pick<Project, 'name' | 'kind' | 'noMention'>): CardObject {
+export function buildGroupSettingsCard(project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin'>): CardObject {
   const kind = project.kind ?? 'multi';
-  const noMention = project.noMention ?? true;
+  const noMention = project.noMention ?? defaultNoMention(project);
   const scopeNote =
     kind === 'single'
       ? '开启后：本群所有消息(不用 @)都交给我处理。'

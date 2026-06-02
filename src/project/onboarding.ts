@@ -1,7 +1,7 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
 import { buildWelcomeCard } from '../card/command-cards';
-import type { Project } from './registry';
+import { defaultNoMention, type Project } from './registry';
 
 /**
  * Public command manual — an internet-readable Feishu doc (full command guide +
@@ -24,18 +24,24 @@ const HELP_DOC_URL: string = 'https://my.feishu.cn/wiki/PZ23wGr7JiKK5RkIG4rcZXzG
 export async function onboardGroup(channel: LarkChannel, project: Project): Promise<void> {
   const kind = project.kind ?? 'multi';
   const chatId = project.chatId;
+  // In a 'joined' group the bot is a plain member, not the owner: don't Pin or
+  // add a chat tab (those mutate the group's structure and a member may lack the
+  // permission anyway). The one-off welcome card is still sent — it's just a
+  // message. Created groups keep the full treatment (welcome → Pin → tab).
+  const decorate = (project.origin ?? 'created') !== 'joined';
 
-  // 1. Welcome card → Pin. Raw interactive JSON (no callback buttons to mutate,
-  //    just an open_url link), so it needn't be a CardKit entity. Capture the
-  //    message_id so we can Pin it.
+  // 1. Welcome card. Raw interactive JSON (no callback buttons to mutate, just
+  //    an open_url link), so it needn't be a CardKit entity. For created groups
+  //    we capture the message_id and Pin it; joined groups skip the Pin.
   try {
-    const content = JSON.stringify(buildWelcomeCard(kind, HELP_DOC_URL || undefined));
+    const noMention = project.noMention ?? defaultNoMention(project);
+    const content = JSON.stringify(buildWelcomeCard(kind, HELP_DOC_URL || undefined, noMention));
     const sent = await channel.rawClient.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: { receive_id: chatId, msg_type: 'interactive', content },
     });
     const messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
-    if (messageId) {
+    if (messageId && decorate) {
       await channel.rawClient.im.v1.pin.create({ data: { message_id: messageId } });
       log.info('project', 'onboard-pin', { name: project.name });
     }
@@ -43,10 +49,11 @@ export async function onboardGroup(channel: LarkChannel, project: Project): Prom
     log.fail('project', err, { phase: 'onboard-welcome' });
   }
 
-  // 2. Chat tab → public manual. Skipped when no URL is configured (otherwise
-  //    we'd pin a tab to an empty link). Sits to the right of the built-in Pins
-  //    tab. Only doc/url tab types are allowed by the API.
-  if (HELP_DOC_URL) {
+  // 2. Chat tab → public manual. Skipped for joined groups (don't mutate the
+  //    group) and when no URL is configured (otherwise we'd pin a tab to an
+  //    empty link). Sits to the right of the built-in Pins tab. Only doc/url
+  //    tab types are allowed by the API.
+  if (decorate && HELP_DOC_URL) {
     try {
       await channel.rawClient.im.v1.chatTab.create({
         path: { chat_id: chatId },

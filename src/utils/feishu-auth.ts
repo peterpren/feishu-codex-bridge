@@ -1,5 +1,5 @@
 import type { TenantBrand } from '../config/schema';
-import { REQUIRED_SCOPES } from '../config/scopes';
+import { JOIN_GROUP_SCOPES, REQUIRED_SCOPES } from '../config/scopes';
 
 const ENDPOINTS: Record<TenantBrand, string> = {
   feishu: 'https://open.feishu.cn',
@@ -16,6 +16,13 @@ export interface ValidationResult {
    * the scope list couldn't be fetched). Empty array = all granted.
    */
   missingScopes?: string[];
+  /**
+   * Opt-in "加入存量群" scopes ({@link JOIN_GROUP_SCOPES}) not yet granted. Same
+   * 3-state semantics as {@link missingScopes} (undefined = couldn't check).
+   * These aren't required for core messaging, so they never gate startup — the
+   * doctor card surfaces them so existing users can discover + enable them.
+   */
+  missingJoinScopes?: string[];
 }
 
 interface TokenResp {
@@ -58,8 +65,16 @@ export async function validateAppCredentials(
   }
   const token = data.tenant_access_token;
   const info = await fetchBotInfo(base, token).catch(() => undefined);
-  const missingScopes = await fetchMissingScopes(base, token).catch(() => undefined);
-  return { ok: true, botName: info?.bot?.app_name, botOpenId: info?.bot?.open_id, missingScopes };
+  const granted = await fetchGrantedScopes(base, token).catch(() => undefined);
+  const missing = (list: readonly string[]): string[] | undefined =>
+    granted ? list.filter((s) => !granted.has(s)) : undefined;
+  return {
+    ok: true,
+    botName: info?.bot?.app_name,
+    botOpenId: info?.bot?.open_id,
+    missingScopes: missing(REQUIRED_SCOPES),
+    missingJoinScopes: missing(JOIN_GROUP_SCOPES),
+  };
 }
 
 async function fetchBotInfo(base: string, token: string): Promise<BotInfoResp | undefined> {
@@ -75,17 +90,16 @@ interface ScopeListResp {
 }
 
 /**
- * Which {@link REQUIRED_SCOPES} the app still lacks. `grant_status === 1` means
- * granted; scopes missing from the list count as not granted. Returns undefined
- * (not []) on any failure so callers can tell "all granted" from "couldn't check".
+ * The set of scope names the app has actually been granted (`grant_status === 1`).
+ * Returns undefined (not an empty set) on any failure so callers can tell "none
+ * granted" from "couldn't check" — and compute missing-from-any-list themselves.
  */
-async function fetchMissingScopes(base: string, token: string): Promise<string[] | undefined> {
+async function fetchGrantedScopes(base: string, token: string): Promise<Set<string> | undefined> {
   const resp = await fetch(`${base}/open-apis/application/v6/scopes`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!resp.ok) return undefined;
   const body = (await resp.json()) as ScopeListResp;
   if (!body.data?.scopes) return undefined;
-  const granted = new Set(body.data.scopes.filter((s) => s.grant_status === 1).map((s) => s.scope_name));
-  return REQUIRED_SCOPES.filter((s) => !granted.has(s));
+  return new Set(body.data.scopes.filter((s) => s.grant_status === 1).map((s) => s.scope_name));
 }

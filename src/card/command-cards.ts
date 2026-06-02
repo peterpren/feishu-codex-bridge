@@ -173,15 +173,25 @@ export function pickerTime(unixSeconds: number): string {
 /** Where the user is when they ask for help — drives which commands we list. */
 export type HelpScope = 'main' | 'topic' | 'single';
 
-/** The `/help` card: commands available **right here** (this exact scope). */
-export function buildHelpCard(scope: HelpScope): CardObject {
+/** First bullet describing how to talk to the bot, honoring the group's
+ * effective 免@ state so the card never promises免@ when it's actually off
+ * (e.g. a joined single-session group, which defaults off). */
+function talkLine(noMention: boolean, tail: string): string {
+  return noMention
+    ? `· 直接发消息（免@）→ ${tail}`
+    : `· **@我 + 内容** → ${tail}（本群默认需 @；\`/settings\` 可开启免@）`;
+}
+
+/** The `/help` card: commands available **right here** (this exact scope).
+ * `noMention` is the group's effective 免@ state (`noMention ?? defaultNoMention`). */
+export function buildHelpCard(scope: HelpScope, noMention = true): CardObject {
   const elements: CardElement[] = [];
   if (scope === 'single') {
     elements.push(
       md('💬 **单会话群** — 整群就是一个会话，上下文连续。'),
       hr(),
       md(
-        '· 直接发消息（免@）→ 交给我处理\n' +
+        `${talkLine(noMention, '交给我处理')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 这张速查卡',
@@ -192,7 +202,7 @@ export function buildHelpCard(scope: HelpScope): CardObject {
       md('🧵 **话题内** — 每个话题是一个独立会话。'),
       hr(),
       md(
-        '· 直接发消息（免@）→ 继续当前会话\n' +
+        `${talkLine(noMention, '继续当前会话')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
           '· `/help` → 这张速查卡',
       ),
@@ -215,11 +225,13 @@ export function buildHelpCard(scope: HelpScope): CardObject {
 }
 
 /**
- * Welcome card posted (and Pin'd) when a project group is created — a full
- * overview of every command this group supports, keyed off its session kind.
- * Adds a "查看完整手册" link button when a doc URL is configured.
+ * Welcome card posted when a project group is created or a group is bound — a
+ * full overview of every command this group supports, keyed off its session
+ * kind. `noMention` is the group's effective 免@ state (so a joined
+ * single-session group, which defaults off, doesn't promise免@). Adds a
+ * "查看完整手册" link button when a doc URL is configured.
  */
-export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string): CardObject {
+export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMention = true): CardObject {
   const elements: CardElement[] = [
     md('👋 **欢迎使用 Codex Bridge** — 本群已绑定一个项目目录，在群里就能驱动本机 Codex 干活。'),
     hr(),
@@ -228,7 +240,7 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string): Car
     elements.push(
       md('💬 **单会话群**（整群一个会话，上下文连续）'),
       md(
-        '· 直接发消息（免@）→ 交给我处理\n' +
+        `${talkLine(noMention, '交给我处理')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 命令速查卡',

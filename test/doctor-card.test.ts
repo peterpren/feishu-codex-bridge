@@ -14,6 +14,8 @@ function info(over: Partial<DoctorInfo> = {}): DoctorInfo {
     configFile: '/Users/me/.feishu-codex-bridge/bots/cli_x/config.json',
     missingScopes: [], // healthy baseline: all required scopes granted
     scopeGrantUrl: 'https://open.feishu.cn/app/cli_x/auth?q=',
+    missingJoinScopes: [], // healthy baseline: 加入存量群 scopes granted too
+    joinScopeGrantUrl: 'https://open.feishu.cn/app/cli_x/auth?q=join',
     ...over,
   };
 }
@@ -150,5 +152,41 @@ describe('buildDoctorCard — 飞书权限自检', () => {
     expect(codeBlock(buildDoctorCard(info({ missingScopes: ['im:resource'] })))).toContain('缺失 1 项');
     expect(codeBlock(buildDoctorCard(info({ missingScopes: [] })))).toContain('必需权限齐全');
     expect(codeBlock(buildDoctorCard(info({ missingScopes: undefined })))).toContain('未能自动检查');
+  });
+});
+
+describe('buildDoctorCard — 加入存量群（opt-in scope 提示）', () => {
+  const JOIN_GRANT = 'https://open.feishu.cn/app/cli_x/auth?q=im%3Achat%3Areadonly%2Cim%3Achat.members%3Awrite_only';
+
+  it('always reminds about the two un-checkable bot member events', () => {
+    // events have no query API → surfaced as a note regardless of scope state
+    const json = JSON.stringify(buildDoctorCard(info()));
+    expect(json).toContain('im.chat.member.bot.added_v1');
+    expect(json).toContain('im.chat.member.bot.deleted_v1');
+  });
+
+  it('surfaces the missing join scopes with a one-click grant button', () => {
+    const card = buildDoctorCard(
+      info({ missingJoinScopes: ['im:chat:readonly', 'im:chat.members:write_only'], joinScopeGrantUrl: JOIN_GRANT }),
+    );
+    const json = JSON.stringify(card);
+    expect(json).toContain('加入存量群');
+    expect(json).toContain('缺 2 项');
+    expect(json).toContain('im:chat:readonly');
+    expect(collectUrls(card)).toContain(JOIN_GRANT);
+    // opt-in: a missing join scope must NOT escalate the header to orange
+    expect((card as { header: { template: string } }).header.template).toBe('blue');
+  });
+
+  it('shows 已开通 (no button) when join scopes are all granted', () => {
+    const card = buildDoctorCard(info({ missingJoinScopes: [], joinScopeGrantUrl: JOIN_GRANT }));
+    expect(JSON.stringify(card)).toContain('已开通');
+    expect(collectUrls(card)).not.toContain(JOIN_GRANT);
+  });
+
+  it('says 未能自动检查 with a button when the scope check could not run', () => {
+    const card = buildDoctorCard(info({ missingJoinScopes: undefined, joinScopeGrantUrl: JOIN_GRANT }));
+    expect(JSON.stringify(card)).toContain('未能自动检查');
+    expect(collectUrls(card)).toContain(JOIN_GRANT);
   });
 });

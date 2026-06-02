@@ -64,15 +64,19 @@ export interface ManagedCardSendResult {
 /**
  * Create a CardKit entity and send a message referencing it. With `replyTo`
  * the card threads under the triggering message (im.v1.message.reply);
- * otherwise it posts top-level into `chatId`. Pass `replyInThread` when the
- * triggering message lives in a topic and the card should stay in it.
+ * otherwise it posts top-level to `to`. Pass `replyInThread` when the
+ * triggering message lives in a topic and the card should stay in it. Set
+ * `receiveIdType: 'open_id'` (and pass an open_id as `to`) to DM a user
+ * directly — Feishu opens/uses the p2p chat — used to send the bind card to the
+ * admin who added the bot to a group. Ignored when `replyTo` is set.
  */
 export async function sendManagedCard(
   channel: LarkChannel,
-  chatId: string,
+  to: string,
   card: object,
   replyTo?: string,
   replyInThread = false,
+  receiveIdType: 'chat_id' | 'open_id' = 'chat_id',
 ): Promise<ManagedCardSendResult> {
   stampRenderToken(card);
   const created = await channel.rawClient.cardkit.v1.card.create({
@@ -93,8 +97,8 @@ export async function sendManagedCard(
     messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
   } else {
     const sent = await channel.rawClient.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'interactive', content },
+      params: { receive_id_type: receiveIdType },
+      data: { receive_id: to, msg_type: 'interactive', content },
     });
     messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
   }

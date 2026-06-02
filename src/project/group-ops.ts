@@ -16,3 +16,19 @@ export async function transferOwnership(channel: LarkChannel, chatId: string, to
   });
   log.info('project', 'owner-transfer', { chatId: chatId.slice(-6), to: toOpenId.slice(-6) });
 }
+
+/**
+ * The bot leaves a group on its own (`me_leave`). Used to unbind a `joined`
+ * project: the group is the user's, so the bot just exits — it never disbands
+ * it (unlike a bridge-created group, where ownership is transferred so the admin
+ * can disband). The SDK client doesn't wrap `me_leave`, so we call the raw
+ * endpoint; the tenant token's identity (the bot) is the member that leaves, so
+ * no member id / extra permission is needed. Needs `im:chat.members:write_only`.
+ */
+export async function leaveChat(channel: LarkChannel, chatId: string): Promise<void> {
+  await channel.rawClient.request({
+    method: 'PATCH',
+    url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/me_leave`,
+  });
+  log.info('project', 'leave-chat', { chatId: chatId.slice(-6) });
+}

@@ -1,4 +1,4 @@
-import type { CardActionEvent, CommentEvent, LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import type { BotAddedEvent, CardActionEvent, CommentEvent, LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { createBackend } from '../agent';
 import type { AgentInput, AgentRun, AgentThread, ModelInfo, ReasoningEffort } from '../agent/types';
 import {
@@ -42,6 +42,7 @@ import {
   buildDmMenuCard,
   buildDoctorCard,
   buildGroupSettingsCard,
+  buildJoinGroupFormCard,
   buildNewProjectDoneCard,
   buildNewProjectFormCard,
   buildProjectListCard,
@@ -66,12 +67,19 @@ import { serviceStdoutPath, serviceStderrPath } from '../service/launchd';
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
 import { getSecret } from '../config/keystore';
-import { buildScopeGrantUrl } from '../config/scopes';
+import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
-import { getProjectByChatId, listProjects, removeProject, updateProject, type Project } from '../project/registry';
-import { createProject } from '../project/lifecycle';
+import {
+  defaultNoMention,
+  getProjectByChatId,
+  listProjects,
+  removeProject,
+  updateProject,
+  type Project,
+} from '../project/registry';
+import { createProject, joinExistingGroup } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
-import { transferOwnership } from '../project/group-ops';
+import { leaveChat, transferOwnership } from '../project/group-ops';
 import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
 import { handleDmConsole } from './dm-console';
 import { collectInboundImages, messageHasImages } from './media';
@@ -113,6 +121,12 @@ export interface Orchestrator {
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
   onComment: (evt: CommentEvent) => Promise<void>;
+  /** `botAdded` event: a human added the bot to a group → DM the (admin) adder
+   * a bind card to register it as a `joined` project. */
+  onBotAddedToChat: (evt: BotAddedEvent) => Promise<void>;
+  /** bot removed from a group (im.chat.member.bot.deleted_v1, tapped on the raw
+   * dispatcher) → auto-unbind the bound project, if any. */
+  onBotRemovedFromChat: (chatId: string) => Promise<void>;
   dispatcher: CardDispatcher;
   /** Close every live codex session (SIGKILLs the app-server children) so a
    *  graceful exit leaves no orphan processes. */
@@ -255,6 +269,23 @@ export function createOrchestrator(
       return;
     }
 
+    // The bot is in a group not bound to any project (e.g. it was just added and
+    // the admin hasn't finished binding in DM yet). Don't run codex in the
+    // fallback cwd for an unbound group — only nudge toward binding when @ed.
+    if (!project) {
+      log.info('intake', 'unbound-group', { chatId: msg.chatId.slice(-6), atBot: msg.mentionedBot });
+      if (msg.mentionedBot) {
+        await channel
+          .send(
+            msg.chatId,
+            { markdown: '本群还没绑定为项目。请**把我拉进群的管理员**在与我的私聊里完成绑定后再 @我。' },
+            { replyTo: msg.messageId },
+          )
+          .catch(() => undefined);
+      }
+      return;
+    }
+
     const text = msg.content.trim();
     const cmd = parseCommand(text);
 
@@ -263,7 +294,7 @@ export function createOrchestrator(
     // Commands: /settings (群设置) + /model. /resume has no topic list here.
     if ((project?.kind ?? 'multi') === 'single') {
       if (cmd === 'help') {
-        await postHelpCard(msg, 'single');
+        await postHelpCard(msg, 'single', false, project);
         return;
       }
       if (cmd === 'settings') {
@@ -283,7 +314,7 @@ export function createOrchestrator(
     // as a normal turn (告诉 codex 的普通文本).
     if (msg.threadId) {
       if (cmd === 'help') {
-        await postHelpCard(msg, 'topic', true);
+        await postHelpCard(msg, 'topic', true, project);
         return;
       }
       if (cmd === 'model') {
@@ -297,7 +328,7 @@ export function createOrchestrator(
     // group-settings card; /model only makes sense inside a topic; anything else
     // directly creates a topic + runs.
     if (cmd === 'help') {
-      await postHelpCard(msg, 'main');
+      await postHelpCard(msg, 'main', false, project);
       return;
     }
     if (cmd === 'resume') {
@@ -332,7 +363,7 @@ export function createOrchestrator(
    * 即使开了免@，若消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
    * bot 不插话。(此函数仅在 !mentionedBot 时调用,故 @到 bot 的情况已被排除。) */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
-    if (!(project.noMention ?? true)) return false;
+    if (!(project.noMention ?? defaultNoMention(project))) return false;
     if (msg.mentionAll || msg.mentions.some((m) => !m.isBot)) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
     return Boolean(msg.threadId) || parseCommand(msg.content.trim()) !== null;
@@ -602,9 +633,15 @@ export function createOrchestrator(
   }
 
   /** `/help`: post the command cheat-sheet for the caller's current scope. */
-  async function postHelpCard(msg: NormalizedMessage, scope: HelpScope, inThread = false): Promise<void> {
+  async function postHelpCard(
+    msg: NormalizedMessage,
+    scope: HelpScope,
+    inThread = false,
+    project?: Project,
+  ): Promise<void> {
+    const noMention = project ? (project.noMention ?? defaultNoMention(project)) : true;
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
-      await sendManagedCard(channel, msg.chatId, buildHelpCard(scope), msg.messageId, inThread).catch((err) =>
+      await sendManagedCard(channel, msg.chatId, buildHelpCard(scope, noMention), msg.messageId, inThread).catch((err) =>
         log.fail('card', err, { cmd: 'help', scope }),
       );
       log.info('card', 'help', { scope });
@@ -827,6 +864,36 @@ export function createOrchestrator(
         );
       })();
     })
+    .on(DM.joinGroupSubmit, ({ evt, formValue, value }) => {
+      const op = evt.operator?.openId;
+      if (!dmAdmin(op)) return;
+      const name = String((formValue?.name as string) ?? '').trim();
+      const cwdIn = String((formValue?.cwd as string) ?? '').trim();
+      const chatId = typeof value.chatId === 'string' ? value.chatId : '';
+      const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
+      // Same fresh-card pattern as DM.newProjectSubmit: a submitted form locks
+      // its card_id, so the result goes to a new card while the form stays above
+      // as a 留痕. Detached so the click acks immediately (join is slow).
+      void (async () => {
+        let result;
+        if (!chatId)
+          result = buildJoinGroupFormCard({ chatId: '', name, cwd: cwdIn, error: '缺少群标识，请重新从进群通知里打开绑定卡' });
+        else if (!name) result = buildJoinGroupFormCard({ chatId, cwd: cwdIn, error: '项目名不能为空' });
+        else if (!op) result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: '无法识别操作者身份' });
+        else {
+          try {
+            const p = await joinExistingGroup(channel, { name, chatId, addedBy: op, existingPath: cwdIn || undefined, kind });
+            log.info('console', 'join-group', { name: p.name, blank: p.blank });
+            result = buildNewProjectDoneCard(p);
+          } catch (err) {
+            result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err) });
+          }
+        }
+        await sendManagedCard(channel, evt.chatId, result).catch((e) =>
+          log.fail('console', e, { phase: 'join-group-result' }),
+        );
+      })();
+    })
     .on(DM.projects, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       patch(evt, renderProjectList);
@@ -847,6 +914,7 @@ export function createOrchestrator(
         ? await validateAppCredentials(app.id, secret, app.tenant).catch(() => undefined)
         : undefined;
       const missingScopes = scopeCheck?.missingScopes;
+      const missingJoinScopes = scopeCheck?.missingJoinScopes;
       const info: DoctorInfo = {
         codexOk: await backend.isAvailable().catch(() => false),
         codexVer: codexBin ? codexVersion(codexBin) : null,
@@ -864,6 +932,9 @@ export function createOrchestrator(
           app.tenant,
           missingScopes && missingScopes.length ? missingScopes : undefined,
         ),
+        missingJoinScopes,
+        // 「加入存量群」按钮恒预选这两项 opt-in scope（它们不在必需清单里）。
+        joinScopeGrantUrl: buildScopeGrantUrl(app.id, app.tenant, JOIN_GROUP_SCOPES),
       };
       // A reply card (not a patch of the menu) so the diagnosis persists below
       // the console; re-open the menu by messaging the bot.
@@ -938,7 +1009,8 @@ export function createOrchestrator(
     .on(DM.rmConfirm, async ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;
       if (!dmAdmin(evt.operator?.openId) || !name) return;
-      await patch(evt, buildRmConfirmCard(name));
+      const proj = (await listProjects()).find((p) => p.name === name);
+      await patch(evt, buildRmConfirmCard(name, proj?.origin));
     })
     .on(DM.rmCancel, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -948,24 +1020,42 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : undefined;
       const op = evt.operator?.openId;
       if (!dmAdmin(op) || !name) return;
-      // all the slow work (remove + owner transfer + reply) runs in the
+      // all the slow work (remove + owner transfer/leave + reply) runs in the
       // settle builder so the click acks immediately. The announcement vanishes
       // with the group once the owner dissolves it, so nothing to clean up here.
       patch(evt, async () => {
         const removed = await removeProject(name);
-        let transferred = false;
-        if (removed?.chatId && op) {
-          transferred = await transferOwnership(channel, removed.chatId, op)
-            .then(() => true)
-            .catch((err) => {
-              log.fail('console', err, { phase: 'owner-transfer' });
-              return false;
-            });
+        let tail: string;
+        if (removed && (removed.origin ?? 'created') === 'joined') {
+          // joined group: the bot is a plain member, not the owner — it just
+          // leaves (never disbands; the group is the user's). Best-effort.
+          const left = removed.chatId
+            ? await leaveChat(channel, removed.chatId)
+                .then(() => true)
+                .catch((err) => {
+                  log.fail('console', err, { phase: 'leave-chat' });
+                  return false;
+                })
+            : false;
+          log.info('console', 'rm', { name, origin: 'joined', left });
+          tail = left
+            ? '我已退出该群（群是你们的，不会解散）。'
+            : '⚠️ 我退群失败（可能权限不足），可在群里手动把我移除。';
+        } else {
+          let transferred = false;
+          if (removed?.chatId && op) {
+            transferred = await transferOwnership(channel, removed.chatId, op)
+              .then(() => true)
+              .catch((err) => {
+                log.fail('console', err, { phase: 'owner-transfer' });
+                return false;
+              });
+          }
+          log.info('console', 'rm', { name, origin: 'created', transferred });
+          tail = transferred
+            ? '群主已转给你 → 请在飞书里**自行解散该群**（机器人不主动解散）。'
+            : '⚠️ 群主转让失败（可能 bot 非群主），请用「🚪 群管理」手动转让后解散。';
         }
-        log.info('console', 'rm', { name, transferred });
-        const tail = transferred
-          ? '群主已转给你 → 请在飞书里**自行解散该群**（机器人不主动解散）。'
-          : '⚠️ 群主转让失败（可能 bot 非群主），请用「🚪 群管理」手动转让后解散。';
         await channel
           .send(evt.chatId, { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n${tail}` }, { replyTo: evt.messageId })
           .catch(() => undefined);
@@ -1460,6 +1550,75 @@ export function createOrchestrator(
     return fresh;
   }
 
+  /**
+   * `botAdded` event: a human added the bot to a group. If the adder is an admin
+   * (binding ties the group to a cwd on the operator's machine — privileged) and
+   * the group isn't already bound, DM them a bind card with the project name
+   * pre-filled from the group name. Groups the bridge created itself are already
+   * registered (or added by the bot, not an admin), so they fall through.
+   */
+  async function onBotAddedToChat(evt: BotAddedEvent): Promise<void> {
+    // The SDK fires botAdded fire-and-forget (no await around the handler), so a
+    // rejection here would surface as an unhandled rejection — guard the whole
+    // body (getProjectByChatId can throw on a corrupt/locked projects.json).
+    await withTrace({ chatId: evt.chatId }, async () => {
+      const op = evt.operator?.openId;
+      if (await getProjectByChatId(evt.chatId)) {
+        log.info('intake', 'bot-added-bound', { chatId: evt.chatId.slice(-6) });
+        return;
+      }
+      if (!op || !isAdmin(cfg, op)) {
+        log.info('intake', 'bot-added-nonadmin', { chatId: evt.chatId.slice(-6), op: op?.slice(-6) });
+        return;
+      }
+      // Best-effort group name (needs im:chat:readonly); the bind card's name is
+      // editable, so an empty/failed lookup just means the admin types one.
+      const info = await channel.getChatInfo(evt.chatId).catch((err) => {
+        log.fail('intake', err, { phase: 'bot-added-chatinfo' });
+        return undefined;
+      });
+      const name = (info?.name ?? '').trim();
+      await sendManagedCard(
+        channel,
+        op,
+        buildJoinGroupFormCard({ chatId: evt.chatId, name }),
+        undefined,
+        false,
+        'open_id',
+      ).catch((err) => log.fail('intake', err, { phase: 'bot-added-bindcard' }));
+      log.info('intake', 'bot-added', { chatId: evt.chatId.slice(-6), op: op.slice(-6), named: Boolean(name) });
+    }).catch((err) => log.fail('intake', err, { phase: 'bot-added' }));
+  }
+
+  /**
+   * Bot removed from a group (im.chat.member.bot.deleted_v1, tapped on the raw
+   * dispatcher in bridge.ts — the SDK has no named event for it). Auto-unbind the
+   * bound project: the bot is already out, so no me_leave. Notify the binder.
+   */
+  async function onBotRemovedFromChat(chatId: string): Promise<void> {
+    const project = await getProjectByChatId(chatId);
+    if (!project) return;
+    // Remove first, then notify only if THIS call removed it — Feishu delivers
+    // events at-least-once and this raw-tap path bypasses the SDK's dedup, so a
+    // redelivery would otherwise double-notify the binder. removeProject returns
+    // undefined when the entry is already gone.
+    const removed = await removeProject(project.name);
+    if (!removed) return;
+    log.info('intake', 'bot-removed-unbind', { name: removed.name, chatId: chatId.slice(-6) });
+    if (removed.addedBy) {
+      await channel.rawClient.im.v1.message
+        .create({
+          params: { receive_id_type: 'open_id' },
+          data: {
+            receive_id: removed.addedBy,
+            msg_type: 'text',
+            content: JSON.stringify({ text: `ℹ️ 我已被移出群「${removed.name}」，对应项目已自动解绑。` }),
+          },
+        })
+        .catch(() => undefined);
+    }
+  }
+
   async function shutdown(): Promise<void> {
     const live = [...sessions.values()];
     sessions.clear();
@@ -1469,7 +1628,7 @@ export function createOrchestrator(
     log.info('bridge', 'shutdown', { closed: live.length });
   }
 
-  return { onMessage, onComment, dispatcher, shutdown };
+  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, dispatcher, shutdown };
 }
 
 /** Resolve a message's thread_id via raw API (reply response omits it). */

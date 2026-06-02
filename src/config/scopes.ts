@@ -60,8 +60,27 @@ export const COMMENT_SCOPES = [
   'wiki:wiki:readonly',
 ] as const;
 
-/** Everything the one-click grant URL pre-selects: required + opt-in comment. */
-export const GRANT_SCOPES = [...REQUIRED_SCOPES, ...COMMENT_SCOPES] as const;
+/**
+ * Optional scopes for the "加入存量群" feature (a human adds the bot to a
+ * pre-existing group → bot binds it as a `joined` project). Like
+ * {@link COMMENT_SCOPES}, deliberately NOT in {@link REQUIRED_SCOPES}: the
+ * daemon-install gate loops on REQUIRED_SCOPES until granted, and we must not
+ * make an upgrade suddenly demand new permissions of every existing
+ * messaging-only install. Without these, `getChatInfo` (read the group name)
+ * and the me_leave-on-unbind call fail and we log + degrade — the rest still
+ * works, and binding can still proceed with a manually-typed project name.
+ *
+ * `im:chat:readonly` = read the joined group's name/owner via im.v1.chat.get;
+ * `im:chat.members:write_only` = the bot leaves the group (me_leave) when the
+ * project is unbound from the console.
+ */
+export const JOIN_GROUP_SCOPES = [
+  'im:chat:readonly',
+  'im:chat.members:write_only',
+] as const;
+
+/** Everything the one-click grant URL pre-selects: required + opt-in extras. */
+export const GRANT_SCOPES = [...REQUIRED_SCOPES, ...COMMENT_SCOPES, ...JOIN_GROUP_SCOPES] as const;
 
 /**
  * Human-readable Chinese labels per scope token, so the doctor card can show
@@ -84,6 +103,8 @@ export const SCOPE_LABELS: Record<string, string> = {
   'im:chat.announcement:write_only': '编辑群公告',
   'im:chat.top_notice:write_only': '置顶群公告横幅',
   'im:chat.tabs:write_only': '添加群标签页',
+  'im:chat:readonly': '读取群信息（群名/群主，加入存量群用）',
+  'im:chat.members:write_only': '群成员增减（绑定的存量群解绑时机器人退群）',
   'cardkit:card:write': '交互按钮卡片',
   'docs:document.comment:read': '读取文档评论',
   'docs:document.comment:create': '发表文档评论回复',

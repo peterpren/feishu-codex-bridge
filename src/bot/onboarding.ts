@@ -175,6 +175,10 @@ export async function confirmReadyForDaemon(result: OnboardResult): Promise<bool
   console.log('       • （可选）想要「在飞书文档评论里 @机器人就自动回复」，再加这一个事件：');
   console.log('           drive.notice.comment_add_v1（云文档新增评论）');
   console.log('           它依赖「文档评论」权限（docs:document.comment:read / :create，授权链接已预勾选）；不加则该功能静默关闭。');
+  console.log('       • （可选）想要「把我加进已有群就能绑定成项目」，再加这两个事件：');
+  console.log('           im.chat.member.bot.added_v1（机器人被加入群 → 私聊推送绑定卡）');
+  console.log('           im.chat.member.bot.deleted_v1（机器人被移出群 → 自动解绑项目）');
+  console.log('           它们依赖「群信息/群成员」权限（im:chat:readonly / im:chat.members:write_only，已预勾选）；不加则该功能静默关闭。');
   console.log('       • 切到「回调配置」标签 → 「订阅方式」改「长连接」→ 点「添加回调」勾选：');
   console.log('           card.action.trigger（卡片回传交互）');
   console.log('           ⚠️ 它是「回调」不是「事件」——在上面「添加事件」里搜不到，必须切到「回调配置」这个标签。');

@@ -3,8 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { getServiceAdapter } from './adapter';
-import { statusLaunchd } from './launchd';
+import { getServiceAdapter, isServiceRunning } from './adapter';
 
 const execFileP = promisify(execFile);
 
@@ -117,13 +116,12 @@ export async function installLatest(opts: { inherit?: boolean } = {}): Promise<I
   });
 }
 
-/** Is the launchd background service currently loaded? (false off darwin.) */
+/**
+ * Is the OS background service currently running? Platform-aware (launchd on
+ * macOS, Task Scheduler on Windows); false on platforms without a service.
+ */
 export function daemonRunning(): boolean {
-  try {
-    return statusLaunchd().loaded;
-  } catch {
-    return false;
-  }
+  return isServiceRunning();
 }
 
 /**

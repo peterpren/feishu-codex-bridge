@@ -1,10 +1,10 @@
-import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { paths, useBotDir } from '../../config/paths';
 import { ensureRegistry, currentBot } from '../../config/bots';
 import { resolveCodexBin, codexVersion } from '../../agent/codex-appserver/locate';
+import { spawnProcessSync } from '../../platform/spawn';
 
 interface Check {
   name: string;
@@ -82,7 +82,11 @@ export async function runDoctor(): Promise<void> {
 
 function tryExec(cmd: string, args: string[]): string | null {
   try {
-    return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    // cross-spawn so a Windows `.cmd` shim (e.g. lark-cli.cmd) resolves instead
+    // of being reported as "not found".
+    const res = spawnProcessSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    if (res.status !== 0 || typeof res.stdout !== 'string') return null;
+    return res.stdout.trim();
   } catch {
     return null;
   }

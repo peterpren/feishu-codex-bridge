@@ -21,13 +21,17 @@ export async function runStart(): Promise<void> {
     return;
   }
   const status = await getServiceAdapter().install();
-  console.log('✓ 后台服务已安装并启动（开机自启、崩溃自动拉起）。');
+  console.log(
+    process.platform === 'win32'
+      ? '✓ 后台服务已安装并启动（登录自启；注意：Windows 计划任务无崩溃自动拉起）。'
+      : '✓ 后台服务已安装并启动（开机自启、崩溃自动拉起）。',
+  );
   printStatus(status);
 }
 
 export async function runStop(): Promise<void> {
   await getServiceAdapter().uninstall();
-  console.log('✓ 后台服务已停止，并已关闭开机自启（已移除 launchd plist）。');
+  console.log('✓ 后台服务已停止，并已关闭自启（已移除服务定义）。');
 }
 
 export async function runRestart(): Promise<void> {
@@ -45,9 +49,10 @@ export async function runLogs(follow: boolean): Promise<void> {
 }
 
 function printStatus(status: ServiceStatus): void {
-  console.log(`plist:     ${status.plistPath}`);
+  console.log(`service:   ${status.platformName}`);
+  console.log(`path:      ${status.servicePath}`);
   console.log(`installed: ${status.installed ? 'yes' : 'no'}`);
-  console.log(`loaded:    ${status.loaded ? 'yes' : 'no'}`);
+  console.log(`running:   ${status.running ? 'yes' : 'no'}`);
   console.log(`pid:       ${status.pid ?? '-'}`);
   console.log(`last exit: ${status.lastExit ?? '-'}`);
   console.log(`stdout:    ${status.stdoutPath}`);
@@ -55,7 +60,7 @@ function printStatus(status: ServiceStatus): void {
 
   if (!status.installed) {
     console.log('提示：后台服务尚未安装，运行 `feishu-codex-bridge start`。');
-  } else if (!status.loaded) {
-    console.log('提示：plist 已存在，但 launchd 当前未加载（试试 `restart`）。');
+  } else if (!status.running) {
+    console.log('提示：服务已注册但当前未运行（试试 `restart`）。');
   }
 }

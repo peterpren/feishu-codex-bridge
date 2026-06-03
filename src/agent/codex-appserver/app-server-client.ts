@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
 import { log } from '../../core/logger';
 import type { ServerNotification } from './protocol';
 
@@ -66,11 +67,14 @@ export class AppServerClient {
 
   /** spawn + initialize handshake. Throws if spawn/handshake fails. */
   async connect(): Promise<void> {
-    const child = spawn(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
+    // Launch via cross-spawn (platform/spawn) so a Windows `.cmd` codex shim
+    // runs instead of throwing EINVAL (CVE-2024-27980). With stdio all-piped the
+    // streams are non-null, so the cast to *WithoutNullStreams is sound.
+    const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
       cwd: this.opts.cwd,
-      env: { ...process.env, ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' },
+      env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
       stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    }) as ChildProcessWithoutNullStreams;
     this.child = child;
     log.info('agent', 'spawn', { pid: child.pid ?? null, cwd: this.opts.cwd });
 
@@ -123,6 +127,32 @@ export class AppServerClient {
     this.closed = true;
     const child = this.child;
     if (!child || child.exitCode !== null) return;
+
+    if (process.platform === 'win32' && child.pid) {
+      // Windows has no POSIX signals, and child.kill() can't reap codex's
+      // grandchildren (MCP / tool subprocesses) — they'd orphan. `taskkill /T`
+      // terminates the whole process tree; wait for exit with graceMs fallback.
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const done = (): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(t);
+          resolve();
+        };
+        const t = setTimeout(done, graceMs);
+        child.once('exit', done);
+        spawnProcess('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on(
+          'error',
+          () => {
+            child.kill();
+            done();
+          },
+        );
+      });
+      return;
+    }
+
     child.kill('SIGTERM');
     await new Promise<void>((resolve) => {
       const t = setTimeout(() => {

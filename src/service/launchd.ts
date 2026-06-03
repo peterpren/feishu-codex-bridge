@@ -1,23 +1,17 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { appendFile, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { paths } from '../config/paths';
+import {
+  ensureLogFiles,
+  serviceStderrPath,
+  serviceStdoutPath,
+  type ServiceStatus,
+} from './common';
 
 export const LAUNCHD_LABEL = 'ai.feishu-codex-bridge.bot';
-
-export interface LaunchdStatus {
-  installed: boolean;
-  loaded: boolean;
-  plistPath: string;
-  stdoutPath: string;
-  stderrPath: string;
-  pid?: string;
-  lastExit?: string;
-  raw: string;
-}
 
 interface LaunchctlResult {
   ok: boolean;
@@ -28,14 +22,6 @@ interface LaunchctlResult {
 
 export function launchAgentPlistPath(): string {
   return join(homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
-}
-
-export function serviceStdoutPath(): string {
-  return join(paths.appDir, 'service.log');
-}
-
-export function serviceStderrPath(): string {
-  return join(paths.appDir, 'service.err.log');
 }
 
 function resolveCliBinPath(): string {
@@ -86,7 +72,7 @@ export function buildPlist(): string {
 `;
 }
 
-export async function installLaunchd(): Promise<LaunchdStatus> {
+export async function installLaunchd(): Promise<ServiceStatus> {
   const plistPath = launchAgentPlistPath();
   await mkdir(dirname(plistPath), { recursive: true });
   await ensureLogFiles();
@@ -115,7 +101,7 @@ export async function uninstallLaunchd(): Promise<void> {
   await rm(launchAgentPlistPath(), { force: true });
 }
 
-export async function restartLaunchd(): Promise<LaunchdStatus> {
+export async function restartLaunchd(): Promise<ServiceStatus> {
   if (!existsSync(launchAgentPlistPath())) {
     throw new Error(`launchd service 未安装：${launchAgentPlistPath()}`);
   }
@@ -139,15 +125,16 @@ export async function restartLaunchd(): Promise<LaunchdStatus> {
   return statusLaunchd();
 }
 
-export function statusLaunchd(): LaunchdStatus {
+export function statusLaunchd(): ServiceStatus {
   const result = runLaunchctl(['print', serviceTarget()]);
   const raw = result.stdout || result.stderr;
   const parsed = parseLaunchdStatus(raw);
 
   return {
+    platformName: 'launchd (macOS)',
     installed: existsSync(launchAgentPlistPath()),
-    loaded: result.ok,
-    plistPath: launchAgentPlistPath(),
+    running: result.ok,
+    servicePath: launchAgentPlistPath(),
     stdoutPath: serviceStdoutPath(),
     stderrPath: serviceStderrPath(),
     pid: parsed.pid,
@@ -182,7 +169,7 @@ function parseLaunchdStatus(text: string): { pid?: string; lastExit?: string } {
   };
 }
 
-function isLoaded(): boolean {
+export function isLoaded(): boolean {
   const result = spawnSync('launchctl', ['print', serviceTarget()], {
     stdio: ['ignore', 'ignore', 'ignore'],
   });
@@ -196,12 +183,6 @@ async function waitUntilUnloaded(timeoutMs = 5000): Promise<void> {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
   }
   throw new Error(`launchd service 未在 ${timeoutMs}ms 内卸载完成`);
-}
-
-async function ensureLogFiles(): Promise<void> {
-  await mkdir(paths.appDir, { recursive: true });
-  await appendFile(serviceStdoutPath(), '');
-  await appendFile(serviceStderrPath(), '');
 }
 
 function userTarget(): string {

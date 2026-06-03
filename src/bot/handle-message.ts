@@ -63,7 +63,7 @@ import {
   restartDaemon,
 } from '../service/update';
 import { resolveCodexBin, codexVersion } from '../agent/codex-appserver/locate';
-import { serviceStdoutPath, serviceStderrPath } from '../service/launchd';
+import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
 import { getSecret } from '../config/keystore';

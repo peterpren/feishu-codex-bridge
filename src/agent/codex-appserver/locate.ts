@@ -1,15 +1,20 @@
-import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { extname, join } from 'node:path';
 import { paths } from '../../config/paths';
+import { spawnProcessSync } from '../../platform/spawn';
+
+const IS_WIN = process.platform === 'win32';
 
 /**
  * Resolve the codex CLI binary, in priority order:
  *   1. $CODEX_BIN (explicit override)
- *   2. PATH (`codex`)
+ *   2. PATH (`codex`, via `where`/`which`)
  *   3. bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
  *   4. macOS Codex.app bundled binary
  * Returns null if none found.
+ *
+ * On Windows an npm-installed bin is a `codex.cmd`/`codex.exe` shim, never a
+ * bare `codex`, so the private-install probe enumerates PATHEXT variants.
  */
 export function resolveCodexBin(): string | null {
   const env = process.env.CODEX_BIN;
@@ -18,8 +23,9 @@ export function resolveCodexBin(): string | null {
   const onPath = which('codex');
   if (onPath) return onPath;
 
-  const priv = join(paths.codexCliBinDir, 'codex');
-  if (existsSync(priv)) return priv;
+  for (const cand of execCandidates(paths.codexCliBinDir, 'codex')) {
+    if (existsSync(cand)) return cand;
+  }
 
   const appBundle = '/Applications/Codex.app/Contents/Resources/codex';
   if (process.platform === 'darwin' && existsSync(appBundle)) return appBundle;
@@ -27,13 +33,34 @@ export function resolveCodexBin(): string | null {
   return null;
 }
 
+/**
+ * Candidate file paths for a bare command in `dir`. On Windows a shim carries a
+ * PATHEXT extension (`.cmd`/`.exe`/`.bat`), so probe `codex`, `codex.cmd`,
+ * `codex.exe`, … On POSIX the bare name is the only candidate.
+ */
+function execCandidates(dir: string, base: string): string[] {
+  const exact = join(dir, base);
+  if (!IS_WIN || extname(base)) return [exact];
+  const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+    .split(';')
+    .map((e) => e.trim())
+    .filter(Boolean);
+  return [exact, ...exts.map((e) => join(dir, base + e.toLowerCase()))];
+}
+
 function which(cmd: string): string | null {
   try {
-    const out = execFileSync(process.platform === 'win32' ? 'where' : 'which', [cmd], {
+    // `where` (win) / `which` (posix) are real executables; cross-spawn runs
+    // them uniformly. `where` may return multiple lines — take the first.
+    const res = spawnProcessSync(IS_WIN ? 'where' : 'which', [cmd], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const first = out.split('\n').map((l) => l.trim()).find(Boolean);
+    if (res.status !== 0 || typeof res.stdout !== 'string') return null;
+    const first = res.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .find(Boolean);
     return first && existsSync(first) ? first : null;
   } catch {
     return null;
@@ -43,7 +70,10 @@ function which(cmd: string): string | null {
 /** Best-effort version string of the resolved codex binary. */
 export function codexVersion(bin: string): string | null {
   try {
-    return execFileSync(bin, ['--version'], { encoding: 'utf8' }).trim();
+    // cross-spawn so a Windows `.cmd` shim runs (avoids execFile EINVAL).
+    const res = spawnProcessSync(bin, ['--version'], { encoding: 'utf8' });
+    if (res.status !== 0 || typeof res.stdout !== 'string') return null;
+    return res.stdout.trim();
   } catch {
     return null;
   }

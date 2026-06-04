@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { spawnProcess } from '../platform/spawn';
 import { getSecret } from './keystore';
 import { paths } from './paths';
 import type { AppConfig, ProviderConfig, SecretInput, SecretRef } from './schema';
@@ -110,7 +111,12 @@ async function spawnExecProvider(pc: ProviderConfig, ref: SecretRef): Promise<st
     const env: NodeJS.ProcessEnv = {};
     if (pc.passEnv) for (const k of pc.passEnv) { const v = process.env[k]; if (v) env[k] = v; }
     if (pc.env) Object.assign(env, pc.env);
-    const child = spawn(pc.command!, pc.args ?? [], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // cross-spawn: a Windows `.cmd`/`.bat` exec provider runs (no EINVAL) and
+    // windowsHide keeps it from popping a console under the background service.
+    const child = spawnProcess(pc.command!, pc.args ?? [], {
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }) as ChildProcessWithoutNullStreams;
     let stdout = '', stderr = '', truncated = false, settled = false;
     const timer = setTimeout(() => {
       if (settled) return;

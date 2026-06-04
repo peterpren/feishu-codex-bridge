@@ -1,15 +1,14 @@
-import { execFile, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { spawnProcess } from '../platform/spawn';
 import { getServiceAdapter, isServiceRunning } from './adapter';
 
-const execFileP = promisify(execFile);
-
-// On Windows the npm shim is npm.cmd, not an exec'able `npm`. The bridge service
-// is darwin-only today, but the `update` CLI runs everywhere — keep it portable.
-const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+// `npm` via cross-spawn: on Windows it's an `npm.cmd` shim that a bare
+// spawn/execFile would reject with EINVAL (CVE-2024-27980); cross-spawn runs it,
+// and spawnProcess hides the console window (important when the background
+// service triggers a one-click update with no console of its own).
+const NPM = 'npm';
 
 /**
  * The installed package's own root. After bundling, every source module's
@@ -63,13 +62,26 @@ export function isNewer(a: string, b: string): boolean {
 
 /** Latest published version on the configured registry, or null if unreachable. */
 export async function latestVersion(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileP(NPM, ['view', packageName(), 'version'], { timeout: 20000 });
-    const v = stdout.trim();
-    return /^\d+\.\d+\.\d+/.test(v) ? v : null;
-  } catch {
-    return null;
-  }
+  const v = await new Promise<string | null>((resolveP) => {
+    const child = spawnProcess(NPM, ['view', packageName(), 'version'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let out = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      resolveP(null);
+    }, 20000);
+    child.stdout?.on('data', (d) => (out += d));
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolveP(null);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolveP(code === 0 ? out.trim() : null);
+    });
+  });
+  return v && /^\d+\.\d+\.\d+/.test(v) ? v : null;
 }
 
 export interface UpdateCheck {
@@ -100,7 +112,7 @@ export interface InstallResult {
 export async function installLatest(opts: { inherit?: boolean } = {}): Promise<InstallResult> {
   const target = `${packageName()}@latest`;
   return await new Promise<InstallResult>((resolveP) => {
-    const child = spawn(NPM, ['install', '-g', target], {
+    const child = spawnProcess(NPM, ['install', '-g', target], {
       stdio: opts.inherit ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'],
     });
     let out = '';

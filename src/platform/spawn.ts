@@ -17,16 +17,20 @@ export function spawnProcess(
   args: readonly string[] = [],
   options: SpawnOptions = {},
 ): ChildProcess {
-  return crossSpawn(command, [...args], options);
+  // windowsHide: the bridge spawns these as background helpers (codex app-server,
+  // lark-cli). When the bridge itself runs with no console (the hidden Windows
+  // background service), spawning a `.cmd`/console child would otherwise pop a
+  // visible cmd.exe window — and closing it kills the whole codex tree. Hide it.
+  return crossSpawn(command, [...args], { windowsHide: true, ...options });
 }
 
-/** Synchronous counterpart of {@link spawnProcess} (same Windows `.cmd` fix). */
+/** Synchronous counterpart of {@link spawnProcess} (same Windows `.cmd` + hide fix). */
 export function spawnProcessSync(
   command: string,
   args: readonly string[] = [],
   options: SpawnSyncOptions = {},
 ) {
-  return crossSpawn.sync(command, [...args], options);
+  return crossSpawn.sync(command, [...args], { windowsHide: true, ...options });
 }
 
 /**

@@ -33,10 +33,15 @@ export interface Project {
   /** 项目级响应白名单：谁能让 bot 在本群响应/跑 codex。空/缺省 = 所有人；
    * admin/owner 恒豁免（见 isUserAllowedInProject）。 */
   allowedUsers?: string[];
-  /** permission tier for codex's sandbox. Omitted on old data → treated as
-   * 'full' (danger-full-access), preserving prior behavior. Read via
-   * {@link effectiveMode}. 'qa'/'write' confine reads+writes to `cwd`. */
+  /** permission tier for codex's sandbox — the tier ADMINS/owner get. Omitted on
+   * old data → treated as 'full' (danger-full-access), preserving prior behavior.
+   * Read via {@link effectiveMode}. 'qa'/'write' confine reads+writes to `cwd`. */
   mode?: PermissionMode;
+  /** permission tier for NON-admin senders. Unset → same as `mode` (no split,
+   * the historical single-tier behavior). When set to a distinct tier, admin and
+   * guest turns run on SEPARATE codex threads (see {@link turnTier}). Read via
+   * {@link effectiveGuestMode}. */
+  guestMode?: PermissionMode;
   /** allow the sandboxed agent's shell to reach the network (only meaningful for
    * 'qa'/'write'; 'full' is always networked). Default false. */
   network?: boolean;
@@ -63,6 +68,37 @@ export function defaultNoMention(p: Pick<Project, 'kind' | 'origin'>): boolean {
  */
 export function effectiveMode(p: Pick<Project, 'mode'>): PermissionMode {
   return p.mode ?? 'full';
+}
+
+/**
+ * The effective tier for NON-admin senders. Unset `guestMode` → same as the
+ * admin tier ({@link effectiveMode}), i.e. no split (everyone shares one tier,
+ * the historical behavior). Single source of truth for the guest-side read.
+ */
+export function effectiveGuestMode(p: Pick<Project, 'mode' | 'guestMode'>): PermissionMode {
+  return p.guestMode ?? effectiveMode(p);
+}
+
+/**
+ * Resolve a turn's permission tier + role from the sender's admin status.
+ * `split` is true only when a distinct `guestMode` is configured — then the
+ * sandbox AND the codex conversation history (both bound per thread) differ by
+ * role, so admin and guest turns MUST run on separate threads. The caller
+ * namespaces the session key by `role` when `split` to keep a guest from ever
+ * inheriting the admin thread (its sandbox or its history). No split → one
+ * shared thread per topic, unchanged from before.
+ */
+export function turnTier(
+  p: Pick<Project, 'mode' | 'guestMode'>,
+  isAdminSender: boolean,
+): { mode: PermissionMode; role: 'admin' | 'guest'; split: boolean } {
+  const adminTier = effectiveMode(p);
+  const guestTier = effectiveGuestMode(p);
+  return {
+    mode: isAdminSender ? adminTier : guestTier,
+    role: isAdminSender ? 'admin' : 'guest',
+    split: guestTier !== adminTier,
+  };
 }
 
 interface StoreFile {

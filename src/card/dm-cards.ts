@@ -5,11 +5,11 @@ import {
   resolveOwner,
   type AppConfig,
 } from '../config/schema';
-import { defaultNoMention, effectiveMode, type Project } from '../project/registry';
+import { defaultNoMention, effectiveGuestMode, effectiveMode, type Project } from '../project/registry';
 import type { PermissionMode } from '../agent/types';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
-import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject } from './cards';
+import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject, type SelectOption } from './cards';
 import { relativeTime } from './command-cards';
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
@@ -53,9 +53,9 @@ export const DM = {
   // 项目设置容器（项目列表 / 建项目完成卡 进入），以后的项目级设置项往这里加
   projectSettings: 'dm.projectSettings',
   setNoMentionDm: 'dm.proj.noMention',
-  // 🔐 权限：codex 沙箱档位 + 联网开关（项目设置容器内）
-  setMode: 'dm.proj.mode',
-  setNetwork: 'dm.proj.network',
+  // 🔐 权限：codex 沙箱档位（管理员档 + 普通用户档）+ 联网，做成下拉表单（选+提交）
+  permission: 'dm.proj.perm',
+  permissionSubmit: 'dm.proj.perm.submit',
 } as const;
 
 /** Action ids for the in-group settings card (@bot /settings). */
@@ -686,47 +686,72 @@ export function buildAddAdminCard(members: { openId: string; name: string }[]): 
 }
 
 /** Permission tiers, escalating, each with a one-line plain-language description
- * (no "cwd" jargon — "项目文件夹"). Network is a SEPARATE toggle (see
- * {@link permissionBlock}); these lines deliberately say nothing about it. */
+ * (no "cwd" jargon — "项目文件夹"). */
 const MODE_OPTS: { value: PermissionMode; label: string; desc: string }[] = [
   { value: 'qa', label: '🔒 项目内只读', desc: '只能查看项目文件夹里的内容，不会改任何文件' },
   { value: 'write', label: '✏️ 项目内读写', desc: '能查看并修改项目文件夹里的文件，但碰不到文件夹外' },
   { value: 'full', label: '⚠️ 完全访问', desc: '能读写整台电脑上的任何文件' },
 ];
 
+/** Short label for a tier (falls back to the raw value). */
+function tierLabel(m: PermissionMode): string {
+  return MODE_OPTS.find((o) => o.value === m)?.label ?? m;
+}
+
+/** Tier dropdown options: "label — desc" so the meaning shows in the menu. */
+const TIER_SELECT_OPTS: SelectOption[] = MODE_OPTS.map((o) => ({ label: `${o.label} — ${o.desc}`, value: o.value }));
+
+/** One-line summary of a project's tiers, for the 项目设置 card. */
+export function permissionSummary(p: Pick<Project, 'mode' | 'guestMode'>): string {
+  const admin = effectiveMode(p);
+  const guest = effectiveGuestMode(p);
+  return admin === guest
+    ? `所有人：${tierLabel(admin)}`
+    : `管理员：${tierLabel(admin)}　·　其他人：${tierLabel(guest)}`;
+}
+
 /**
- * The 「🔐 权限」 block inside the project settings card: one button per tier
- * (selected = highlighted) each followed by a one-line description, then the
- * network toggle (which IS part of permissions). Buttons carry the project
- * `name` (the DM card can't resolve by evt.chatId). 'full' is always networked,
- * so the toggle is replaced by a note in that tier.
- *
- * Option buttons, not select_static — Feishu locks a card once a select is
- * touched (see {@link buildSettingsCard}); buttons keep the card interactive.
+ * 🔐 权限表单卡（DM「项目设置 → 🔐 权限」）。两个下拉:「管理员档」给 owner/管理员、
+ * 「普通用户档」给群里其他人——两档**不同**即按档位拆线程(各自独立沙箱+对话历史)、**相同**
+ * 则所有人一致。外加联网开关。用 selectMenu(表单收值、提交时才读、不锁卡)而非即时按钮——
+ * 选完点提交；提交 handler 落盘 + 驱逐活跃会话让新档立刻生效。
  */
-function permissionBlock(p: Pick<Project, 'name' | 'mode' | 'network'>): CardElement[] {
-  const mode = effectiveMode(p);
+export function buildPermissionCard(p: Pick<Project, 'name' | 'mode' | 'guestMode' | 'network'>): CardObject {
   const network = p.network ?? false;
-  const els: CardElement[] = [md('**🔐 权限**')];
-  for (const o of MODE_OPTS) {
-    els.push(
-      actions([button(o.label, { a: DM.setMode, v: o.value, n: p.name }, o.value === mode ? 'primary' : 'default')]),
-    );
-    els.push(note(o.desc));
-  }
-  if (mode === 'full') {
-    els.push(note('🌐 联网：完全访问档恒为联网。'));
-  } else {
-    els.push(md('🌐 联网'));
-    els.push(
-      actions([
-        button('关', { a: DM.setNetwork, v: 'off', n: p.name }, network ? 'default' : 'primary'),
-        button('开', { a: DM.setNetwork, v: 'on', n: p.name }, network ? 'primary' : 'default'),
+  return card(
+    [
+      md(`**🔐 权限** · ${p.name}`),
+      note(
+        'codex 沙箱的访问范围。「管理员档」给 owner / 管理员，「普通用户档」给群里其他人。' +
+          '两档**不同**时，两类人各用独立线程（互不串沙箱与对话历史）；**相同**则所有人一致。',
+      ),
+      form('perm', [
+        md('👑 **管理员档**'),
+        selectMenu({ name: 'mode', placeholder: '选择管理员权限档', options: TIER_SELECT_OPTS, initial: effectiveMode(p) }),
+        md('👥 **普通用户档**'),
+        selectMenu({
+          name: 'guestMode',
+          placeholder: '选择普通用户权限档',
+          options: TIER_SELECT_OPTS,
+          initial: effectiveGuestMode(p),
+        }),
+        md('🌐 **联网**（只对只读 / 读写档有意义；完全访问恒联网）'),
+        selectMenu({
+          name: 'network',
+          placeholder: '联网开关',
+          options: [
+            { label: '关（默认，更安全）', value: 'off' },
+            { label: '开', value: 'on' },
+          ],
+          initial: network ? 'on' : 'off',
+        }),
+        actions([submitButton('✅ 保存权限', { a: DM.permissionSubmit, n: p.name }, 'primary', 'submit_perm')]),
       ]),
-    );
-    els.push(note('只影响它执行的命令能否上网，不影响回答本身。'));
-  }
-  return els;
+      note('保存会断开本项目正在进行的会话，让新档位立即生效。'),
+      actions([button('⬅️ 返回设置', { a: DM.projectSettings, n: p.name })]),
+    ],
+    { header: { title: '🔐 权限', template: 'blue' } },
+  );
 }
 
 /**
@@ -735,7 +760,7 @@ function permissionBlock(p: Pick<Project, 'name' | 'mode' | 'network'>): CardEle
  * 各按钮携带项目名 n（DM 里点，不能靠 evt.chatId 取项目）。
  */
 export function buildProjectSettingsCard(
-  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'cwd' | 'mode' | 'network'>,
+  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'cwd' | 'mode' | 'guestMode' | 'network'>,
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
@@ -744,7 +769,8 @@ export function buildProjectSettingsCard(
       md(`**项目设置** · ${project.name}`),
       note(`${kindLabel(kind)}${project.cwd ? `   ·   📂 \`${project.cwd}\`` : ''}`),
       hr(),
-      ...permissionBlock(project),
+      actions([button('🔐 权限', { a: DM.permission, n: project.name }, 'primary')]),
+      note(`当前 ${permissionSummary(project)}　·　codex 沙箱可访问的范围（管理员 / 普通用户可分设）。`),
       hr(),
       md('✋ 免@（不用 @ 也回复）'),
       actions([

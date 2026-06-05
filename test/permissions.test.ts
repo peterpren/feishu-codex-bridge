@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { effectiveMode } from '../src/project/registry';
+import { effectiveGuestMode, effectiveMode, turnTier } from '../src/project/registry';
 import { sandboxParams } from '../src/agent/codex-appserver/backend';
-import { buildProjectSettingsCard } from '../src/card/dm-cards';
+import { buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
 
 describe('effectiveMode', () => {
   it('defaults missing mode to full (legacy data unaffected)', () => {
@@ -12,6 +12,31 @@ describe('effectiveMode', () => {
     expect(effectiveMode({ mode: 'qa' })).toBe('qa');
     expect(effectiveMode({ mode: 'write' })).toBe('write');
     expect(effectiveMode({ mode: 'full' })).toBe('full');
+  });
+});
+
+describe('effectiveGuestMode', () => {
+  it('unset guestMode falls back to the admin tier (no split)', () => {
+    expect(effectiveGuestMode({ mode: 'full' })).toBe('full');
+    expect(effectiveGuestMode({ mode: 'qa' })).toBe('qa');
+    expect(effectiveGuestMode({})).toBe('full'); // legacy
+  });
+  it('explicit guestMode wins', () => {
+    expect(effectiveGuestMode({ mode: 'full', guestMode: 'qa' })).toBe('qa');
+  });
+});
+
+describe('turnTier (admin vs guest per-turn tier + thread split)', () => {
+  it('no guestMode → no split; both roles get the admin tier', () => {
+    expect(turnTier({ mode: 'full' }, true)).toEqual({ mode: 'full', role: 'admin', split: false });
+    expect(turnTier({ mode: 'full' }, false)).toEqual({ mode: 'full', role: 'guest', split: false });
+  });
+  it('guestMode equal to mode → still no split', () => {
+    expect(turnTier({ mode: 'qa', guestMode: 'qa' }, false).split).toBe(false);
+  });
+  it('distinct guestMode → split; admin keeps mode, guest gets guestMode', () => {
+    expect(turnTier({ mode: 'full', guestMode: 'qa' }, true)).toEqual({ mode: 'full', role: 'admin', split: true });
+    expect(turnTier({ mode: 'full', guestMode: 'qa' }, false)).toEqual({ mode: 'qa', role: 'guest', split: true });
   });
 });
 
@@ -70,28 +95,40 @@ describe('sandboxParams', () => {
 });
 
 describe('permission cards', () => {
-  // The 🔐 权限 block lives only in the DM project-settings container
-  // (buildProjectSettingsCard), driven by DM.setMode/DM.setNetwork actions and
-  // resolving the project by the `n` (name) the buttons carry.
-  it('project settings card lists all three tiers + the DM toggle action ids', () => {
+  // The project settings card opens the 🔐 权限 form sub-card (buildPermissionCard);
+  // the tier choice is a dropdown (select_static in a form), not live buttons.
+  it('project settings card shows the 🔐 权限 entry + a tier summary', () => {
     const json = JSON.stringify(
-      buildProjectSettingsCard({ name: 'P', cwd: '/x', kind: 'multi', origin: 'created', mode: 'qa', network: false }),
+      buildProjectSettingsCard({ name: 'P', cwd: '/x', kind: 'multi', origin: 'created', mode: 'full', guestMode: 'qa', network: false }),
     );
-    expect(json).toContain('项目设置');
-    expect(json).toContain('项目内只读');
-    expect(json).toContain('项目内读写');
-    expect(json).toContain('完全访问');
-    expect(json).toContain('dm.proj.mode');
-    expect(json).toContain('dm.proj.network'); // network toggle shown because mode !== full
-    expect(json).toContain('"n":"P"'); // buttons carry the project name
-    expect(json).toContain('dm.projects'); // ⬅️ 项目列表 back button
+    expect(json).toContain('dm.proj.perm'); // 🔐 权限 button → opens the form
+    expect(json).toContain('"n":"P"');
+    expect(json).toContain('管理员'); // split summary mentions both roles
+    expect(json).toContain('其他人');
   });
 
-  it('full tier hides the network toggle (always networked)', () => {
-    const json = JSON.stringify(
-      buildProjectSettingsCard({ name: 'P', cwd: '/x', kind: 'multi', origin: 'created', mode: 'full', network: false }),
-    );
-    expect(json).not.toContain('dm.proj.network');
-    expect(json).toContain('恒为联网');
+  it('permission form has admin + guest tier dropdowns, network, submit, and pre-selects current tiers', () => {
+    const json = JSON.stringify(buildPermissionCard({ name: 'P', mode: 'full', guestMode: 'qa', network: false }));
+    // two tier selects (select_static inside a form), by name
+    expect(json).toContain('"name":"mode"');
+    expect(json).toContain('"name":"guestMode"');
+    expect(json).toContain('"name":"network"');
+    expect(json).toContain('select_static');
+    expect(json).toContain('"tag":"form"');
+    // tiers listed + submit carries the project name
+    expect(json).toContain('项目内只读');
+    expect(json).toContain('完全访问');
+    expect(json).toContain('dm.proj.perm.submit');
+    expect(json).toContain('"n":"P"');
+    // current tiers pre-selected (initial_option)
+    expect(json).toContain('"initial_option":"full"'); // admin
+    expect(json).toContain('"initial_option":"qa"'); // guest
+  });
+
+  it('unset guestMode pre-selects the admin tier for the guest dropdown (no split)', () => {
+    const json = JSON.stringify(buildPermissionCard({ name: 'P', mode: 'qa', network: true }));
+    expect(json).toContain('"initial_option":"on"'); // network
+    // both dropdowns default to qa (guest falls back to admin tier)
+    expect((json.match(/"initial_option":"qa"/g) ?? []).length).toBe(2);
   });
 });

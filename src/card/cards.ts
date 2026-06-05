@@ -299,11 +299,18 @@ export function selectPerson(opts: { name: string; placeholder?: string; require
  * on submit). Unlike {@link selectStatic} it carries no callback behavior — it
  * doesn't fire on its own, so it won't lock the card; the picked option's value
  * comes back only on form submit. Used to pick a group member by open_id. */
-export function selectMenu(opts: { name: string; placeholder: string; options: SelectOption[] }): CardElement {
+export function selectMenu(opts: {
+  name: string;
+  placeholder: string;
+  options: SelectOption[];
+  /** option value to pre-select (shows the current value; still read on submit) */
+  initial?: string;
+}): CardElement {
   return {
     tag: 'select_static',
     name: opts.name,
     placeholder: { tag: 'plain_text', content: opts.placeholder },
+    ...(opts.initial ? { initial_option: opts.initial } : {}),
     options: opts.options.map((o) => ({ text: { tag: 'plain_text', content: o.label }, value: o.value })),
   };
 }

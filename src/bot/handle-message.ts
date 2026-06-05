@@ -51,6 +51,7 @@ import {
   buildJoinGroupFormCard,
   buildNewProjectDoneCard,
   buildNewProjectFormCard,
+  buildPermissionCard,
   buildProjectListCard,
   buildProjectSettingsCard,
   buildRmConfirmCard,
@@ -82,6 +83,7 @@ import {
   getProjectByName,
   listProjects,
   removeProject,
+  turnTier,
   updateProject,
   type Project,
 } from '../project/registry';
@@ -173,6 +175,26 @@ function pickOpenId(formValue: Record<string, unknown> | undefined): string | un
     }
   }
   return undefined;
+}
+
+/** Read a selectMenu's submitted value (form_value[name]) — best-effort across
+ * string / array / {value} shapes, mirroring {@link pickOpenId}. */
+function selectValue(formValue: Record<string, unknown> | undefined, name: string): string | undefined {
+  const c = (() => {
+    const raw = formValue?.[name];
+    return Array.isArray(raw) ? raw[0] : raw;
+  })();
+  if (typeof c === 'string') return c;
+  if (c && typeof c === 'object') {
+    const o = c as Record<string, unknown>;
+    for (const v of [o.value, o.id]) if (typeof v === 'string') return v;
+  }
+  return undefined;
+}
+
+/** Narrow an arbitrary string to a PermissionMode, else undefined. */
+function asTier(v: string | undefined): PermissionMode | undefined {
+  return v === 'qa' || v === 'write' || v === 'full' ? v : undefined;
 }
 
 interface ActiveState {
@@ -381,11 +403,12 @@ export function createOrchestrator(
         await postGroupSettings(msg, project);
         return;
       }
+      const ts = turnSession(msg.chatId, project, msg.senderId);
       if (cmd === 'model') {
-        await postModelCard(msg, msg.chatId);
+        await postModelCard(msg, ts.sessionKey);
         return;
       }
-      handleTurn(msg, text, msg.chatId, true, project);
+      handleTurn(msg, text, ts.sessionKey, true, project, ts);
       return;
     }
 
@@ -397,11 +420,12 @@ export function createOrchestrator(
         await postHelpCard(msg, 'topic', true, project);
         return;
       }
+      const ts = turnSession(msg.threadId, project, msg.senderId);
       if (cmd === 'model') {
-        await postModelCard(msg, msg.threadId);
+        await postModelCard(msg, ts.sessionKey);
         return;
       }
-      handleTurn(msg, text, msg.threadId, false, project);
+      handleTurn(msg, text, ts.sessionKey, false, project, ts);
       return;
     }
     // Main group area: /resume opens the history picker; /settings opens the
@@ -476,6 +500,29 @@ export function createOrchestrator(
     });
   }
 
+  /** A turn's resolved permission, by sender role. `roleSuffix` is set only when
+   * the project splits admin/guest tiers — then the session key is namespaced by
+   * it so a guest never shares the admin thread (sandbox + codex history). */
+  type TurnPerm = { mode?: PermissionMode; network?: boolean; roleSuffix?: 'admin' | 'guest' };
+
+  /** Pick this sender's tier (admin vs guest) for `project`. */
+  function turnPerm(project: Project | undefined, senderId: string): TurnPerm {
+    if (!project) return {};
+    const t = turnTier(project, isAdmin(cfg, senderId));
+    return { mode: t.mode, network: project.network, roleSuffix: t.split ? t.role : undefined };
+  }
+
+  /** As {@link turnPerm}, plus the role-namespaced session key (only namespaced
+   * when the project splits tiers — keeps existing single-tier sessions intact). */
+  function turnSession(
+    baseKey: string,
+    project: Project | undefined,
+    senderId: string,
+  ): { sessionKey: string } & TurnPerm {
+    const perm = turnPerm(project, senderId);
+    return { sessionKey: perm.roleSuffix ? `${baseKey}#${perm.roleSuffix}` : baseKey, ...perm };
+  }
+
   /**
    * A turn in a session keyed by `sessionKey` — the topic's threadId (multi) or
    * the chatId (single, `flat`). steer/queue mid-turn; otherwise reserve + run.
@@ -486,7 +533,8 @@ export function createOrchestrator(
     text: string,
     sessionKey: string,
     flat: boolean,
-    project?: Project,
+    project: Project | undefined,
+    perm: TurnPerm,
   ): Promise<void> {
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
@@ -500,7 +548,7 @@ export function createOrchestrator(
       // If it's gone, start a fresh run (carrying the images we already fetched).
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, text, sessionKey, flat, project, images);
+        startReservedRun(msg, text, sessionKey, flat, project, perm, images);
         return;
       }
       if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
@@ -520,7 +568,7 @@ export function createOrchestrator(
       return;
     }
 
-    startReservedRun(msg, text, sessionKey, flat, project);
+    startReservedRun(msg, text, sessionKey, flat, project, perm);
   }
 
   /**
@@ -538,7 +586,8 @@ export function createOrchestrator(
     text: string,
     sessionKey: string,
     flat: boolean,
-    project?: Project,
+    project: Project | undefined,
+    perm: TurnPerm,
     preloadedImages?: string[],
   ): void {
     const existing = active.get(sessionKey);
@@ -558,12 +607,12 @@ export function createOrchestrator(
         // (inside the detached run, after the synchronous reservation).
         const images =
           preloadedImages ?? (messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined);
-        let thread = await resolveThread(sessionKey, msg.chatId, { mode: project?.mode, network: project?.network });
+        let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
         if (!thread) {
           // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd.
           const cwd = project?.cwd ?? fallbackCwd;
-          thread = await backend.startThread({ cwd, mode: project?.mode, network: project?.network });
+          thread = await backend.startThread({ cwd, mode: perm.mode, network: perm.network });
           sessions.set(sessionKey, thread);
           await upsertSession({
             threadId: sessionKey,
@@ -678,12 +727,16 @@ export function createOrchestrator(
       // unlike an in-topic turn (see handleTurn).
       const reaction = runReaction(msg.messageId, !sema.hasFree());
       const cwd = project?.cwd ?? fallbackCwd;
+      // The topic creator's role decides this new topic's tier; roleSuffix (when
+      // tiers are split) namespaces the persisted session so the other role gets
+      // its own thread on its first message (see turnSession / adoptThreadId).
+      const perm = turnPerm(project, msg.senderId);
       // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
       if (project) void refreshBranch(channel, project).catch(() => undefined);
       const { model, effort } = pickDefault(await listModels());
       let thread: AgentThread;
       try {
-        thread = await backend.startThread({ cwd, model, effort, mode: project?.mode, network: project?.network });
+        thread = await backend.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network });
       } catch (err) {
         reaction.done();
         log.fail('card', err, { phase: 'start-topic' });
@@ -709,6 +762,7 @@ export function createOrchestrator(
           cwd,
           summary: text.slice(0, 80) || '(空)',
           requesterOpenId: msg.senderId,
+          roleSuffix: perm.roleSuffix,
         },
         reaction,
         () => reaction.done(), // topic created → ✅ DONE (don't wait for the reply)
@@ -1355,33 +1409,36 @@ export function createOrchestrator(
         return buildProjectSettingsCard({ ...p, noMention: on });
       });
     })
-    // 🔐 权限：切 codex 沙箱档位。改档必须驱逐该项目活跃会话——沙箱在 thread/start
-    // 绑定后不可变，否则切到只读后正在跑的 full 线程仍读全盘（卡片显示只读、运行时却没限制）。
-    .on(DM.setMode, ({ evt, value }) => {
+    // 🔐 权限：打开下拉表单子卡（管理员档 + 普通用户档 + 联网，选完提交）。
+    .on(DM.permission, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      const mode = value.v as PermissionMode;
-      if (mode !== 'qa' && mode !== 'write' && mode !== 'full') return;
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard();
-        await updateProject(name, { mode });
-        await evictLiveSessionsForChat(p.chatId);
-        return buildProjectSettingsCard({ ...p, mode });
+        return p ? buildPermissionCard(p) : buildDmMenuCard();
       });
     })
-    // 🌐 联网开关（仅 qa/write 有意义；full 恒联网）。同样驱逐活跃会话以重建沙箱。
-    .on(DM.setNetwork, ({ evt, value }) => {
+    // 提交权限表单：落盘 管理员档 mode / 普通用户档 guestMode / 联网，再驱逐本项目活跃会话
+    // 让新档立即生效（沙箱在 thread/start 绑定后不可变）。表单卡 card_id 提交后会锁，故发
+    // 一张全新的项目设置卡（旧表单卡留痕），不 patch 原卡。
+    .on(DM.permissionSubmit, ({ evt, value, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      const network = value.v === 'on';
-      patch(evt, async () => {
+      const mode = asTier(selectValue(formValue, 'mode'));
+      const guestMode = asTier(selectValue(formValue, 'guestMode'));
+      const network = selectValue(formValue, 'network') === 'on';
+      void (async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard();
-        await updateProject(name, { network });
+        if (!p) return;
+        await updateProject(name, { ...(mode ? { mode } : {}), ...(guestMode ? { guestMode } : {}), network });
         await evictLiveSessionsForChat(p.chatId);
-        return buildProjectSettingsCard({ ...p, network });
-      });
+        log.info('console', 'permission', { project: name, mode, guestMode, network });
+        const fresh = await getProjectByName(name); // 写后回读，卡片与盘上一致
+        if (!fresh) return;
+        await sendManagedCard(channel, evt.chatId, buildProjectSettingsCard(fresh)).catch((e) =>
+          log.fail('console', e, { phase: 'permission-result' }),
+        );
+      })();
     });
 
   /**
@@ -1473,6 +1530,9 @@ export function createOrchestrator(
     requesterOpenId?: string;
     /** single-session group: reply by quoting (no reply_in_thread / topic). */
     flat?: boolean;
+    /** when admin/guest tiers are split: 'admin'|'guest' to namespace the
+     * resolved topic key so the two roles never share a thread (see turnSession). */
+    roleSuffix?: 'admin' | 'guest';
   }
 
   async function launchRun(
@@ -1549,13 +1609,18 @@ export function createOrchestrator(
           if (activeKey.startsWith('pending:')) {
             const tid = await getThreadId(channel, messageId);
             if (tid) {
+              // Logical session key = real Feishu topic id + role suffix (when
+              // admin/guest tiers are split), so the two roles keep separate
+              // threads in the same topic. Feishu reply targeting uses messageId,
+              // not this key, so the suffix is purely bridge-internal.
+              const key = opts.roleSuffix ? `${tid}#${opts.roleSuffix}` : tid;
               active.delete(activeKey);
-              active.set(tid, state);
-              sessions.set(tid, opts.thread);
-              activeKey = tid;
-              topicThreadId = tid;
-              rc.threadId = tid;
-              await persist(tid);
+              active.set(key, state);
+              sessions.set(key, opts.thread);
+              activeKey = key;
+              topicThreadId = key;
+              rc.threadId = key;
+              await persist(key);
             }
           } else {
             topicThreadId = activeKey;

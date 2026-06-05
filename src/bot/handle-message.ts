@@ -124,6 +124,39 @@ async function resolveNames(channel: LarkChannel, ids: (string | undefined)[]): 
   return out;
 }
 
+/** 拉群成员（open_id + 姓名）。该接口**不返回机器人成员**（天然排除 bot），也能拿到
+ * 外部租户成员（不受通讯录可见范围限制）。失败 / 无权限返回空数组（调用方降级到手填
+ * open_id）。仅取首页（page_size 100），大群配合手填。 */
+async function fetchChatMembers(channel: LarkChannel, chatId: string): Promise<{ openId: string; name: string }[]> {
+  try {
+    const r = await channel.rawClient.im.v1.chatMembers.get({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id', page_size: 100 },
+    });
+    const out: { openId: string; name: string }[] = [];
+    for (const it of r.data?.items ?? []) {
+      if (it.member_id) out.push({ openId: it.member_id, name: it.name || `…${it.member_id.slice(-6)}` });
+    }
+    return out;
+  } catch (err) {
+    log.info('console', 'fetch-members-fail', { chatId: chatId.slice(-6), err: String(err) });
+    return [];
+  }
+}
+
+/** 所有项目群成员的并集（去重）—— admins 加人的候选源（admins 通常是项目相关的人）。
+ * 逐群调 fetchChatMembers，失败的群跳过；不含 bot/应用（接口保证）。 */
+async function fetchAllProjectMembers(channel: LarkChannel): Promise<{ openId: string; name: string }[]> {
+  const projects = await listProjects();
+  // 并发拉各项目群成员（原串行 for-await 在项目多时单次渲染放大成 O(N) 串行调用）。
+  const lists = await Promise.all(projects.filter((p) => p.chatId).map((p) => fetchChatMembers(channel, p.chatId)));
+  const seen = new Map<string, string>();
+  for (const members of lists) {
+    for (const m of members) if (!seen.has(m.openId)) seen.set(m.openId, m.name);
+  }
+  return [...seen].map(([openId, name]) => ({ openId, name }));
+}
+
 /**
  * 从 select_person 的提交值（form_value['pick']）里取出 open_id。单选格式飞书未在
  * 类型中声明（可能是字符串 / 数组 / {open_id|id|value}），故 best-effort 兼容多形态，
@@ -857,6 +890,23 @@ export function createOrchestrator(
   const patch = (evt: CardActionEvent, c: object | (() => object | Promise<object>)): void =>
     settleUpdate(evt.messageId, c, evt.chatId);
 
+  /** open_id→姓名 三级兜底（管理员/白名单卡展示用）：
+   *  1) resolveNames：contact.batch（需 contact:user.base:readonly）；
+   *  2) 项目群成员名：im:chat:readonly 已开就够，含外部成员，是 contact 没开时的主力；
+   *  3) 卡片回调自带的操作者姓名（若 operator 带 name）。都拿不到才降级尾号。 */
+  const namesWithOperator = async (
+    evt: CardActionEvent,
+    ids: (string | undefined)[],
+  ): Promise<Map<string, string>> => {
+    const m = await resolveNames(channel, ids);
+    if (ids.some((id) => id && !m.has(id))) {
+      for (const mem of await fetchAllProjectMembers(channel)) if (!m.has(mem.openId)) m.set(mem.openId, mem.name);
+    }
+    const op = evt.operator as { openId?: string; name?: string } | undefined;
+    if (op?.openId && op.name && !m.has(op.openId)) m.set(op.openId, op.name);
+    return m;
+  };
+
   function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): void {
     if (!dmAdmin(evt.operator?.openId)) return;
     const prefs: AppPreferences = { ...(cfg.preferences ?? {}) };
@@ -1155,15 +1205,21 @@ export function createOrchestrator(
     .on(DM.admins, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       patch(evt, async () =>
-        buildAdminsCard(cfg, await resolveNames(channel, [resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])])),
+        buildAdminsCard(cfg, await namesWithOperator(evt, [resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])])),
       );
     })
     .on(DM.addAdminForm, ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) patch(evt, buildAddAdminCard());
+      if (!dmAdmin(evt.operator?.openId)) return;
+      patch(evt, async () => {
+        const all = await fetchAllProjectMembers(channel);
+        const members = all.filter((m) => !isAdmin(cfg, m.openId)); // 排除已是 admin/owner 的
+        return buildAddAdminCard(members);
+      });
     })
     .on(DM.addAdminSubmit, ({ evt, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      const id = pickOpenId(formValue);
+      const manual = String(formValue?.open_id ?? '').trim();
+      const id = manual.startsWith('ou_') ? manual : pickOpenId(formValue);
       log.info('console', 'admin-add', { picked: id?.slice(-6) ?? null });
       void (async () => {
         if (id) {
@@ -1174,7 +1230,7 @@ export function createOrchestrator(
           await saveConfig(cfg).catch((e) => log.fail('console', e, { phase: 'save-config' }));
         }
         const ids = [resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])];
-        const next = buildAdminsCard(cfg, await resolveNames(channel, ids));
+        const next = buildAdminsCard(cfg, await namesWithOperator(evt, ids));
         await sendManagedCard(channel, evt.chatId, next).catch((e) => log.fail('console', e, { phase: 'admin-add-result' }));
       })();
     })
@@ -1190,7 +1246,7 @@ export function createOrchestrator(
           await saveConfig(cfg).catch((e) => log.fail('console', e, { phase: 'save-config' }));
         }
         const ids = [resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])];
-        return buildAdminsCard(cfg, await resolveNames(channel, ids));
+        return buildAdminsCard(cfg, await namesWithOperator(evt, ids));
       });
     })
     .on(DM.allowlist, ({ evt, value }) => {
@@ -1199,25 +1255,31 @@ export function createOrchestrator(
       patch(evt, async () => {
         const p = await getProjectByName(name);
         if (!p) return buildDmMenuCard();
-        return buildAllowlistCard(p, await resolveNames(channel, p.allowedUsers ?? []));
+        return buildAllowlistCard(p, await namesWithOperator(evt, p.allowedUsers ?? []));
       });
     })
     .on(DM.addAllowedForm, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      if (name) patch(evt, buildAddAllowedCard(name));
+      if (!name) return;
+      patch(evt, async () => {
+        const p = await getProjectByName(name);
+        const members = p?.chatId ? await fetchChatMembers(channel, p.chatId) : [];
+        return buildAddAllowedCard(name, members);
+      });
     })
     .on(DM.addAllowedSubmit, ({ evt, value, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      const id = pickOpenId(formValue);
+      const manual = String(formValue?.open_id ?? '').trim();
+      const id = manual.startsWith('ou_') ? manual : pickOpenId(formValue);
       log.info('console', 'allow-add', { project: name, picked: id?.slice(-6) ?? null });
       void (async () => {
-        const p = await getProjectByName(name);
-        if (!p) return;
-        const next = id ? Array.from(new Set([...(p.allowedUsers ?? []), id])) : (p.allowedUsers ?? []);
-        if (id) await updateProject(name, { allowedUsers: next });
-        const card = buildAllowlistCard({ ...p, allowedUsers: next }, await resolveNames(channel, next));
+        // 函数式 updater：在 registry 临界区内基于最新盘值 append 去重，避免并发丢更新。
+        if (id) await updateProject(name, (p) => ({ allowedUsers: Array.from(new Set([...(p.allowedUsers ?? []), id])) }));
+        const fresh = await getProjectByName(name); // 写后回读，卡片显示与盘上一致
+        if (!fresh) return;
+        const card = buildAllowlistCard(fresh, await namesWithOperator(evt, fresh.allowedUsers ?? []));
         await sendManagedCard(channel, evt.chatId, card).catch((e) => log.fail('console', e, { phase: 'allow-add-result' }));
       })();
     })
@@ -1226,11 +1288,10 @@ export function createOrchestrator(
       const id = typeof value.u === 'string' ? value.u : '';
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
-        const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard();
-        const next = (p.allowedUsers ?? []).filter((x) => x !== id);
-        await updateProject(name, { allowedUsers: next });
-        return buildAllowlistCard({ ...p, allowedUsers: next }, await resolveNames(channel, next));
+        await updateProject(name, (p) => ({ allowedUsers: (p.allowedUsers ?? []).filter((x) => x !== id) }));
+        const fresh = await getProjectByName(name); // 写后回读，与盘上一致
+        if (!fresh) return buildDmMenuCard();
+        return buildAllowlistCard(fresh, await namesWithOperator(evt, fresh.allowedUsers ?? []));
       });
     })
     // 项目设置卡（可扩展容器）：打开 + DM 版免@开关（携带项目名 n，不能靠 evt.chatId）。

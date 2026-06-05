@@ -1,4 +1,5 @@
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from './paths';
 import type { AppConfig, AppPreferences, TenantBrand } from './schema';
@@ -63,10 +64,20 @@ export async function ensureSecretsGetterWrapper(): Promise<string> {
   return wrapperPath;
 }
 
-export async function saveConfig(cfg: AppConfig, path: string = paths.configFile): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}`;
-  await writeFile(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
-  await chmod(tmp, 0o600);
-  await rename(tmp, path);
+// 同进程内并发 saveConfig 串行化 + tmp 唯一名：避免两次写共用 tmp 文件交错（rename
+// 命中被对方写一半的 tmp → JSON 损坏，或丢写）。
+let saveChain: Promise<unknown> = Promise.resolve();
+export function saveConfig(cfg: AppConfig, path: string = paths.configFile): Promise<void> {
+  const run = saveChain.then(async () => {
+    await mkdir(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+    await writeFile(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+    await chmod(tmp, 0o600);
+    await rename(tmp, path);
+  });
+  saveChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }

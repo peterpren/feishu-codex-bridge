@@ -8,7 +8,7 @@ import {
 import { defaultNoMention, type Project } from '../project/registry';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
-import { actions, button, card, form, hr, input, linkButton, md, note, selectPerson, submitButton, type CardElement, type CardObject } from './cards';
+import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject } from './cards';
 import { relativeTime } from './command-cards';
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
@@ -644,14 +644,37 @@ export function buildAdminsCard(cfg: AppConfig, names: Map<string, string>): Car
 
 /** 添加管理员的表单卡：select_person 选人 + 提交。提交后旧卡留痕、结果发新名单卡
  * （form+submit 模式规避 select 锁卡，仿 {@link buildNewProjectFormCard}）。 */
-export function buildAddAdminCard(): CardObject {
+/**
+ * 添加管理员的表单卡。候选 = **所有项目群成员的并集**（真人，去重、不含 bot/应用，
+ * 调用方已排除现有 admin）；大群/多群只列前 N，其余走 open_id 手填兜底。 */
+export function buildAddAdminCard(members: { openId: string; name: string }[]): CardObject {
+  const MAX = 50;
+  const shown = members.slice(0, MAX);
+  const formEls: CardElement[] = [];
+  if (shown.length > 0) {
+    formEls.push(
+      selectMenu({
+        name: 'pick',
+        placeholder: '从项目群成员选择',
+        options: shown.map((m) => ({ label: m.name, value: m.openId })),
+      }),
+    );
+  }
+  formEls.push(
+    input({
+      name: 'open_id',
+      label: shown.length ? '或直接输入 open_id' : '输入 open_id（未读取到项目群成员）',
+      placeholder: 'ou_xxx',
+    }),
+    actions([submitButton('✅ 确认添加', { a: DM.addAdminSubmit }, 'primary', 'submit_admin')]),
+  );
+  const tail: CardElement[] = [];
+  if (members.length > MAX) tail.push(note(`候选较多，仅列前 ${MAX} 个；其余请直接输入 open_id。`));
   return card(
     [
-      md('**添加管理员** · 选一个人加入管理员名单'),
-      form('add_admin', [
-        selectPerson({ name: 'pick', placeholder: '选择要添加为管理员的人', required: true }),
-        actions([submitButton('✅ 确认添加', { a: DM.addAdminSubmit }, 'primary', 'submit_admin')]),
-      ]),
+      md('**添加管理员** · 从项目群成员选，或输入 open_id'),
+      form('add_admin', formEls),
+      ...tail,
       actions([button('⬅️ 取消', { a: DM.admins })]),
     ],
     { header: { title: '➕ 添加管理员', template: 'blue' } },
@@ -724,15 +747,41 @@ export function buildAllowlistCard(
   return card(elements, { header: { title: '🛡 响应白名单', template: 'blue' } });
 }
 
-/** 添加白名单成员的表单卡。提交按钮携带项目名（n），回调据此 updateProject。 */
-export function buildAddAllowedCard(projectName: string): CardObject {
+/**
+ * 添加白名单成员的表单卡。候选来自**群成员接口**（含外部租户成员，且 API 本身不返回
+ * 机器人）；大群只列前 N，其余走 open_id 手动输入兜底。提交按钮携带项目名（n）。
+ */
+export function buildAddAllowedCard(
+  projectName: string,
+  members: { openId: string; name: string }[],
+): CardObject {
+  const MAX = 50;
+  const shown = members.slice(0, MAX);
+  const formEls: CardElement[] = [];
+  if (shown.length > 0) {
+    formEls.push(
+      selectMenu({
+        name: 'pick',
+        placeholder: '从群成员选择',
+        options: shown.map((m) => ({ label: m.name, value: m.openId })),
+      }),
+    );
+  }
+  formEls.push(
+    input({
+      name: 'open_id',
+      label: shown.length ? '或直接输入 open_id' : '输入 open_id（未读取到群成员）',
+      placeholder: 'ou_xxx',
+    }),
+    actions([submitButton('✅ 确认添加', { a: DM.addAllowedSubmit, n: projectName }, 'primary', 'submit_allowed')]),
+  );
+  const tail: CardElement[] = [];
+  if (members.length > MAX) tail.push(note(`群成员较多，仅列前 ${MAX} 个；其余请直接输入 open_id。`));
   return card(
     [
       md(`**添加可使用「${projectName}」的人**`),
-      form('add_allowed', [
-        selectPerson({ name: 'pick', placeholder: '选择可使用本群的人', required: true }),
-        actions([submitButton('✅ 确认添加', { a: DM.addAllowedSubmit, n: projectName }, 'primary', 'submit_allowed')]),
-      ]),
+      form('add_allowed', formEls),
+      ...tail,
       actions([button('⬅️ 取消', { a: DM.allowlist, n: projectName })]),
     ],
     { header: { title: '➕ 添加白名单成员', template: 'blue' } },

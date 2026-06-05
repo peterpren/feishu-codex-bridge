@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
 
@@ -64,9 +65,22 @@ async function read(): Promise<Project[]> {
   }
 }
 
+// 同进程内并发的「读-改-写」串行化（addProject/updateProject/removeProject）：既防
+// 共用 tmp 文件交错损坏，也防两个回调基于同一旧快照算 next、后写覆盖前写的丢更新
+// （白名单数组增删最易踩中）。配合函数式 updater，把 read+算+write 收进一个临界区。
+let opChain: Promise<unknown> = Promise.resolve();
+function withLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = opChain.then(fn, fn);
+  opChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 async function write(projects: Project[]): Promise<void> {
   await mkdir(dirname(paths.projectsFile), { recursive: true });
-  const tmp = `${paths.projectsFile}.tmp-${process.pid}`;
+  const tmp = `${paths.projectsFile}.tmp-${process.pid}-${randomUUID()}`;
   const body: StoreFile = { version: FILE_VERSION, projects };
   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   await rename(tmp, paths.projectsFile);
@@ -88,39 +102,48 @@ export async function getProjectByName(name: string): Promise<Project | undefine
  * The chatId check is the registry-level hard guard against binding one group
  * twice (createProject's chatId is freshly minted so it never trips). */
 export async function addProject(p: Project): Promise<void> {
-  const projects = await read();
-  if (projects.some((x) => x.name === p.name)) {
-    throw new Error(`项目名「${p.name}」已存在`);
-  }
-  if (p.chatId) {
-    const bound = projects.find((x) => x.chatId === p.chatId);
-    if (bound) throw new Error(`该群已绑定为项目「${bound.name}」`);
-  }
-  projects.push(p);
-  await write(projects);
+  return withLock(async () => {
+    const projects = await read();
+    if (projects.some((x) => x.name === p.name)) {
+      throw new Error(`项目名「${p.name}」已存在`);
+    }
+    if (p.chatId) {
+      const bound = projects.find((x) => x.chatId === p.chatId);
+      if (bound) throw new Error(`该群已绑定为项目「${bound.name}」`);
+    }
+    projects.push(p);
+    await write(projects);
+  });
 }
 
-/** Patch fields of a project by name; no-op if it doesn't exist. */
+/** Patch fields of a project by name; no-op if it doesn't exist. `patch` 可以是
+ * 对象，或一个 `(p) => patch` 函数——后者在同一临界区内基于**最新盘值**计算补丁，
+ * 用于数组增量改写（如 allowedUsers append/filter）避免丢更新。 */
 export async function updateProject(
   name: string,
-  patch: Partial<Omit<Project, 'name'>>,
+  patch: Partial<Omit<Project, 'name'>> | ((p: Project) => Partial<Omit<Project, 'name'>>),
 ): Promise<void> {
-  const projects = await read();
-  const p = projects.find((x) => x.name === name);
-  if (!p) return;
-  const target = p as unknown as Record<string, unknown>;
-  for (const [k, v] of Object.entries(patch)) {
-    if (v !== undefined) target[k] = v;
-  }
-  await write(projects);
+  return withLock(async () => {
+    const projects = await read();
+    const p = projects.find((x) => x.name === name);
+    if (!p) return;
+    const actual = typeof patch === 'function' ? patch(p) : patch;
+    const target = p as unknown as Record<string, unknown>;
+    for (const [k, v] of Object.entries(actual)) {
+      if (v !== undefined) target[k] = v;
+    }
+    await write(projects);
+  });
 }
 
 /** Remove (unbind) a project by name. Returns the removed entry, if any. */
 export async function removeProject(name: string): Promise<Project | undefined> {
-  const projects = await read();
-  const idx = projects.findIndex((p) => p.name === name);
-  if (idx === -1) return undefined;
-  const [removed] = projects.splice(idx, 1);
-  await write(projects);
-  return removed;
+  return withLock(async () => {
+    const projects = await read();
+    const idx = projects.findIndex((p) => p.name === name);
+    if (idx === -1) return undefined;
+    const [removed] = projects.splice(idx, 1);
+    await write(projects);
+    return removed;
+  });
 }

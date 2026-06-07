@@ -1,6 +1,6 @@
 import type { BotAddedEvent, CardActionEvent, CommentEvent, LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { createBackend } from '../agent';
-import type { AgentInput, AgentRun, AgentThread, ModelInfo, PermissionMode, ReasoningEffort } from '../agent/types';
+import type { AgentInput, AgentRun, AgentThread, ModelInfo, PermissionMode, ReasoningEffort, ThreadSummary } from '../agent/types';
 import {
   getMaxConcurrentRuns,
   getPendingPolicy,
@@ -20,7 +20,7 @@ import { saveConfig } from '../config/store';
 import { CardDispatcher } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
-import { finalMessageText, initialState, reduce, type RunState } from '../card/run-state';
+import { finalMessageText, finalizeIfRunning, initialState, markIdleTimeout, reduce, type RunState } from '../card/run-state';
 import {
   buildHelpCard,
   buildModelCard,
@@ -45,6 +45,7 @@ import {
   buildAddAllowedCard,
   buildAdminsCard,
   buildAllowlistCard,
+  buildCloudDocFolderFormCard,
   buildDmMenuCard,
   buildDoctorCard,
   buildGroupSettingsCard,
@@ -83,24 +84,42 @@ import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
 import { getSecret } from '../config/keystore';
-import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
+import { buildScopeGrantUrl, CLOUD_DOC_FOLDER_SCOPES, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import {
   defaultNoMention,
   getProjectByChatId,
   getProjectByName,
   listProjects,
+  parseCloudDocFolder,
   removeProject,
   turnTier,
   updateProject,
+  type CloudDocFolder,
   type Project,
 } from '../project/registry';
+import { isIsolatedTopicWorkspace, prepareSessionCwd } from '../project/topic-workspace';
 import { createProject, joinExistingGroup } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
+import {
+  createTopicCloudDocFolder,
+  grantProjectCloudDocFolderAccess,
+  grantTopicCloudDocFolderAccess,
+  permissionRecord,
+} from '../project/cloud-doc-permission';
 import { leaveChat, transferOwnership } from '../project/group-ops';
 import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
+import {
+  appendRunRecord,
+  finishedRunRecord,
+  newRunId,
+  startedRunRecord,
+  type RunRecord,
+  type RunRecordContext,
+} from './run-store';
 import { handleDmConsole } from './dm-console';
 import { collectInboundImages, messageHasImages } from './media';
+import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, type TopicRequester } from './topic-title';
 import {
   addCommentReaction,
   buildCommentPrompt,
@@ -250,7 +269,8 @@ export interface Orchestrator {
  *
  * Flow (design §3):
  *   p2p                       → DM console (never runs codex).
- *   group @bot, no thread     → reply_in_thread creates the topic → run codex
+ *   group @bot, no thread     → bot posts a short title message, then
+ *                               reply_in_thread creates the topic → run codex
  *                               (default model/effort; tune later with /model).
  *   group @bot /resume        → history picker → resume a codex thread in a new topic.
  *   group @bot, inside thread → a turn in that session (steer/queue mid-turn);
@@ -258,9 +278,10 @@ export interface Orchestrator {
  *
  * Group kinds (project.kind): 'multi' (default) = a topic per session, keyed by
  * threadId (the flow above); 'single' = the whole group is one session keyed by
- * chatId, replies quote the message (no topic, runs serialize). 免@ (noMention,
- * default on) lets non-@ messages run too — multi only inside a topic, single
- * whole-group (needs the im:message.group_msg scope). @bot /settings toggles it.
+ * chatId, replies quote the message (no topic, runs serialize). 免@ (noMention)
+ * lets non-command, non-@ messages run too — multi only inside a topic, single
+ * whole-group (needs the im:message.group_msg scope). Multi defaults off;
+ * @bot /settings toggles it.
  */
 export function createOrchestrator(
   channel: LarkChannel,
@@ -299,6 +320,71 @@ export function createOrchestrator(
     const def = models.find((m) => m.isDefault && !m.hidden) ?? models.find((m) => !m.hidden) ?? models[0];
     return { model: def?.id ?? 'gpt-5.5', effort: def?.defaultEffort ?? 'medium' };
   }
+
+  function projectCloudDocAdmins(extraOpenId?: string): string[] {
+    return [...new Set([resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? []), extraOpenId].filter((x): x is string => Boolean(x)))];
+  }
+
+  function cloudDocAccess(extraOpenId?: string): { adminOpenIds: string[]; appId: string } {
+    return { adminOpenIds: projectCloudDocAdmins(extraOpenId), appId: cfg.accounts.app.id };
+  }
+
+  function usableCloudDocFolder(folder: CloudDocFolder | undefined): CloudDocFolder | undefined {
+    if (!folder?.token) return undefined;
+    if (folder.permission && folder.permission.status !== 'granted') return undefined;
+    return folder;
+  }
+
+  async function prepareTopicCloudDocFolder(
+    project: Project | undefined,
+    opts: { title: string; requesterOpenId: string; requesterName?: string; existing?: CloudDocFolder },
+  ): Promise<{ cloudDocFolder?: CloudDocFolder; cloudDocFolderError?: string }> {
+    if (!project?.cloudDocFolder?.token) return {};
+    if ((project.kind ?? 'multi') === 'single') return { cloudDocFolder: usableCloudDocFolder(project.cloudDocFolder) };
+
+    if (opts.existing?.token) {
+      const result = await grantTopicCloudDocFolderAccess(channel, opts.existing, {
+        ...cloudDocAccess(opts.requesterOpenId),
+        title: opts.title,
+        requesterOpenId: opts.requesterOpenId,
+        requesterName: opts.requesterName,
+      });
+      const folder = { ...opts.existing, permission: permissionRecord(result) };
+      if (result.status === 'granted') return { cloudDocFolder: folder };
+      return { cloudDocFolderError: result.error ?? '话题云文档目录授权失败' };
+    }
+
+    const result = await createTopicCloudDocFolder(channel, project.cloudDocFolder, {
+      ...cloudDocAccess(opts.requesterOpenId),
+      title: opts.title,
+      requesterOpenId: opts.requesterOpenId,
+      requesterName: opts.requesterName,
+    });
+    if (result.folder?.permission?.status === 'granted') return { cloudDocFolder: result.folder };
+    return { cloudDocFolderError: result.error ?? '话题云文档目录创建失败' };
+  }
+
+  async function reconcileProjectCloudDocFolderAccess(): Promise<void> {
+    for (const project of await listProjects()) {
+      if (!project.cloudDocFolder?.token) continue;
+      const result = await grantProjectCloudDocFolderAccess(channel, project.cloudDocFolder, {
+        ...cloudDocAccess(project.addedBy),
+        chatId: project.chatId,
+      });
+      const cloudDocFolder = { ...project.cloudDocFolder, permission: permissionRecord(result) };
+      await updateProject(project.name, { cloudDocFolder });
+      if (result.status === 'granted') {
+        log.info('project', 'cloud-doc-folder-reconcile', { name: project.name, via: result.via ?? '-' });
+      } else {
+        log.fail('project', new Error(result.error ?? 'grant failed'), {
+          phase: 'cloud-doc-folder-reconcile',
+          name: project.name,
+        });
+      }
+    }
+  }
+
+  void reconcileProjectCloudDocFolderAccess().catch((err) => log.fail('project', err, { phase: 'cloud-doc-folder-reconcile' }));
 
   // Feishu gives bots no way to mark a message "已读" (read receipts are a
   // human-client signal), so a reaction stands in for one. Best-effort — a
@@ -371,8 +457,8 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
-    // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
-    // single 整群;非项目群一律不响应非 @ 消息。
+    // @门：没 @ 时只在「项目群 + 明确命令 / 免@ 适用」才响应。免@ multi 默认关且
+    // 仅话题内生效，single 整群；非项目群一律不响应非 @ 消息。
     if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
     if (!isChatAllowed(cfg, msg.chatId) || !isUserAllowedInProject(cfg, project, msg.senderId)) {
       log.info('intake', 'reject', { reason: 'not_allowed', chatId: msg.chatId.slice(-6) });
@@ -416,21 +502,32 @@ export function createOrchestrator(
         await postModelCard(msg, ts.sessionKey);
         return;
       }
+      if (cmd === 'rename') {
+        await channel
+          .send(msg.chatId, { markdown: '`/rename 新名字` 只适用于多话题群里的具体话题。' }, { replyTo: msg.messageId })
+          .catch(() => undefined);
+        return;
+      }
       handleTurn(msg, text, ts.sessionKey, true, project, ts);
       return;
     }
 
-    // Multi (default): inside a topic → a turn in that session. Only /model is a
-    // command here; /settings + /resume aren't topic-scoped, so they fall through
-    // as a normal turn (告诉 codex 的普通文本).
+    // Multi (default): inside a topic → a turn in that session. /model and
+    // /rename are topic-scoped commands; /settings + /resume aren't topic-scoped,
+    // so they fall through as normal turns.
     if (msg.threadId) {
       if (cmd === 'help') {
         await postHelpCard(msg, 'topic', true, project);
         return;
       }
       const ts = turnSession(msg.threadId, project, msg.senderId);
+      if (!(await ensureTopicActorAllowed(msg, msg.threadId))) return;
       if (cmd === 'model') {
         await postModelCard(msg, ts.sessionKey);
+        return;
+      }
+      if (cmd === 'rename') {
+        await renameTopic(msg, text);
         return;
       }
       handleTurn(msg, text, ts.sessionKey, false, project, ts);
@@ -457,28 +554,57 @@ export function createOrchestrator(
         .catch(() => undefined);
       return;
     }
+    if (cmd === 'rename') {
+      await channel
+        .send(msg.chatId, { markdown: '`/rename 新名字` 需要在话题里使用。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
     startTopicDirectly(msg, text, project);
   };
 
-  /** Parse a leading slash command (`/resume`, `/model`, `/settings`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | null {
-    const m = /^\/(\w+)/.exec(text);
+  /** Parse a leading slash command (`/resume`, `/model`, `/settings`, `/rename`); null otherwise. */
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'rename' | null {
+    const m = /^\/([\w-]+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' ? name : null;
+    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' || name === 'rename'
+      ? name
+      : null;
   }
 
-  /** Whether to respond to a non-@ message in a project group (免@ default on).
-   * single: whole group. multi: inside a topic, OR a slash command in the main
-   * area — plain chatter in the main area still needs @ (开新话题 是明确意图，
-   * 不能让随便一句话就开话题)，but explicit commands (/help /resume /settings
-   * /model) respond without @ since they're unambiguous intent.
+  function parseRenameTitle(text: string): string {
+    return normalizeManualTopicTitle(text.replace(/^\/rename\b/i, ''));
+  }
+
+  /** Whether to respond to a non-@ message in a project group.
+   * Slash commands (/help /resume /settings /model /rename) respond without @
+   * because they're explicit. For normal messages, single applies to the whole
+   * group; multi applies only inside a topic. Plain chatter in the main area
+   * still needs @, so a random sentence never opens a new topic.
    * 即使开了免@，若消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
    * bot 不插话。(此函数仅在 !mentionedBot 时调用,故 @到 bot 的情况已被排除。) */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
-    if (!(project.noMention ?? defaultNoMention(project))) return false;
     if (msg.mentionAll || msg.mentions.some((m) => !m.isBot)) return false;
+    if (parseCommand(msg.content.trim()) !== null) return true;
+    if (!(project.noMention ?? defaultNoMention(project))) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
-    return Boolean(msg.threadId) || parseCommand(msg.content.trim()) !== null;
+    return Boolean(msg.threadId);
+  }
+
+  async function ensureTopicActorAllowed(msg: NormalizedMessage, threadId: string): Promise<boolean> {
+    const rec = await getSession(threadId);
+    const owner = rec?.topicRequesterOpenId;
+    if (!owner || owner === msg.senderId || isAdmin(cfg, msg.senderId)) return true;
+    const ownerLabel = rec?.topicRequesterName ? `「${rec.topicRequesterName}」` : `…${owner.slice(-6)}`;
+    await channel
+      .send(
+        msg.chatId,
+        { markdown: `这个话题由 ${ownerLabel} 发起。为避免改到别人话题的文件，只有话题发起人或管理员可以在这里驱动 Codex。请回主群区 @我 开自己的话题。` },
+        { replyTo: msg.messageId, replyInThread: true },
+      )
+      .catch(() => undefined);
+    log.info('intake', 'topic-owner-denied', { threadId, owner: owner.slice(-6), sender: msg.senderId.slice(-6) });
+    return false;
   }
 
   /** 非管理员触发 owner-only 命令(/resume、/settings)时的统一无权限提示。
@@ -529,6 +655,10 @@ export function createOrchestrator(
   ): { sessionKey: string } & TurnPerm {
     const perm = turnPerm(project, senderId);
     return { sessionKey: perm.roleSuffix ? `${baseKey}#${perm.roleSuffix}` : baseKey, ...perm };
+  }
+
+  function feishuThreadIdFromSessionKey(key: string | undefined): string | undefined {
+    return key?.split('#')[0];
   }
 
   /**
@@ -616,22 +746,51 @@ export function createOrchestrator(
         const images =
           preloadedImages ?? (messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined);
         let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
+        let rec = await getSession(sessionKey);
+        let sessionCwd = rec?.cwd;
+        let runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder);
+        let runCloudDocFolderError = rec?.cloudDocFolderError;
         if (!thread) {
           // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd.
-          const cwd = project?.cwd ?? fallbackCwd;
-          thread = await backend.startThread({ cwd, mode: perm.mode, network: perm.network });
+          const cwd = await prepareSessionCwd(project, sessionKey, fallbackCwd, { flat });
+          const topicTitle = deriveTopicTitle(text);
+          const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
+          const cloudDoc = flat
+            ? { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) }
+            : await prepareTopicCloudDocFolder(project, {
+                title: topicTitle,
+                requesterOpenId: msg.senderId,
+                requesterName,
+              });
+          sessionCwd = cwd;
+          thread = await backend.startThread({
+            cwd,
+            mode: perm.mode,
+            network: perm.network,
+            cloudDocFolder: cloudDoc.cloudDocFolder,
+          });
           sessions.set(sessionKey, thread);
+          runCloudDocFolder = cloudDoc.cloudDocFolder;
+          runCloudDocFolderError = cloudDoc.cloudDocFolderError;
           await upsertSession({
             threadId: sessionKey,
             chatId: msg.chatId,
             cwd,
             codexThreadId: thread.codexThreadId,
-            summary: text.slice(0, 80),
+            summary: topicTitle,
+            topicRequesterOpenId: msg.senderId,
+            topicRequesterName: requesterName,
+            cloudDocFolder: cloudDoc.cloudDocFolder,
+            cloudDocFolderError: cloudDoc.cloudDocFolderError,
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
         }
+        rec = await getSession(sessionKey);
+        sessionCwd = rec?.cwd ?? sessionCwd;
+        runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder) ?? runCloudDocFolder;
+        runCloudDocFolderError = rec?.cloudDocFolderError ?? runCloudDocFolderError;
         reserved.thread = thread;
         await launchRun(
           {
@@ -643,6 +802,10 @@ export function createOrchestrator(
             firstText: text,
             images,
             knownThreadId: sessionKey,
+            cwd: sessionCwd ?? (flat ? project?.cwd : undefined),
+            projectName: project?.name,
+            cloudDocFolder: runCloudDocFolder,
+            cloudDocFolderError: runCloudDocFolderError,
             requesterOpenId: msg.senderId,
           },
           reaction,
@@ -675,6 +838,24 @@ export function createOrchestrator(
     if (live) return live;
     const rec = await getSession(threadId);
     if (!rec) return undefined;
+    const project = await getProjectByChatId(chatId);
+    const cloudDoc =
+      (project?.kind ?? 'multi') === 'single'
+        ? { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) }
+        : rec.topicRequesterOpenId
+          ? await prepareTopicCloudDocFolder(project, {
+              title: rec.topicTitle ?? rec.summary,
+              requesterOpenId: rec.topicRequesterOpenId,
+              requesterName: rec.topicRequesterName,
+              existing: rec.cloudDocFolder,
+            })
+          : { cloudDocFolder: usableCloudDocFolder(rec.cloudDocFolder) };
+    if (cloudDoc.cloudDocFolder || cloudDoc.cloudDocFolderError) {
+      await patchSession(threadId, {
+        cloudDocFolder: cloudDoc.cloudDocFolder,
+        cloudDocFolderError: cloudDoc.cloudDocFolderError,
+      }).catch(() => undefined);
+    }
     try {
       const resumed = await backend.resumeThread({
         cwd: rec.cwd,
@@ -683,19 +864,20 @@ export function createOrchestrator(
         effort: rec.effort,
         mode: perm?.mode,
         network: perm?.network,
+        cloudDocFolder: cloudDoc.cloudDocFolder,
       });
       sessions.set(threadId, resumed);
       return resumed;
     } catch (err) {
       log.fail('agent', err, { phase: 'resume-on-turn', threadId });
-      const project = await getProjectByChatId(chatId);
-      const cwd = project?.cwd ?? rec.cwd ?? fallbackCwd;
+      const cwd = rec.cwd ?? (await prepareSessionCwd(project, threadId, fallbackCwd));
       const fresh = await backend.startThread({
         cwd,
         model: rec.model,
         effort: rec.effort,
         mode: perm?.mode ?? project?.mode,
         network: perm?.network ?? project?.network,
+        cloudDocFolder: cloudDoc.cloudDocFolder,
       });
       sessions.set(threadId, fresh);
       return fresh;
@@ -707,9 +889,8 @@ export function createOrchestrator(
    * actually rebinds. The codex sandbox is fixed at thread/start|resume and is
    * immutable for the thread's life — so an already-running 'full' thread would
    * keep full-disk read access even after the admin switches the project to
-   * read-only (the card would claim read-only while the runtime stays full
-   * access, reading ~/.ssh etc.). Evicting forces the next turn's resolveThread
-   * to re-resume under the new tier (or fail-closed where it can't be enforced).
+   * read-only. Evicting forces the next turn's resolveThread to re-resume under
+   * the new tier (or fail-closed where it can't be enforced).
    */
   async function evictLiveSessionsForChat(chatId: string): Promise<void> {
     let closed = 0;
@@ -717,14 +898,14 @@ export function createOrchestrator(
       if (rec.chatId !== chatId) continue;
       const live = sessions.get(rec.threadId);
       if (!live) continue;
-      sessions.delete(rec.threadId); // synchronous: next turn can't reuse it
-      void live.close().catch(() => undefined); // SIGKILLs the app-server child
+      sessions.delete(rec.threadId);
+      void live.close().catch(() => undefined);
       closed++;
     }
     if (closed) log.info('console', 'tier-evict', { chatId, closed });
   }
 
-  /** Group @bot (no topic): create the topic + run with the default model.
+  /** Group @bot (no topic): create a titled topic + run with the default model.
    * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
   function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project): void {
@@ -734,7 +915,7 @@ export function createOrchestrator(
       // action is "建话题", not the full reply — so DONE fires on first card,
       // unlike an in-topic turn (see handleTurn).
       const reaction = runReaction(msg.messageId, !sema.hasFree());
-      const cwd = project?.cwd ?? fallbackCwd;
+      const cwd = await prepareSessionCwd(project, msg.messageId, fallbackCwd);
       // The topic creator's role decides this new topic's tier; roleSuffix (when
       // tiers are split) namespaces the persisted session so the other role gets
       // its own thread on its first message (see turnSession / adoptThreadId).
@@ -742,9 +923,24 @@ export function createOrchestrator(
       // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
       if (project) void refreshBranch(channel, project).catch(() => undefined);
       const { model, effort } = pickDefault(await listModels());
+      const firstText = text || '你好，我们开始吧。';
+      const topicTitle = deriveTopicTitle(firstText);
+      const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
+      const cloudDoc = await prepareTopicCloudDocFolder(project, {
+        title: topicTitle,
+        requesterOpenId: msg.senderId,
+        requesterName,
+      });
       let thread: AgentThread;
       try {
-        thread = await backend.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network });
+        thread = await backend.startThread({
+          cwd,
+          model,
+          effort,
+          mode: perm.mode,
+          network: perm.network,
+          cloudDocFolder: cloudDoc.cloudDocFolder,
+        });
       } catch (err) {
         reaction.done();
         log.fail('card', err, { phase: 'start-topic' });
@@ -753,22 +949,35 @@ export function createOrchestrator(
           .catch(() => undefined);
         return;
       }
-      const firstText = text || '你好，我们开始吧。';
       // Download any attached/forwarded images so the opening turn can see them.
       const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
-      log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0 });
+      log.info('card', 'start', {
+        project: project?.name ?? '(unregistered)',
+        model,
+        effort,
+        images: images?.length ?? 0,
+        title: topicTitle,
+        cloudDocFolder: cloudDoc.cloudDocFolder?.token ?? null,
+        cloudDocFolderError: cloudDoc.cloudDocFolderError ?? null,
+      });
       await launchRun(
         {
           chatId: msg.chatId,
           replyTo: msg.messageId,
           replyInThread: true,
+          topicTitle,
+          topicRequesterOpenId: msg.senderId,
+          topicRequesterName: requesterName,
           thread,
           firstText,
           images,
           model,
           effort,
           cwd,
-          summary: text.slice(0, 80) || '(空)',
+          projectName: project?.name,
+          summary: topicTitle,
+          cloudDocFolder: cloudDoc.cloudDocFolder,
+          cloudDocFolderError: cloudDoc.cloudDocFolderError,
           requesterOpenId: msg.senderId,
           roleSuffix: perm.roleSuffix,
         },
@@ -778,7 +987,52 @@ export function createOrchestrator(
     }).catch((err) => log.fail('intake', err));
   }
 
-  /** Group @bot /resume: post the history picker for this project's cwd. Owner-only
+  async function sendTopicTitleMessage(chatId: string, title: string, requester?: TopicRequester): Promise<string | undefined> {
+    try {
+      const sent = await channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'text',
+          content: JSON.stringify({ text: formatTopicTitleMessage(title, requester) }),
+        },
+      });
+      const messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
+      if (!messageId) log.warn('intake', 'topic-title-message-missing-id', { title });
+      return messageId;
+    } catch (err) {
+      log.fail('intake', err, { phase: 'topic-title-message' });
+      return undefined;
+    }
+  }
+
+  async function listResumeThreads(project: Project | undefined, cwd: string): Promise<{
+    threads: ThreadSummary[];
+    threadCwds: Record<string, string>;
+  }> {
+    const byId = new Map<string, ThreadSummary>();
+    const threadCwds: Record<string, string> = {};
+    if (project && isIsolatedTopicWorkspace(project)) {
+      for (const s of (await listSessions()).filter((x) => x.chatId === project.chatId)) {
+        byId.set(s.codexThreadId, {
+          codexThreadId: s.codexThreadId,
+          preview: s.summary,
+          createdAt: s.createdAt,
+          updatedAt: s.updatedAt,
+          name: s.topicTitle ?? s.summary,
+        });
+        threadCwds[s.codexThreadId] = s.cwd;
+      }
+    }
+    for (const t of await backend.listThreads(cwd)) {
+      if (!byId.has(t.codexThreadId)) byId.set(t.codexThreadId, t);
+      if (!threadCwds[t.codexThreadId]) threadCwds[t.codexThreadId] = cwd;
+    }
+    const threads = [...byId.values()].sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+    return { threads, threadCwds };
+  }
+
+  /** Group @bot /resume: post the history picker for this project. Owner-only
    * (admins[]) — 恢复会话会改变上下文，属管理类命令；非管理员收到无权限提示。 */
   async function postResumeCard(msg: NormalizedMessage): Promise<void> {
     if (!isAdmin(cfg, msg.senderId)) {
@@ -788,7 +1042,7 @@ export function createOrchestrator(
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const project = await getProjectByChatId(msg.chatId);
       const cwd = project?.cwd ?? fallbackCwd;
-      const threads = await backend.listThreads(cwd);
+      const { threads, threadCwds } = await listResumeThreads(project, cwd);
       const state: ResumeCardState = {
         chatId: msg.chatId,
         originalMsgId: msg.messageId,
@@ -796,6 +1050,7 @@ export function createOrchestrator(
         cwd,
         projectName: project?.name,
         threads,
+        threadCwds,
         createdAt: Date.now(),
       };
       const res = await sendManagedCard(channel, msg.chatId, buildResumeCard(state), msg.messageId);
@@ -825,6 +1080,58 @@ export function createOrchestrator(
       modelPending.set(res.messageId, state);
       log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort });
     });
+  }
+
+  async function renameTopic(msg: NormalizedMessage, text: string): Promise<void> {
+    const threadId = msg.threadId;
+    if (!threadId) return;
+    const title = parseRenameTitle(text);
+    if (!title) {
+      await channel
+        .send(msg.chatId, { markdown: '用法：`/rename 新话题名`' }, { replyTo: msg.messageId, replyInThread: true })
+        .catch(() => undefined);
+      return;
+    }
+    const rec = await getSession(threadId);
+    const titleMessageId = rec?.topicTitleMessageId ?? (await findTopicTitleMessageId(channel, threadId));
+    if (!titleMessageId) {
+      await channel
+        .send(
+          msg.chatId,
+          { markdown: '这个话题没有可重命名的标题消息。只有新版自动短标题创建的话题支持 `/rename`。' },
+          { replyTo: msg.messageId, replyInThread: true },
+        )
+        .catch(() => undefined);
+      return;
+    }
+    try {
+      await channel.rawClient.im.v1.message.update({
+        path: { message_id: titleMessageId },
+        data: {
+          msg_type: 'text',
+          content: JSON.stringify({
+            text: formatTopicTitleMessage(title, {
+              openId: rec?.topicRequesterOpenId,
+              name: rec?.topicRequesterName,
+            }),
+          }),
+        },
+      });
+      await patchSession(threadId, { summary: title, topicTitle: title, topicTitleMessageId: titleMessageId });
+      await channel
+        .send(msg.chatId, { markdown: `已重命名为：${title}` }, { replyTo: msg.messageId, replyInThread: true })
+        .catch(() => undefined);
+      log.info('intake', 'topic-rename', { threadId, title });
+    } catch (err) {
+      log.fail('intake', err, { phase: 'topic-rename', threadId });
+      await channel
+        .send(
+          msg.chatId,
+          { markdown: `重命名失败：${err instanceof Error ? err.message : String(err)}` },
+          { replyTo: msg.messageId, replyInThread: true },
+        )
+        .catch(() => undefined);
+    }
   }
 
   /** `/help`: post the command cheat-sheet for the caller's current scope. */
@@ -1099,6 +1406,7 @@ export function createOrchestrator(
       if (!dmAdmin(op)) return;
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
+      const cloudDocFolderIn = String((formValue?.cloud_doc_folder as string) ?? '').trim();
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // A submitted form locks its card_id (its buttons — retry/返回 on an error
       // re-render — stop firing, and an in-place update no-ops). So the result
@@ -1106,15 +1414,23 @@ export function createOrchestrator(
       // so the submit callback acks immediately (createProject is slow).
       void (async () => {
         let result;
-        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空' });
-        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份' });
+        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '项目名不能为空' });
+        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '无法识别操作者身份' });
         else {
           try {
-            const p = await createProject(channel, { name, ownerOpenId: op, existingPath: cwdIn || undefined, kind });
+            const cloudDocFolder = parseCloudDocFolder(cloudDocFolderIn);
+            const p = await createProject(channel, {
+              name,
+              ownerOpenId: op,
+              existingPath: cwdIn || undefined,
+              kind,
+              cloudDocFolder,
+              ...cloudDocAccess(op),
+            });
             log.info('console', 'new-project', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err) });
+            result = buildNewProjectFormCard({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: err instanceof Error ? err.message : String(err) });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -1127,6 +1443,7 @@ export function createOrchestrator(
       if (!dmAdmin(op)) return;
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
+      const cloudDocFolderIn = String((formValue?.cloud_doc_folder as string) ?? '').trim();
       const chatId = typeof value.chatId === 'string' ? value.chatId : '';
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // Same fresh-card pattern as DM.newProjectSubmit: a submitted form locks
@@ -1135,16 +1452,25 @@ export function createOrchestrator(
       void (async () => {
         let result;
         if (!chatId)
-          result = buildJoinGroupFormCard({ chatId: '', name, cwd: cwdIn, error: '缺少群标识，请重新从进群通知里打开绑定卡' });
-        else if (!name) result = buildJoinGroupFormCard({ chatId, cwd: cwdIn, error: '项目名不能为空' });
-        else if (!op) result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: '无法识别操作者身份' });
+          result = buildJoinGroupFormCard({ chatId: '', name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '缺少群标识，请重新从进群通知里打开绑定卡' });
+        else if (!name) result = buildJoinGroupFormCard({ chatId, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '项目名不能为空' });
+        else if (!op) result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '无法识别操作者身份' });
         else {
           try {
-            const p = await joinExistingGroup(channel, { name, chatId, addedBy: op, existingPath: cwdIn || undefined, kind });
+            const cloudDocFolder = parseCloudDocFolder(cloudDocFolderIn);
+            const p = await joinExistingGroup(channel, {
+              name,
+              chatId,
+              addedBy: op,
+              existingPath: cwdIn || undefined,
+              kind,
+              cloudDocFolder,
+              ...cloudDocAccess(op),
+            });
             log.info('console', 'join-group', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err) });
+            result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: err instanceof Error ? err.message : String(err) });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -1173,6 +1499,7 @@ export function createOrchestrator(
         : undefined;
       const missingScopes = scopeCheck?.missingScopes;
       const missingJoinScopes = scopeCheck?.missingJoinScopes;
+      const missingCloudDocFolderScopes = scopeCheck?.missingCloudDocFolderScopes;
       const info: DoctorInfo = {
         codexOk: await backend.isAvailable().catch(() => false),
         codexVer: codexBin ? codexVersion(codexBin) : null,
@@ -1193,6 +1520,8 @@ export function createOrchestrator(
         missingJoinScopes,
         // 「加入存量群」按钮恒预选这两项 opt-in scope（它们不在必需清单里）。
         joinScopeGrantUrl: buildScopeGrantUrl(app.id, app.tenant, JOIN_GROUP_SCOPES),
+        missingCloudDocFolderScopes,
+        cloudDocFolderScopeGrantUrl: buildScopeGrantUrl(app.id, app.tenant, CLOUD_DOC_FOLDER_SCOPES),
       };
       // A reply card (not a patch of the menu) so the diagnosis persists below
       // the console; re-open the menu by messaging the bot.
@@ -1484,6 +1813,51 @@ export function createOrchestrator(
         return p ? buildProjectSettingsCard(p) : buildDmMenuCard();
       });
     })
+    .on(DM.cloudDocFolderForm, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      patch(evt, async () => {
+        const p = await getProjectByName(name);
+        return p ? buildCloudDocFolderFormCard(p) : buildDmMenuCard();
+      });
+    })
+    .on(DM.cloudDocFolderSubmit, ({ evt, value, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      const raw = String((formValue?.cloud_doc_folder as string) ?? '').trim();
+      void (async () => {
+        const p = await getProjectByName(name);
+        if (!p) return;
+        let result;
+        try {
+          const cloudDocFolder = parseCloudDocFolder(raw);
+          if (cloudDocFolder) {
+            const permission = await grantProjectCloudDocFolderAccess(channel, cloudDocFolder, {
+              ...cloudDocAccess(evt.operator?.openId),
+              chatId: p.chatId,
+            });
+            cloudDocFolder.permission = permissionRecord(permission);
+          }
+          await updateProject(name, { cloudDocFolder });
+          const fresh = await getProjectByName(name);
+          result = fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
+        } catch (err) {
+          result = buildCloudDocFolderFormCard(p, { value: raw, error: err instanceof Error ? err.message : String(err) });
+        }
+        await sendManagedCard(channel, evt.chatId, result).catch((e) =>
+          log.fail('console', e, { phase: 'cloud-doc-folder-result' }),
+        );
+      })();
+    })
+    .on(DM.cloudDocFolderClear, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      patch(evt, async () => {
+        await updateProject(name, { cloudDocFolder: undefined });
+        const fresh = await getProjectByName(name);
+        return fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
+      });
+    })
     .on(DM.setNoMentionDm, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
@@ -1537,15 +1911,24 @@ export function createOrchestrator(
    */
   async function resumeFromCard(evt: CardActionEvent, state: ResumeCardState, codexThreadId: string): Promise<void> {
     try {
+      const selectedCwd = state.threadCwds?.[codexThreadId] ?? state.cwd;
       // thread/read: fetch the transcript without starting a turn or holding the
       // session live (model/effort left to the thread's own remembered config).
       // Never throws — empty history just yields a minimal card.
-      const history = await backend.readHistory(state.cwd, codexThreadId);
+      const history = await backend.readHistory(selectedCwd, codexThreadId);
       resumePending.delete(evt.messageId);
 
       let bound = false;
       await withTrace({ chatId: state.chatId, msgId: state.originalMsgId }, async () => {
-        const cardState: HistoryCardState = { cwd: state.cwd, projectName: state.projectName, history };
+        const cardState: HistoryCardState = { cwd: selectedCwd, projectName: state.projectName, history };
+        const project = await getProjectByChatId(state.chatId);
+        const requesterName = (await resolveNames(channel, [state.requesterOpenId])).get(state.requesterOpenId);
+        const topicTitle = history.name || history.preview || '(恢复会话)';
+        const cloudDoc = await prepareTopicCloudDocFolder(project, {
+          title: topicTitle,
+          requesterOpenId: state.requesterOpenId,
+          requesterName,
+        });
         // reply_in_thread on the /resume message turns it into the topic; the
         // history card is that topic's first message.
         const sent = await sendManagedCard(channel, state.chatId, buildHistoryCard(cardState), state.originalMsgId, true);
@@ -1564,9 +1947,14 @@ export function createOrchestrator(
           await upsertSession({
             threadId: tid,
             chatId: state.chatId,
-            cwd: state.cwd,
+            cwd: selectedCwd,
             codexThreadId,
-            summary: history.name || history.preview || '(恢复会话)',
+            summary: topicTitle,
+            topicTitle: topicTitle,
+            topicRequesterOpenId: state.requesterOpenId,
+            topicRequesterName: requesterName,
+            cloudDocFolder: cloudDoc.cloudDocFolder,
+            cloudDocFolderError: cloudDoc.cloudDocFolderError,
             createdAt: now,
             updatedAt: now,
           });
@@ -1611,7 +1999,14 @@ export function createOrchestrator(
     model?: string;
     effort?: ReasoningEffort;
     cwd?: string;
+    projectName?: string;
     summary?: string;
+    /** main-group @bot path: send this bot-owned root message before creating the topic. */
+    topicTitle?: string;
+    topicRequesterOpenId?: string;
+    topicRequesterName?: string;
+    cloudDocFolder?: CloudDocFolder;
+    cloudDocFolderError?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
     requesterOpenId?: string;
     /** single-session group: reply by quoting (no reply_in_thread / topic). */
@@ -1631,6 +2026,7 @@ export function createOrchestrator(
     let firstCardSent = false;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
+    let topicTitleMessageId: string | undefined;
     // Reuse the reservation handleTurn made for this session (so messages
     // queued during startup aren't lost); fall back to a fresh state otherwise.
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
@@ -1648,6 +2044,12 @@ export function createOrchestrator(
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? opts.firstText.slice(0, 80),
+        topicTitle: opts.topicTitle,
+        topicTitleMessageId,
+        topicRequesterOpenId: opts.topicRequesterOpenId,
+        topicRequesterName: opts.topicRequesterName,
+        cloudDocFolder: opts.cloudDocFolder,
+        cloudDocFolderError: opts.cloudDocFolderError,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       }).catch(() => undefined);
@@ -1671,16 +2073,82 @@ export function createOrchestrator(
     // tracks the latest run card key so the finally can clear runsByCard even
     // if the stream producer throws mid-turn (avoids leaking a stale stop target)
     let curCardKey: string | undefined;
+    let currentRun: {
+      ctx: RunRecordContext;
+      run?: AgentRun;
+      state?: RunState;
+      events?: number;
+      textChars?: number;
+      finished: boolean;
+    } | undefined;
+    const writeRunRecord = async (record: RunRecord): Promise<void> => {
+      await appendRunRecord(record).catch((err) => log.warn('run-store', 'write-failed', { err: String(err) }));
+    };
+    const finishCurrentRun = async (terminal: RunState['terminal'] | 'bridge_error', bridgeError?: unknown): Promise<void> => {
+      if (!currentRun || currentRun.finished) return;
+      currentRun.finished = true;
+      await writeRunRecord(
+        finishedRunRecord(
+          {
+            ...currentRun.ctx,
+            feishuThreadId: feishuThreadIdFromSessionKey(topicThreadId) ?? currentRun.ctx.feishuThreadId,
+            cardMessageId: curCardKey ?? currentRun.ctx.cardMessageId,
+            codexTurnId: currentRun.run?.turnId() ?? currentRun.ctx.codexTurnId,
+          },
+          {
+            terminal,
+            endedAt: new Date().toISOString(),
+            state: currentRun.state,
+            bridgeError,
+            events: currentRun.events,
+            textChars: currentRun.textChars,
+          },
+        ),
+      );
+    };
     try {
       let turnInput: AgentInput = { text: opts.firstText, images: opts.images };
       let replyTo = opts.replyTo;
       let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
+      if (opts.topicTitle && !opts.knownThreadId && !opts.flat && replyInThread) {
+        topicTitleMessageId = await sendTopicTitleMessage(opts.chatId, opts.topicTitle, {
+          openId: opts.topicRequesterOpenId,
+          name: opts.topicRequesterName,
+        });
+        if (topicTitleMessageId) {
+          active.delete(activeKey);
+          activeKey = `pending:${topicTitleMessageId}`;
+          active.set(activeKey, state);
+          replyTo = topicTitleMessageId;
+          log.info('intake', 'topic-title-root', { title: opts.topicTitle });
+        }
+      }
       for (;;) {
         // per-turn model/effort: prefer latest persisted (⚙️ may have changed it)
         const rec = topicThreadId ? await getSession(topicThreadId) : undefined;
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
+        const turnCwd = opts.cwd ?? rec?.cwd ?? fallbackCwd;
+        currentRun = {
+          ctx: {
+            runId: newRunId(),
+            chatId: opts.chatId,
+            replyToMessageId: replyTo,
+            feishuThreadId: feishuThreadIdFromSessionKey(topicThreadId),
+            codexThreadId: opts.thread.codexThreadId,
+            projectName: opts.projectName,
+            cwd: turnCwd,
+            topicTitle: opts.topicTitle ?? rec?.topicTitle,
+            requesterOpenId: opts.requesterOpenId ?? opts.topicRequesterOpenId ?? rec?.topicRequesterOpenId,
+            requesterName: opts.topicRequesterName ?? rec?.topicRequesterName,
+            promptPreview: turnInput.text,
+            startedAt: new Date().toISOString(),
+          },
+          finished: false,
+        };
+        await writeRunRecord(startedRunRecord(currentRun.ctx));
         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        currentRun.run = run;
         state.run = run;
         const render = new RunRender();
         render.showTools = getShowToolCalls(cfg);
@@ -1706,11 +2174,13 @@ export function createOrchestrator(
               activeKey = key;
               topicThreadId = key;
               rc.threadId = key;
+              if (currentRun) currentRun.ctx.feishuThreadId = tid;
               await persist(key);
             }
           } else {
             topicThreadId = activeKey;
             rc.threadId = activeKey;
+            if (currentRun) currentRun.ctx.feishuThreadId = feishuThreadIdFromSessionKey(activeKey);
           }
         };
 
@@ -1719,6 +2189,7 @@ export function createOrchestrator(
         const stream = new RunCardStream();
         cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(rc), { replyTo, replyInThread });
         curCardKey = cardMsgId;
+        if (currentRun) currentRun.ctx.cardMessageId = cardMsgId;
         rc.cardKey = cardMsgId;
         runsByCard.set(cardMsgId, state);
         runStreams.set(cardMsgId, stream);
@@ -1793,6 +2264,7 @@ export function createOrchestrator(
         else if (interrupted) render.interrupt();
         else render.finalize();
         rc.rs = render.snapshot();
+        if (currentRun) currentRun.state = rc.rs;
 
         // A killed turn leaves codex mid-turn with a notification stream that
         // never terminates. Recycle the process: closing it ends the stream
@@ -1818,7 +2290,7 @@ export function createOrchestrator(
         const { fences } = extractCardFences(answerText);
         const imgSources = imageSources(answerText);
         if (imgSources.length > 0) {
-          rc.images = await uploadOutboundImages(channel, imgSources, opts.cwd ?? fallbackCwd);
+          rc.images = await uploadOutboundImages(channel, imgSources, turnCwd);
         }
 
         // terminal whole-card update: final render with streaming off (clears the
@@ -1846,6 +2318,13 @@ export function createOrchestrator(
         }
         runsByCard.delete(cardMsgId);
         promoteCard(finalMsgId, rc);
+        if (currentRun) {
+          currentRun.state = rc.rs;
+          currentRun.events = evCount;
+          currentRun.textChars = textChars;
+        }
+        await finishCurrentRun(render.terminal());
+        currentRun = undefined;
 
         for (const fence of fences) {
           try {
@@ -1866,6 +2345,7 @@ export function createOrchestrator(
         turnInput = state.queue.shift()!;
       }
     } catch (err) {
+      await finishCurrentRun('bridge_error', err);
       log.fail('intake', err);
       await channel
         .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
@@ -1931,40 +2411,87 @@ export function createOrchestrator(
             const thread = await resolveDocThread(sessionKey, ctx.question);
             const rec = await getSession(sessionKey);
             const run = thread.runStreamed({ text: prompt }, { model: rec?.model, effort: rec?.effort });
+            const runCtx: RunRecordContext = {
+              runId: newRunId(),
+              chatId: sessionKey,
+              replyToMessageId: evt.replyId ?? evt.commentId,
+              feishuThreadId: sessionKey,
+              codexThreadId: thread.codexThreadId,
+              projectName: '云文档评论',
+              cwd: rec?.cwd ?? fallbackCwd,
+              requesterOpenId: evt.operator.openId,
+              promptPreview: ctx.question,
+              startedAt: new Date().toISOString(),
+            };
+            let runRecordFinished = false;
+            const finishCommentRun = async (
+              terminal: RunState['terminal'] | 'bridge_error',
+              state: RunState | undefined,
+              bridgeError?: unknown,
+              events?: number,
+              textChars?: number,
+            ): Promise<void> => {
+              if (runRecordFinished) return;
+              runRecordFinished = true;
+              await appendRunRecord(
+                finishedRunRecord(
+                  { ...runCtx, codexTurnId: run.turnId() },
+                  { terminal, endedAt: new Date().toISOString(), state, bridgeError, events, textChars },
+                ),
+              ).catch((err) => log.warn('run-store', 'write-failed', { err: String(err) }));
+            };
+            await appendRunRecord(startedRunRecord(runCtx)).catch((err) =>
+              log.warn('run-store', 'write-failed', { err: String(err) }),
+            );
 
             let state: RunState = initialState;
             let timedOut = false;
+            let evCount = 0;
+            let textChars = 0;
             const guarded = withIdleTimeout(run.events, idleMs, () => {
               timedOut = true;
             });
-            for await (const ev of guarded) state = reduce(state, ev);
+            try {
+              for await (const ev of guarded) {
+                evCount++;
+                if (ev.type === 'text_delta') textChars += ev.delta.length;
+                state = reduce(state, ev);
+              }
 
-            if (timedOut) {
-              const tid = run.turnId();
-              // Recycle the thread so the hung turn's never-terminating stream
-              // doesn't poison the next comment; the doc resumes from the
-              // persisted thread on its next @-mention. Fire-and-forget the
-              // interrupt — turn/interrupt is an unbounded JSON-RPC round-trip,
-              // and close() SIGKILLs the child anyway, so awaiting it here would
-              // pin both the per-doc lock and a global semaphore slot if it
-              // hangs. sessions.delete stays synchronous + before release() so
-              // the next queued same-doc comment always starts fresh.
-              if (tid) void thread.abort(tid).catch(() => undefined);
-              void thread.close().catch(() => undefined);
-              sessions.delete(sessionKey);
-            } else {
-              await patchSession(sessionKey, { updatedAt: Date.now() });
+              if (timedOut) {
+                state = markIdleTimeout(state, Math.max(1, Math.round(idleMs / 60_000)));
+                const tid = run.turnId();
+                // Recycle the thread so the hung turn's never-terminating stream
+                // doesn't poison the next comment; the doc resumes from the
+                // persisted thread on its next @-mention. Fire-and-forget the
+                // interrupt — turn/interrupt is an unbounded JSON-RPC round-trip,
+                // and close() SIGKILLs the child anyway, so awaiting it here would
+                // pin both the per-doc lock and a global semaphore slot if it
+                // hangs. sessions.delete stays synchronous + before release() so
+                // the next queued same-doc comment always starts fresh.
+                if (tid) void thread.abort(tid).catch(() => undefined);
+                void thread.close().catch(() => undefined);
+                sessions.delete(sessionKey);
+              } else {
+                state = finalizeIfRunning(state);
+                await patchSession(sessionKey, { updatedAt: Date.now() });
+              }
+
+              await finishCommentRun(state.terminal, state, undefined, evCount, textChars);
+
+              let reply = stripMarkdown(finalMessageText(state)).trim();
+              if (state.terminal === 'error' && state.errorMsg) reply = `⚠️ 出错了：${state.errorMsg}`;
+              if (!reply) reply = timedOut ? '（处理超时，请重试或把问题问得更具体些）' : '（没有可回复的内容）';
+              if (reply.length > REPLY_MAX_CHARS) reply = `${reply.slice(0, REPLY_MAX_CHARS - 1)}…`;
+
+              await postCommentReply(channel, target, evt, reply).catch((err) =>
+                log.fail('comment', err, { step: 'postCommentReply' }),
+              );
+              log.info('comment', 'done', { terminal: state.terminal, timedOut, len: reply.length });
+            } catch (err) {
+              await finishCommentRun('bridge_error', state, err, evCount, textChars);
+              throw err;
             }
-
-            let reply = stripMarkdown(finalMessageText(state)).trim();
-            if (state.terminal === 'error' && state.errorMsg) reply = `⚠️ 出错了：${state.errorMsg}`;
-            if (!reply) reply = timedOut ? '（处理超时，请重试或把问题问得更具体些）' : '（没有可回复的内容）';
-            if (reply.length > REPLY_MAX_CHARS) reply = `${reply.slice(0, REPLY_MAX_CHARS - 1)}…`;
-
-            await postCommentReply(channel, target, evt, reply).catch((err) =>
-              log.fail('comment', err, { step: 'postCommentReply' }),
-            );
-            log.info('comment', 'done', { terminal: state.terminal, timedOut, len: reply.length });
           } finally {
             release();
           }
@@ -2128,4 +2655,29 @@ async function getThreadId(channel: LarkChannel, messageId: string): Promise<str
     log.warn('intake', 'threadid-lookup-failed', { messageId, err: String(err) });
     return undefined;
   }
+}
+
+async function findTopicTitleMessageId(channel: LarkChannel, threadId: string): Promise<string | undefined> {
+  try {
+    const res = await channel.rawClient.im.v1.message.list({
+      params: {
+        container_id_type: 'thread',
+        container_id: threadId,
+        sort_type: 'ByCreateTimeAsc',
+        page_size: 10,
+      },
+    });
+    const items = (res.data as { items?: FeishuMessageItem[] } | undefined)?.items ?? [];
+    const title = items.find((item) => item.msg_type === 'text' && item.sender?.sender_type === 'app');
+    return title?.message_id;
+  } catch (err) {
+    log.warn('intake', 'topic-title-lookup-failed', { threadId, err: String(err) });
+    return undefined;
+  }
+}
+
+interface FeishuMessageItem {
+  message_id?: string;
+  msg_type?: string;
+  sender?: { sender_type?: string };
 }

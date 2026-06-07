@@ -16,6 +16,8 @@ function info(over: Partial<DoctorInfo> = {}): DoctorInfo {
     scopeGrantUrl: 'https://open.feishu.cn/app/cli_x/auth?q=',
     missingJoinScopes: [], // healthy baseline: 加入存量群 scopes granted too
     joinScopeGrantUrl: 'https://open.feishu.cn/app/cli_x/auth?q=join',
+    missingCloudDocFolderScopes: [],
+    cloudDocFolderScopeGrantUrl: 'https://open.feishu.cn/app/cli_x/auth?q=cloud-doc-folder',
     ...over,
   };
 }
@@ -51,7 +53,7 @@ describe('buildDoctorCard', () => {
     expect(json).toContain('✅ 可用');
     expect(json).toContain('codex-cli 0.45.0');
     expect(json).toContain('✅ 已连接'); // connected → friendly label
-    expect(json).toContain('bridge v0.1.2');
+    expect(json).toContain('feishu-codex bridge v0.1.2');
     expect(json).toContain('darwin-arm64');
   });
 
@@ -188,5 +190,31 @@ describe('buildDoctorCard — 加入存量群（opt-in scope 提示）', () => {
     const card = buildDoctorCard(info({ missingJoinScopes: undefined, joinScopeGrantUrl: JOIN_GRANT }));
     expect(JSON.stringify(card)).toContain('未能自动检查');
     expect(collectUrls(card)).toContain(JOIN_GRANT);
+  });
+});
+
+describe('buildDoctorCard — 飞书云文档目录（opt-in scope 提示）', () => {
+  const CLOUD_GRANT =
+    'https://open.feishu.cn/app/cli_x/auth?q=drive%3Afile%2Cdocs%3Apermission.member%3Acreate%2Cdocs%3Apermission.member%3Adelete';
+
+  it('surfaces missing cloud-doc folder scopes with a one-click grant button', () => {
+    const card = buildDoctorCard(
+      info({
+        missingCloudDocFolderScopes: ['drive:file', 'docs:permission.member:create', 'docs:permission.member:delete'],
+        cloudDocFolderScopeGrantUrl: CLOUD_GRANT,
+      }),
+    );
+    const json = JSON.stringify(card);
+    expect(json).toContain('飞书云文档目录');
+    expect(json).toContain('权限隔离');
+    expect(json).toContain('docs:permission.member:delete');
+    expect(collectUrls(card)).toContain(CLOUD_GRANT);
+    expect((card as { header: { template: string } }).header.template).toBe('blue');
+  });
+
+  it('shows 已开通 when cloud-doc folder scopes are granted', () => {
+    const card = buildDoctorCard(info({ missingCloudDocFolderScopes: [], cloudDocFolderScopeGrantUrl: CLOUD_GRANT }));
+    expect(JSON.stringify(card)).toContain('可创建话题子文件夹');
+    expect(collectUrls(card)).not.toContain(CLOUD_GRANT);
   });
 });

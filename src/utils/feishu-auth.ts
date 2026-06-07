@@ -1,5 +1,5 @@
 import type { TenantBrand } from '../config/schema';
-import { JOIN_GROUP_SCOPES, REQUIRED_SCOPES } from '../config/scopes';
+import { CLOUD_DOC_FOLDER_SCOPES, JOIN_GROUP_SCOPES, REQUIRED_SCOPES } from '../config/scopes';
 
 const ENDPOINTS: Record<TenantBrand, string> = {
   feishu: 'https://open.feishu.cn',
@@ -23,6 +23,11 @@ export interface ValidationResult {
    * doctor card surfaces them so existing users can discover + enable them.
    */
   missingJoinScopes?: string[];
+  /**
+   * Optional cloud-doc folder isolation scopes not yet granted. Same 3-state
+   * semantics as {@link missingScopes}; never gates core messaging startup.
+   */
+  missingCloudDocFolderScopes?: string[];
 }
 
 interface TokenResp {
@@ -74,6 +79,7 @@ export async function validateAppCredentials(
     botOpenId: info?.bot?.open_id,
     missingScopes: missing(REQUIRED_SCOPES),
     missingJoinScopes: missing(JOIN_GROUP_SCOPES),
+    missingCloudDocFolderScopes: missing(CLOUD_DOC_FOLDER_SCOPES),
   };
 }
 

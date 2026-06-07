@@ -1,7 +1,8 @@
 {
   "name": "@modelzen/feishu-codex-bridge",
+  "displayName": "feishu-codex bridge",
   "version": "0.3.4",
-  "description": "Bridge Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
+  "description": "feishu-codex bridge links Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
   "type": "module",
   "bin": {
     "feishu-codex-bridge": "bin/feishu-codex-bridge.mjs"

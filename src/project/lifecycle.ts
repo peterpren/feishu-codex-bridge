@@ -4,8 +4,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
-import { addProject, getProjectByChatId, getProjectByName, type Project } from './registry';
+import { addProject, getProjectByChatId, getProjectByName, updateProject, type CloudDocFolder, type Project } from './registry';
 import type { PermissionMode } from '../agent/types';
+import { grantProjectCloudDocFolderAccess, permissionRecord } from './cloud-doc-permission';
 import { setAnnouncement } from './announcement';
 import { onboardGroup } from './onboarding';
 
@@ -21,6 +22,12 @@ export interface CreateProjectInput {
   mode?: PermissionMode;
   /** allow the sandboxed shell to reach the network (default false). */
   network?: boolean;
+  /** default Feishu Drive folder for cloud docs created in this project */
+  cloudDocFolder?: CloudDocFolder;
+  /** open_ids that should keep full access to the parent cloud-doc folder. */
+  adminOpenIds?: string[];
+  /** Feishu app_id for granting the bot/app full access to the parent folder. */
+  appId?: string;
 }
 
 export interface JoinGroupInput {
@@ -38,6 +45,12 @@ export interface JoinGroupInput {
   mode?: PermissionMode;
   /** allow the sandboxed shell to reach the network (default false). */
   network?: boolean;
+  /** default Feishu Drive folder for cloud docs created in this project */
+  cloudDocFolder?: CloudDocFolder;
+  /** open_ids that should keep full access to the parent cloud-doc folder. */
+  adminOpenIds?: string[];
+  /** Feishu app_id for granting the bot/app full access to the parent folder. */
+  appId?: string;
 }
 
 /**
@@ -105,9 +118,14 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     origin: 'created',
     mode: input.mode ?? 'full',
     network: input.network ?? false,
+    ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
   log.info('project', 'create', { name, chatId, cwd, blank, mode: project.mode });
+  await grantCloudDocFolderIfConfigured(channel, project, {
+    adminOpenIds: input.adminOpenIds ?? [input.ownerOpenId],
+    appId: input.appId,
+  });
 
   // 4. group announcement (top banner) + onboarding (welcome card / Pin / tab),
   //    both best-effort — a group is usable even if these fail.
@@ -145,12 +163,36 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     addedBy: input.addedBy,
     mode: input.mode ?? 'qa',
     network: input.network ?? false,
+    ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
   log.info('project', 'join', { name, chatId: input.chatId, cwd, blank, kind: project.kind, mode: project.mode });
+  await grantCloudDocFolderIfConfigured(channel, project, {
+    adminOpenIds: input.adminOpenIds ?? [input.addedBy],
+    appId: input.appId,
+  });
 
   // Onboarding only (no announcement / Pin / tab — see onboardGroup's joined
   // branch); best-effort, the binding holds even if the welcome card fails.
   await onboardGroup(channel, project).catch((err) => log.fail('project', err, { phase: 'onboard-join' }));
   return project;
+}
+
+async function grantCloudDocFolderIfConfigured(
+  channel: LarkChannel,
+  project: Project,
+  access: { adminOpenIds: string[]; appId?: string },
+): Promise<void> {
+  if (!project.cloudDocFolder?.token) return;
+  const result = await grantProjectCloudDocFolderAccess(channel, project.cloudDocFolder, {
+    ...access,
+    chatId: project.chatId,
+  });
+  project.cloudDocFolder = { ...project.cloudDocFolder, permission: permissionRecord(result) };
+  await updateProject(project.name, { cloudDocFolder: project.cloudDocFolder });
+  if (result.status === 'granted') {
+    log.info('project', 'cloud-doc-folder-access', { name: project.name, via: result.via ?? '-' });
+  } else {
+    log.fail('project', new Error(result.error ?? 'grant failed'), { phase: 'cloud-doc-folder-access', name: project.name });
+  }
 }

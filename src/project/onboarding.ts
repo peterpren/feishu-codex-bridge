@@ -9,7 +9,7 @@ import { defaultNoMention, type Project } from './registry';
  * Empty string = skip the tab + the manual button (no broken links). Set this
  * to the doc's share URL once it's published as "互联网获取链接的人可阅读".
  */
-const HELP_DOC_URL: string = 'https://my.feishu.cn/wiki/PZ23wGr7JiKK5RkIG4rcZXzGn5g';
+const HELP_DOC_URL: string = 'https://taiyang.feishu.cn/docx/S41QdgAmboEFB4xsDf2cYVYVnaf';
 
 /**
  * Onboard a freshly-created project group (design: 项目=群): post a welcome card

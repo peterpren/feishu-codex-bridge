@@ -5,10 +5,19 @@ import {
   resolveOwner,
   type AppConfig,
 } from '../config/schema';
-import { defaultNoMention, effectiveGuestMode, effectiveMode, type Project } from '../project/registry';
+import {
+  cloudDocFolderLabel,
+  cloudDocFolderPermissionLabel,
+  defaultNoMention,
+  effectiveGuestMode,
+  effectiveMode,
+  type Project,
+} from '../project/registry';
 import type { PermissionMode } from '../agent/types';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
+import { isIsolatedTopicWorkspace } from '../project/topic-workspace';
+import { PRODUCT_NAME, REPOSITORY_URL } from '../core/branding';
 import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject, type SelectOption } from './cards';
 import { relativeTime } from './command-cards';
 
@@ -20,7 +29,7 @@ function openChatUrl(chatId: string): string {
 }
 
 /** Project home (matches package.json homepage/repository). */
-const REPO = 'https://github.com/modelzen/feishu-codex-bridge';
+const REPO = REPOSITORY_URL;
 
 /** Action ids for the DM (private chat) management console. */
 export const DM = {
@@ -62,6 +71,9 @@ export const DM = {
   // 🔐 权限：codex 沙箱档位（管理员档 + 普通用户档）+ 联网，做成下拉表单（选+提交）
   permission: 'dm.proj.perm',
   permissionSubmit: 'dm.proj.perm.submit',
+  cloudDocFolderForm: 'dm.proj.cloudDoc.form',
+  cloudDocFolderSubmit: 'dm.proj.cloudDoc.submit',
+  cloudDocFolderClear: 'dm.proj.cloudDoc.clear',
 } as const;
 
 /** Action ids for the in-group settings card (@bot /settings). */
@@ -92,7 +104,7 @@ export function buildDmMenuCard(): CardObject {
         button('⬆️ 版本更新', { a: DM.update }),
       ]),
     ],
-    { header: { title: '🤖 Codex Bridge 管理台', template: 'blue' } },
+    { header: { title: `🤖 ${PRODUCT_NAME} 管理台`, template: 'blue' } },
   );
 }
 
@@ -248,6 +260,12 @@ export interface DoctorInfo {
   missingJoinScopes?: string[];
   /** 一键开通页，预选「加入存量群」那两项 scope。 */
   joinScopeGrantUrl: string;
+  /**
+   * 「飞书云文档目录隔离」可选 scope 尚未开通的项，三态同 missingScopes。
+   */
+  missingCloudDocFolderScopes?: string[];
+  /** 一键开通页，预选云文档目录隔离需要的 scope。 */
+  cloudDocFolderScopeGrantUrl: string;
 }
 
 /** Friendly label for a long-connection state; unknown states show raw. */
@@ -322,6 +340,23 @@ function joinFeatureDiagnosis(i: DoctorInfo): CardElement[] {
   return out;
 }
 
+function cloudDocFolderDiagnosis(i: DoctorInfo): CardElement[] {
+  const out: CardElement[] = [md('**飞书云文档目录（可选）**')];
+  if (i.missingCloudDocFolderScopes === undefined) {
+    out.push(md('- 权限：⚠️ 未能自动检查（凭据失效或网络不通）'), actions([linkButton('🔑 去开通', i.cloudDocFolderScopeGrantUrl)]));
+  } else if (i.missingCloudDocFolderScopes.length === 0) {
+    out.push(md('- 权限：✅ 已开通（可创建话题子文件夹并管理协作者）'));
+  } else {
+    out.push(
+      md(`- 权限：❌ 缺 ${i.missingCloudDocFolderScopes.length} 项 —— 开通后才能自动创建话题云文档子文件夹并做权限隔离`),
+      note(`待开通：\n${i.missingCloudDocFolderScopes.map((s) => `· ${labelScope(s)}`).join('\n')}`),
+      actions([linkButton('🔑 一键开通这些权限', i.cloudDocFolderScopeGrantUrl)]),
+    );
+  }
+  out.push(note('父文件夹只配置管理员/机器人权限；多话题群会为每个话题创建子文件夹，只授权话题发起人和管理员。'));
+  return out;
+}
+
 /**
  * The self-contained prompt the user copies into a project group and @s the bot
  * with. Since codex runs locally on the same machine, handing it the absolute
@@ -330,10 +365,10 @@ function joinFeatureDiagnosis(i: DoctorInfo): CardElement[] {
  */
 function codexDiagnosePrompt(i: DoctorInfo): string {
   return [
-    '我在用 feishu-codex-bridge（飞书 ↔ 本地 Codex 桥接）遇到问题，请帮我定位原因并给出修复步骤。',
+    `我在用 ${PRODUCT_NAME}（飞书 ↔ 本地 Codex 桥接）遇到问题，请帮我定位原因并给出修复步骤。`,
     '',
     '【环境】',
-    `- bridge 版本：v${i.bridgeVer}`,
+    `- ${PRODUCT_NAME} 版本：v${i.bridgeVer}`,
     `- codex 版本：${i.codexVer ?? '未找到（PATH / CODEX_BIN 里都没有 codex）'}`,
     `- Node：${i.node}`,
     `- 平台：${i.platform}`,
@@ -377,9 +412,11 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
       ),
       md(`- 飞书长连接：${connLabel(i.conn)}`),
       ...scopeDiagnosis(i),
-      note(`bridge v${i.bridgeVer}　·　Node ${i.node}　·　${i.platform}`),
+      note(`${PRODUCT_NAME} v${i.bridgeVer}　·　Node ${i.node}　·　${i.platform}`),
       hr(),
       ...joinFeatureDiagnosis(i),
+      hr(),
+      ...cloudDocFolderDiagnosis(i),
       hr(),
       md('**日志路径**'),
       note(`后台守护输出：\`${i.logStdout}\``),
@@ -397,16 +434,25 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
   );
 }
 
-/** Interactive new-project form: project name + optional CWD, submit/cancel. */
-export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; error?: string } = {}): CardObject {
+/** Interactive new-project form: project name + optional CWD/cloud-doc folder, submit/cancel. */
+export function buildNewProjectFormCard(
+  opts: { name?: string; cwd?: string; cloudDocFolder?: string; error?: string } = {},
+): CardObject {
   const elements = [];
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   elements.push(
-    md('填项目名（必填）。**文件夹路径留空** = 自动在默认位置新建一个空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
+    md('填项目名（必填）。**本地文件夹路径留空** = 自动新建空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
     form('new_project', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
-      input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
-      note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文。'),
+      input({ name: 'cwd', label: '本地文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({
+        name: 'cloud_doc_folder',
+        label: '飞书云文档保存文件夹（选填）',
+        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
+        value: opts.cloudDocFolder,
+      }),
+      note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
+      note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话和工作区（发起人/管理员可驱动）；💬 单会话群 = 整群一个会话、连续上下文。'),
       actions([
         submitButton('👥 创建·多话题群', { a: DM.newProjectSubmit, kind: 'multi' }, 'primary', 'submit_multi'),
         submitButton('💬 创建·单会话群', { a: DM.newProjectSubmit, kind: 'single' }, 'primary', 'submit_single'),
@@ -425,17 +471,24 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
  * handler binds *this* group instead of creating a new one.
  */
 export function buildJoinGroupFormCard(
-  opts: { chatId: string; name?: string; cwd?: string; error?: string },
+  opts: { chatId: string; name?: string; cwd?: string; cloudDocFolder?: string; error?: string },
 ): CardObject {
   const elements: CardElement[] = [];
   if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
   elements.push(
     md('我已被加入这个群。填一下要绑定的项目信息即可开始用。'),
-    md('项目名默认用群名，可改。**文件夹路径留空** = 自动新建空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
+    md('项目名默认用群名，可改。**本地文件夹路径留空** = 自动新建空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
     form('join_group', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
-      input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
-      note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
+      input({ name: 'cwd', label: '本地文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({
+        name: 'cloud_doc_folder',
+        label: '飞书云文档保存文件夹（选填）',
+        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
+        value: opts.cloudDocFolder,
+      }),
+      note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
+      note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话和工作区（发起人/管理员可驱动）；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
       actions([
         submitButton('👥 绑定·多话题群', { a: DM.joinGroupSubmit, kind: 'multi', chatId: opts.chatId }, 'primary', 'submit_multi'),
         submitButton('💬 绑定·单会话群', { a: DM.joinGroupSubmit, kind: 'single', chatId: opts.chatId }, 'primary', 'submit_single'),
@@ -455,6 +508,9 @@ export function buildNewProjectDoneCard(p: Project): CardObject {
   const elements: CardElement[] = [
     md(`✅ ${verb} **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
     note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
+    ...(isIsolatedTopicWorkspace(p) ? [note('🧵 多话题：每个话题有独立本地工作区，只有发起人/管理员可驱动')] : []),
+    note(`☁️ 云文档目录：${cloudDocFolderLabel(p.cloudDocFolder)}`),
+    ...(p.cloudDocFolder?.token ? [note(`🔐 权限隔离：${cloudDocFolderPermissionLabel(p.cloudDocFolder)}`)] : []),
     md(p.chatId ? '👉 去群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
   ];
   if (p.chatId)
@@ -484,6 +540,7 @@ export function buildProjectListCard(
   for (const p of projects) {
     elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
     elements.push(note(`📂 \`${p.cwd}\`${p.branch && p.branch !== '—' ? `   🌿 ${p.branch}` : ''}`));
+    if (isIsolatedTopicWorkspace(p)) elements.push(note('🧵 话题工作区：独立'));
     elements.push(
       note(
         p.chatId
@@ -767,14 +824,28 @@ export function buildPermissionCard(p: Pick<Project, 'name' | 'mode' | 'guestMod
  * 各按钮携带项目名 n（DM 里点，不能靠 evt.chatId 取项目）。
  */
 export function buildProjectSettingsCard(
-  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'cwd' | 'mode' | 'guestMode' | 'network'>,
+  project: Pick<
+    Project,
+    'name' | 'kind' | 'noMention' | 'origin' | 'cwd' | 'mode' | 'guestMode' | 'network' | 'cloudDocFolder' | 'topicWorkspace'
+  >,
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
+  const hasCloudDocFolder = Boolean(project.cloudDocFolder?.token);
   return card(
     [
       md(`**项目设置** · ${project.name}`),
       note(`${kindLabel(kind)}${project.cwd ? `   ·   📂 \`${project.cwd}\`` : ''}`),
+      ...(isIsolatedTopicWorkspace(project) ? [note('🧵 多话题工作区：独立（发起人/管理员可驱动）')] : []),
+      note(`☁️ 云文档目录：${cloudDocFolderLabel(project.cloudDocFolder)}`),
+      ...(hasCloudDocFolder ? [note(`🔐 权限隔离：${cloudDocFolderPermissionLabel(project.cloudDocFolder)}`)] : []),
+      hr(),
+      md('☁️ 飞书云文档保存目录'),
+      actions([
+        button(hasCloudDocFolder ? '修改目录' : '设置目录', { a: DM.cloudDocFolderForm, n: project.name }, 'primary'),
+        ...(hasCloudDocFolder ? [button('清空目录', { a: DM.cloudDocFolderClear, n: project.name }, 'danger')] : []),
+      ]),
+      note('多话题群会在该父文件夹下为每个话题创建子文件夹；父文件夹不再授予整个群编辑权限。'),
       hr(),
       actions([button('🔐 权限', { a: DM.permission, n: project.name }, 'primary')]),
       note(`当前 ${permissionSummary(project)}　·　codex 沙箱可访问的范围（管理员 / 普通用户可分设）。`),
@@ -797,6 +868,32 @@ export function buildProjectSettingsCard(
     ],
     { header: { title: '⚙️ 项目设置', template: 'blue' } },
   );
+}
+
+export function buildCloudDocFolderFormCard(
+  project: Pick<Project, 'name' | 'cloudDocFolder'>,
+  opts: { value?: string; error?: string } = {},
+): CardObject {
+  const current = opts.value ?? project.cloudDocFolder?.url ?? project.cloudDocFolder?.token ?? '';
+  const elements: CardElement[] = [];
+  if (opts.error) elements.push(md(`❌ **保存失败**：${opts.error}`));
+  elements.push(
+    md(`**飞书云文档保存目录** · ${project.name}`),
+    note('填飞书云空间父文件夹 URL 或 fld... token。留空提交 = 清空项目默认目录。父文件夹只配管理员/机器人权限，多话题按话题创建子文件夹。'),
+    form('cloud_doc_folder', [
+      input({
+        name: 'cloud_doc_folder',
+        label: '文件夹 URL / Token',
+        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
+        value: current,
+      }),
+      actions([
+        submitButton('✅ 保存', { a: DM.cloudDocFolderSubmit, n: project.name }, 'primary', 'submit_cloud_doc_folder'),
+        button('⬅️ 项目设置', { a: DM.projectSettings, n: project.name }),
+      ]),
+    ]),
+  );
+  return card(elements, { header: { title: '☁️ 云文档目录', template: 'blue' } });
 }
 
 /**

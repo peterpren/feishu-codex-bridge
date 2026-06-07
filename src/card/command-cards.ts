@@ -1,4 +1,5 @@
 import type { ModelInfo, ReasoningEffort, ThreadSummary } from '../agent/types';
+import { PRODUCT_NAME } from '../core/branding';
 import { actions, button, card, hr, linkButton, md, note, selectStatic, type CardElement, type CardObject } from './cards';
 
 /** Action ids for the `/model` card. */
@@ -76,6 +77,8 @@ export interface ResumeCardState {
   cwd: string;
   projectName?: string;
   threads: ThreadSummary[];
+  /** codexThreadId -> cwd. Needed when multi-topic workspaces are isolated. */
+  threadCwds?: Record<string, string>;
   createdAt: number;
   /** in-flight guard (anti double-click) */
   launching?: boolean;
@@ -96,7 +99,7 @@ export function buildResumeCard(state: ResumeCardState): CardObject {
   if (state.threads.length === 0) {
     elements.push(md('_该目录下还没有历史会话。直接 @我 即可新建。_'));
   } else {
-    elements.push(note('点一条即恢复 —— 在新话题里打开历史、可直接继续。'));
+    elements.push(note('点一条即恢复 —— 在新话题里打开历史；继续提问默认 @我。'));
     for (const t of state.threads) {
       const title = (t.name?.trim() || t.preview.trim() || '(无摘要)').replace(/\s+/g, ' ');
       const label = `↩️ ${pickerTime(t.updatedAt || t.createdAt)} · ${truncate(title, RESUME_TITLE_MAX)}`;
@@ -113,7 +116,7 @@ export function buildResumeLaunchingCard(state: ResumeCardState): CardObject {
 
 /** Terminal success card — the resumed session opened as a new topic above. */
 export function buildResumeDoneCard(state: ResumeCardState): CardObject {
-  return card([md('✅ 已恢复 —— 已在上方新话题打开，可直接继续。'), note(metaNote(state))], { summary: '已恢复' });
+  return card([md('✅ 已恢复 —— 已在上方新话题打开；继续提问默认 @我。'), note(metaNote(state))], { summary: '已恢复' });
 }
 
 /** Failure card after a failed resume launch. */
@@ -174,8 +177,7 @@ export function pickerTime(unixSeconds: number): string {
 export type HelpScope = 'main' | 'topic' | 'single';
 
 /** First bullet describing how to talk to the bot, honoring the group's
- * effective 免@ state so the card never promises免@ when it's actually off
- * (e.g. a joined single-session group, which defaults off). */
+ * effective 免@ state so the card never promises免@ when it's actually off. */
 function talkLine(noMention: boolean, tail: string): string {
   return noMention
     ? `· 直接发消息（免@）→ ${tail}`
@@ -186,10 +188,11 @@ function talkLine(noMention: boolean, tail: string): string {
  * `noMention` is the group's effective 免@ state (`noMention ?? defaultNoMention`).
  * `isAdmin` gates the owner-only commands (`/settings`、`/resume`): non-admins
  * don't see them listed (they'd be denied anyway — see handle-message 的门控). */
-export function buildHelpCard(scope: HelpScope, noMention = true, isAdmin = false): CardObject {
+export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = false): CardObject {
+  const effectiveNoMention = noMention ?? (scope === 'single');
   const elements: CardElement[] = [];
   if (scope === 'single') {
-    const lines = [talkLine(noMention, '交给我处理'), '· `/model` → 切换模型 / 推理强度'];
+    const lines = [talkLine(effectiveNoMention, '交给我处理'), '· `/model` → 切换模型 / 推理强度'];
     if (isAdmin) lines.push('· `/settings` → 群设置（免@ 开关）');
     lines.push('· `/help` → 这张速查卡');
     elements.push(md('💬 **单会话群** — 整群就是一个会话，上下文连续。'), hr(), md(lines.join('\n')));
@@ -198,16 +201,17 @@ export function buildHelpCard(scope: HelpScope, noMention = true, isAdmin = fals
       md('🧵 **话题内** — 每个话题是一个独立会话。'),
       hr(),
       md(
-        `${talkLine(noMention, '继续当前会话')}\n` +
+        `${talkLine(effectiveNoMention, '继续当前会话')}\n` +
+          '· `/rename 新标题` → 修改话题标题\n' +
           '· `/model` → 切换模型 / 推理强度\n' +
           '· `/help` → 这张速查卡',
       ),
-      note('开新话题：回到主群区 @我 + 内容。'),
+      note('只有话题发起人或管理员可驱动本话题；开新话题：回到主群区 @我 + 内容。'),
     );
   } else {
-    const lines = ['· **@我 + 内容** → 开一个新话题并开始'];
+    const lines = ['· **@我 + 内容** → 开一个新话题并开始（独立工作区）'];
     if (isAdmin) lines.push('· `/resume` → 恢复历史会话', '· `/settings` → 群设置（免@ 开关）');
-    lines.push('· `/model` → 需要在话题里用', '· `/help` → 这张速查卡');
+    lines.push('· `/rename 新标题` → 需要在话题里用', '· `/model` → 需要在话题里用', '· `/help` → 这张速查卡');
     elements.push(md('👥 **主群区** — @我开话题，每个话题是独立会话。'), hr(), md(lines.join('\n')));
   }
   return card(elements, { header: { title: '🤖 可用命令', template: 'blue' }, summary: '可用命令' });
@@ -216,20 +220,20 @@ export function buildHelpCard(scope: HelpScope, noMention = true, isAdmin = fals
 /**
  * Welcome card posted when a project group is created or a group is bound — a
  * full overview of every command this group supports, keyed off its session
- * kind. `noMention` is the group's effective 免@ state (so a joined
- * single-session group, which defaults off, doesn't promise免@). Adds a
- * "查看完整手册" link button when a doc URL is configured.
+ * kind. `noMention` is the group's effective 免@ state. Adds a "查看完整手册"
+ * link button when a doc URL is configured.
  */
-export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMention = true): CardObject {
+export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMention?: boolean): CardObject {
+  const effectiveNoMention = noMention ?? (kind === 'single');
   const elements: CardElement[] = [
-    md('👋 **欢迎使用 Codex Bridge** — 本群已绑定一个项目目录，在群里就能驱动本机 Codex 干活。'),
+    md(`👋 **欢迎使用 ${PRODUCT_NAME}** — 本群已绑定一个项目目录，在群里就能驱动本机 Codex 干活。`),
     hr(),
   ];
   if (kind === 'single') {
     elements.push(
       md('💬 **单会话群**（整群一个会话，上下文连续）'),
       md(
-        `${talkLine(noMention, '交给我处理')}\n` +
+        `${talkLine(effectiveNoMention, '交给我处理')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 命令速查卡',
@@ -239,13 +243,13 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
     elements.push(
       md('👥 **主群区**'),
       md(
-        '· **@我 + 内容** → 开一个新话题并开始（每话题独立会话）\n' +
+        '· **@我 + 内容** → 开一个新话题并开始（每话题独立会话 + 独立工作区）\n' +
           '· `/resume` → 恢复历史会话\n' +
           '· `/settings` → 群设置（免@ 开关）',
       ),
       md('🧵 **话题内**'),
-      md('· 直接发消息（免@）→ 继续当前会话\n· `/model` → 切换模型 / 推理强度'),
-      note('任意场景发 `/help` 看当前可用命令。'),
+      md(`${talkLine(effectiveNoMention, '继续当前会话')}\n· \`/rename 新标题\` → 修改话题标题\n· \`/model\` → 切换模型 / 推理强度`),
+      note('只有话题发起人或管理员可驱动该话题；任意场景发 `/help` 看当前可用命令。'),
     );
   }
   if (docUrl) {

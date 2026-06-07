@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
 import type { ReasoningEffort } from '../agent/types';
+import type { CloudDocFolder } from '../project/registry';
 
 /**
  * A persisted session = one Feishu topic (thread) bound to a codex thread.
@@ -20,6 +21,17 @@ export interface SessionRecord {
   effort?: ReasoningEffort;
   /** first user message excerpt, for context */
   summary: string;
+  /** Short Feishu topic title shown in the project/session list. */
+  topicTitle?: string;
+  /** Bot-owned root text message used as the Feishu topic title. */
+  topicTitleMessageId?: string;
+  /** User who triggered the topic; used to keep the title root message attributable. */
+  topicRequesterOpenId?: string;
+  topicRequesterName?: string;
+  /** Topic-specific Feishu Drive folder for cloud docs. */
+  cloudDocFolder?: CloudDocFolder;
+  /** Last topic-folder creation/permission error, for local troubleshooting. */
+  cloudDocFolderError?: string;
   createdAt: number;
   updatedAt: number;
 }

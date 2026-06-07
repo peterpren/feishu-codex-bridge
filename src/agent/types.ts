@@ -4,6 +4,8 @@
  * from codex internals (and lets us swap to exec / SDK / remote later).
  */
 
+import type { CloudDocFolder } from '../project/registry';
+
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 
 /**
@@ -138,6 +140,8 @@ export interface StartThreadOptions {
   /** let the sandboxed agent's shell reach the network (qa/write only; full is
    * always networked). Default false. */
   network?: boolean;
+  /** default Feishu Drive folder for docs created by this thread */
+  cloudDocFolder?: CloudDocFolder;
 }
 
 export interface ResumeThreadOptions extends StartThreadOptions {

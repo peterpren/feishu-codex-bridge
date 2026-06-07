@@ -80,6 +80,16 @@ export const JOIN_GROUP_SCOPES = [
 ] as const;
 
 /**
+ * Optional scopes for the cloud-doc folder isolation feature: create per-topic
+ * Drive folders and manage collaborators on the project/topic folders.
+ */
+export const CLOUD_DOC_FOLDER_SCOPES = [
+  'drive:file',
+  'docs:permission.member:create',
+  'docs:permission.member:delete',
+] as const;
+
+/**
  * Optional scope for resolving open_id → 姓名 in the admins / 项目白名单 management
  * cards. Like {@link COMMENT_SCOPES} / {@link JOIN_GROUP_SCOPES}, deliberately NOT
  * in {@link REQUIRED_SCOPES}: it gates only a display nicety (without it the cards
@@ -94,6 +104,7 @@ export const GRANT_SCOPES = [
   ...REQUIRED_SCOPES,
   ...COMMENT_SCOPES,
   ...JOIN_GROUP_SCOPES,
+  ...CLOUD_DOC_FOLDER_SCOPES,
   ...CONTACT_SCOPES,
 ] as const;
 
@@ -121,6 +132,9 @@ export const SCOPE_LABELS: Record<string, string> = {
   'im:chat:readonly': '读取群信息（群名/群主，加入存量群用）',
   'im:chat.members:write_only': '群成员增减（绑定的存量群解绑时机器人退群）',
   'cardkit:card:write': '交互按钮卡片',
+  'drive:file': '云空间文件夹创建 / 文件操作',
+  'docs:permission.member:create': '添加云文档 / 文件夹协作者权限',
+  'docs:permission.member:delete': '移除云文档 / 文件夹协作者权限',
   'docs:document.comment:read': '读取文档评论',
   'docs:document.comment:create': '发表文档评论回复',
   'wiki:wiki:readonly': '读取知识库节点',

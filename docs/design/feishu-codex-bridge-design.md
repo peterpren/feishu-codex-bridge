@@ -1,4 +1,4 @@
-# feishu-codex-bridge 设计规格
+# feishu-codex bridge 设计规格
 
 > 本文是一轮 grill 对齐后的设计依据。把飞书 / Lark 消息桥接到本机 Codex，在飞书里以"项目—会话"的模型驱动 `codex` 干活。
 > 参考实现：`docs/references/feishu-claude-code-bridge`（原版，对接 claude，功能基线）、`docs/references/feishu-codex-bridge`（QQQingyu 的 codex 移植，仅作对照）。
@@ -8,7 +8,7 @@
 
 ## 1. 目标与范围
 
-**目标**：一个**自建、稳定、架构干净**的 codex bridge。功能以 feishu-claude-code-bridge 为基线，但重做交互模型与后端，重点解决原版的"卡住"问题。
+**目标**：一个**自建、稳定、架构干净**的 feishu-codex bridge。功能以 feishu-claude-code-bridge 为基线，但重做交互模型与后端，重点解决原版的"卡住"问题。
 
 **核心原则**
 - **少斜杠命令，能用卡片/菜单就不用斜杠。**
@@ -26,16 +26,18 @@
 ## 2. 核心模型
 
 ```
-飞书群  ===  一个 Project  ===  绑定一个固定 cwd（建项目时确定，群内不可改）
+飞书群  ===  一个 Project  ===  绑定一个固定项目 cwd（建项目时确定，群内不可改）
   │
   ├─ 主群对话区：@bot → 弹"会话配置卡"，不直接跑 codex
   │
-  ├─ 话题(thread) A  ===  session A   ← 每个话题 = 一个独立 codex 会话
+  ├─ 话题(thread) A  ===  session A   ← 独立 codex 会话 + 独立工作区
   ├─ 话题(thread) B  ===  session B
   └─ ...
 ```
 
-- **项目 = 群 = 固定 cwd**。一个项目群里所有话题共享同一个 cwd。
+- **项目 = 群 = 固定项目 cwd**。项目 cwd 是群的本地边界。
+- **多话题群：话题 = 独立 cwd**。默认写入 `项目cwd/.feishu-codex/topics/<topic>/`；只有话题发起人或管理员能驱动该话题。旧行为可通过 `topicWorkspace:"shared"` 保留。
+- **单会话群：群 = 一个共享 cwd**。整群共享项目 cwd。
 - **话题(thread) = 会话(session)**。每个话题对应一个 codex 会话（`thread_id`）。
 - **三层默认，逐层覆盖**：全局默认（config.json）→ 项目默认（建项目时）→ 话题配置卡（创建时按上层预填，可逐项覆盖）。
 - **session 延续**：codex app-server `thread/resume`；会话 id 持久化。
@@ -95,7 +97,7 @@
 ## 4. Agent 后端
 
 - **后端：codex `app-server`（stdio 传输）**，`codex app-server --listen stdio://`，JSON-RPC。
-  - **每个会话(话题)一个独立 app-server 子进程**，绑该项目 cwd → 进程隔离，单会话卡死不波及他人（参考 yepanywhere 的 `runSession` 模式，但**不抄其代码**——该仓库无 LICENSE）。
+  - **每个会话(话题)一个独立 app-server 子进程**，多话题默认绑该话题 cwd → 进程和写目录双隔离，单会话卡死不波及他人（参考 yepanywhere 的 `runSession` 模式，但**不抄其代码**——该仓库无 LICENSE）。
   - 握手 `initialize` → `initialized` → `thread/start` / `thread/resume`，参数 `{ model, cwd, approvalPolicy, sandbox }`。
   - **动态模型列表**：`model/list`（临时 spawn 查询，缓存，带静态兜底）→ 喂配置卡模型下拉。
   - 协议绑定：自己 `codex app-server generate-ts` 生成（版本匹配）。
@@ -104,7 +106,7 @@
   - 模型 → `thread/start.model`
   - effort → `turn/start.effort`（none/minimal/low/medium/high/xhigh；按模型 supportedReasoningEfforts 联动）
   - ~~fast~~ → codex 无此参数，已删（见 .plans/decisions.md）
-  - 权限 → 固定 `approvalPolicy:"never"` + `sandbox:"danger-full-access"`（= dangerously bypass）→ 无 mid-turn 审批
+  - 权限 → 固定 `approvalPolicy:"never"` + `sandbox:"workspace-write"`，`writable_roots` 只给当前会话 `cwd` → 无 mid-turn 审批，但禁止写入会话目录外
   - 图片 → input `{ type:"local_image", path }`
 - **传输层**：`@larksuiteoapi/node-sdk` 长连接（WSClient）收 `im.message.receive_v1` + `card.action.trigger`(卡片回调) + `application.bot.menu_v6`(菜单)。lark-cli **收不到卡片回调**，仅用于出站动作（发卡/置顶/建群/reply_in_thread）+ OAuth onboarding。
 

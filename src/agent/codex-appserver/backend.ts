@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { log } from '../../core/logger';
 import type {
   AgentBackend,
@@ -16,6 +17,7 @@ import type {
   ThreadSummary,
   TurnOptions,
 } from '../types';
+import type { CloudDocFolder } from '../../project/registry';
 import { AppServerClient } from './app-server-client';
 import { mapNotification } from './event-map';
 import { codexVersion, resolveCodexBin } from './locate';
@@ -71,6 +73,37 @@ export function sandboxParams(
   };
 }
 
+interface ThreadSessionOptions {
+  cwd: string;
+  model?: string;
+  mode?: PermissionMode;
+  network?: boolean;
+  cloudDocFolder?: CloudDocFolder;
+}
+
+type ThreadSessionParams = {
+  cwd: string;
+  approvalPolicy: typeof APPROVAL_POLICY;
+  developerInstructions: string;
+  model?: string;
+} & Record<string, unknown>;
+
+function workspaceRoot(cwd: string): string {
+  return resolve(cwd);
+}
+
+export function buildThreadSessionParams(opts: ThreadSessionOptions): ThreadSessionParams {
+  const root = workspaceRoot(opts.cwd);
+  const sandbox = sandboxParams(opts.mode, opts.network);
+  return {
+    cwd: root,
+    approvalPolicy: APPROVAL_POLICY,
+    ...sandbox,
+    developerInstructions: bridgeDeveloperInstructions({ cloudDocFolder: opts.cloudDocFolder }),
+    ...(opts.model ? { model: opts.model } : {}),
+  };
+}
+
 /**
  * Bridge-scoped developer guidance, injected ONLY into threads this bridge
  * starts (never the user's own codex usage). Teaches the two output conventions
@@ -93,6 +126,25 @@ const BRIDGE_DEVELOPER_INSTRUCTIONS = [
   '`**粗体**`、列表、链接照常使用；配图同样用 ![说明](真实路径)。',
   '不要手写飞书卡片的 JSON。普通问答正常回复即可，只有用户要卡片时才用 ```feishu-card 代码块。',
 ].join('\n');
+
+export function bridgeDeveloperInstructions(opts: { cloudDocFolder?: CloudDocFolder } = {}): string {
+  const folder = opts.cloudDocFolder;
+  if (!folder?.token) return BRIDGE_DEVELOPER_INSTRUCTIONS;
+
+  const createAs = folder.createAs ?? 'user';
+  return [
+    BRIDGE_DEVELOPER_INSTRUCTIONS,
+    '',
+    '3) 飞书云文档：当用户要求创建、输出、保存飞书云文档时，默认保存到当前会话配置的云空间文件夹。',
+    `默认 folder_token：${folder.token}`,
+    folder.url ? `文件夹链接：${folder.url}` : '',
+    `创建文档时优先使用：lark-cli docs +create --api-version v2 --as ${createAs} --parent-token ${folder.token} --content '<title>标题</title><p>内容</p>'`,
+    '除非用户本轮明确指定其它位置，不要改用 my_library 或其它父目录。',
+    '如果 lark-cli 权限不足或目录不可访问，直接说明需要为当前 lark-cli 用户授权或给该文件夹授权。',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
 /** Hard ceiling on a history read so a wedged codex can't hang the resume card. */
 const READ_HISTORY_TIMEOUT_MS = 20_000;
 
@@ -296,30 +348,20 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async startThread(opts: StartThreadOptions): Promise<AgentThread> {
-    // Build sandbox params first — the platform fail-closed guard throws here,
-    // before we spawn, so a rejected tier leaves no orphan app-server process.
-    const sandbox = sandboxParams(opts.mode, opts.network);
-    const client = await this.spawn(opts.cwd);
+    const params = buildThreadSessionParams(opts);
+    const client = await this.spawn(params.cwd);
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
-      cwd: opts.cwd,
-      approvalPolicy: APPROVAL_POLICY,
-      ...sandbox,
-      developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
-      ...(opts.model ? { model: opts.model } : {}),
+      ...params,
     });
     return new CodexThread(client, res.thread.id, opts.model, opts.effort);
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
-    const sandbox = sandboxParams(opts.mode, opts.network);
-    const client = await this.spawn(opts.cwd);
+    const params = buildThreadSessionParams(opts);
+    const client = await this.spawn(params.cwd);
     const res = await client.request<{ thread: { id: string } }>('thread/resume', {
       threadId: opts.codexThreadId,
-      cwd: opts.cwd,
-      approvalPolicy: APPROVAL_POLICY,
-      ...sandbox,
-      developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
-      ...(opts.model ? { model: opts.model } : {}),
+      ...params,
     });
     return new CodexThread(client, res.thread.id, opts.model, opts.effort);
   }

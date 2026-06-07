@@ -4,6 +4,25 @@ import { dirname } from 'node:path';
 import { paths } from '../config/paths';
 import type { PermissionMode } from '../agent/types';
 
+export type CloudDocCreateAs = 'user' | 'bot';
+
+export interface CloudDocFolderPermission {
+  status: 'granted' | 'failed';
+  via?: 'bot' | 'user' | 'mixed';
+  scope?: 'project_admins' | 'topic_owner_admins' | 'group';
+  error?: string;
+  updatedAt: number;
+}
+
+export interface CloudDocFolder {
+  token: string;
+  url?: string;
+  createAs?: CloudDocCreateAs;
+  permission?: CloudDocFolderPermission;
+}
+
+export type TopicWorkspaceMode = 'shared' | 'isolated';
+
 /** A project = a Feishu group bound to a fixed working directory. */
 export interface Project {
   /** unique project name (also the group name) */
@@ -45,19 +64,62 @@ export interface Project {
   /** allow the sandboxed agent's shell to reach the network (only meaningful for
    * 'qa'/'write'; 'full' is always networked). Default false. */
   network?: boolean;
+  /** Multi-topic file boundary. 'isolated' gives each topic its own writable cwd;
+   * 'shared' keeps the legacy behavior where every topic writes the project cwd.
+   * Missing = isolated for multi-topic groups, shared for single-session groups. */
+  topicWorkspace?: TopicWorkspaceMode;
+  /** Default Feishu Drive folder for cloud docs Codex creates for this project. */
+  cloudDocFolder?: CloudDocFolder;
+}
+
+const FOLDER_URL_RE = /\/drive\/folder\/([^/?#]+)/;
+const FOLDER_TOKEN_RE = /^fld[a-zA-Z0-9_-]+$/;
+
+export function parseCloudDocFolder(input: string): CloudDocFolder | undefined {
+  const raw = input.trim();
+  if (!raw) return undefined;
+
+  const fromUrl = FOLDER_URL_RE.exec(raw)?.[1];
+  if (fromUrl) return { token: fromUrl, url: raw, createAs: 'user' };
+  if (FOLDER_TOKEN_RE.test(raw)) return { token: raw, createAs: 'user' };
+
+  throw new Error('飞书云空间目录请填写文件夹 URL，或 fld... 开头的文件夹 token');
+}
+
+export function cloudDocFolderLabel(folder: CloudDocFolder | undefined): string {
+  if (!folder?.token) return '未设置';
+  return folder.url ? `${folder.token}` : folder.token;
+}
+
+export function cloudDocFolderPermissionLabel(folder: CloudDocFolder | undefined): string {
+  const p = folder?.permission;
+  if (!folder?.token) return '未设置';
+  if (!p) return '未授权';
+  if (p.status === 'granted') {
+    const label =
+      p.scope === 'topic_owner_admins'
+        ? '话题发起人/管理员'
+        : p.scope === 'group'
+          ? '群编辑'
+          : p.scope === 'project_admins'
+            ? '管理员/机器人'
+            : '权限';
+    return `已配置${label}权限${p.via ? `（${p.via}）` : ''}`;
+  }
+  return `授权失败${p.error ? `：${p.error}` : ''}`;
 }
 
 /**
  * Default for 免@ (respond without @) when a project hasn't set `noMention`
- * explicitly. On for everything **except** a *joined* single-session group:
- * making the whole of a pre-existing (possibly busy / multi-person) group run
- * codex on every message without an @ is too aggressive, so that one combo
- * defaults off. Created groups (incl. single) keep the historical default (on),
- * so existing data is unaffected. Single source of truth — every
- * `noMention ?? …` read goes through here.
+ * explicitly. Multi-topic groups default off: topic chatter should not be
+ * captured by Codex unless the group admin opts in. Single-session groups keep
+ * the chat-like default for bot-created groups, while joined existing groups
+ * default off to avoid taking over a busy group.
  */
 export function defaultNoMention(p: Pick<Project, 'kind' | 'origin'>): boolean {
-  return !((p.origin ?? 'created') === 'joined' && (p.kind ?? 'multi') === 'single');
+  const kind = p.kind ?? 'multi';
+  if (kind === 'multi') return false;
+  return (p.origin ?? 'created') !== 'joined';
 }
 
 /**
@@ -184,7 +246,8 @@ export async function updateProject(
     const actual = typeof patch === 'function' ? patch(p) : patch;
     const target = p as unknown as Record<string, unknown>;
     for (const [k, v] of Object.entries(actual)) {
-      if (v !== undefined) target[k] = v;
+      if (v === undefined) delete target[k];
+      else target[k] = v;
     }
     await write(projects);
   });

@@ -117,7 +117,7 @@ function metaNote(state: HistoryCardState): CardElement {
 }
 
 function resumedFooter(): CardElement {
-  return md('✅ **会话已恢复** —— 直接发消息即可继续。');
+  return md('✅ **会话已恢复** —— 继续提问默认 @我；开启免@后可直接发消息。');
 }
 
 /**

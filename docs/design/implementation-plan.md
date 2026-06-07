@@ -1,4 +1,4 @@
-# feishu-codex-bridge 实现规划
+# feishu-codex bridge 实现规划
 
 > 配套 `feishu-codex-bridge-design.md`。从零搭 `src/`。references 仅学习不抄。
 > 注：yepanywhere 在 `/tmp/yepany`（临时克隆、无 LICENSE，仅研究 app-server 客户端思路）。
@@ -63,7 +63,7 @@ interface AgentRun { events: AsyncIterable<AgentEvent>; turnId(); waitForExit(ms
 ```
 - AgentEvent 沿用 reference 形状（system/text/thinking/tool_use/tool_result/usage/done/error）+ 可选 turnId。
 - **一话题一进程**：backend 持 `Map<feishuThreadId, AppServerClient>`；startThread/resumeThread spawn+握手，close 回收。
-- 握手：initialize→等result→notify(initialized)→thread/start{model,cwd,approvalPolicy:'never',sandbox:'danger-full-access'}（resume 走 thread/resume{threadId}）。
+- 握手：initialize→等result→notify(initialized)→thread/start{model,cwd,approvalPolicy:'never',sandbox:'workspace-write',config.sandbox_workspace_write.writable_roots:[cwd]}（resume 走 thread/resume{threadId}）。
 - 回收：SIGTERM→grace→SIGKILL；detached 进程组 kill 防孤儿；启动清孤儿；崩溃 reject pending+标卡 error。
 - watchdog/steer/interrupt 挂在 bot/run-orchestrator；server-request 兜底回 -32601 防卡死。
 - 协议绑定：generate-ts 子集入库 + `tools/update-codex-protocol.mjs` + doctor 校验版本。

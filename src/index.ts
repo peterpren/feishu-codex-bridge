@@ -1,5 +1,5 @@
 /**
- * feishu-codex-bridge — public entry.
+ * feishu-codex bridge — public entry.
  *
  * Bridges Feishu/Lark to local Codex via app-server. Interaction model:
  * project=group=cwd, thread=session. See docs/design/feishu-codex-bridge-design.md.

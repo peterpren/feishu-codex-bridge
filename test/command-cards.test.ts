@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildHelpCard, buildResumeCard, type ResumeCardState } from '../src/card/command-cards';
+import { buildHelpCard, buildResumeCard, buildWelcomeCard, type ResumeCardState } from '../src/card/command-cards';
 import type { ThreadSummary } from '../src/agent/types';
 
 function buttons(node: unknown, acc: any[] = []): any[] {
@@ -72,5 +72,25 @@ describe('buildHelpCard 权限过滤', () => {
     expect(JSON.stringify(buildHelpCard('single', true, false))).not.toContain('/settings');
     expect(JSON.stringify(buildHelpCard('single', true, true))).toContain('/settings');
     expect(JSON.stringify(buildHelpCard('single', true, false))).toContain('/model');
+    expect(JSON.stringify(buildHelpCard('single', true, false))).not.toContain('/rename');
+  });
+
+  it('多话题群：主群区和话题内都会提示 /rename 的使用位置', () => {
+    expect(JSON.stringify(buildHelpCard('main', true, false))).toContain('/rename 新标题');
+    expect(JSON.stringify(buildHelpCard('topic', true, false))).toContain('/rename 新标题');
+  });
+
+  it('多话题群：话题内默认不承诺免@', () => {
+    const json = JSON.stringify(buildHelpCard('topic'));
+    expect(json).toContain('@我 + 内容');
+    expect(json).not.toContain('直接发消息（免@）→ 继续当前会话');
+  });
+
+  it('欢迎卡：多话题群提示 /rename，单会话群不提示', () => {
+    const multiJson = JSON.stringify(buildWelcomeCard('multi'));
+    expect(multiJson).toContain('/rename 新标题');
+    expect(multiJson).toContain('@我 + 内容');
+    expect(multiJson).not.toContain('直接发消息（免@）→ 继续当前会话');
+    expect(JSON.stringify(buildWelcomeCard('single'))).not.toContain('/rename');
   });
 });

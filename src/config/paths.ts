@@ -46,6 +46,10 @@ export const paths = {
   get processesFile(): string {
     return join(currentBotDir, 'processes.json');
   },
+  /** run 级别运行/故障记录（当前 bot，按日期写 JSONL） */
+  get runsDir(): string {
+    return join(currentBotDir, 'runs');
+  },
   secretsFile: join(appDir, 'secrets.enc'),
   keystoreSaltFile: join(appDir, '.keystore.salt'),
   npmCacheDir: join(appDir, 'npm-cache'),

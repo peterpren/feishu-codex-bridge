@@ -5,6 +5,7 @@ import { paths, useBotDir } from '../../config/paths';
 import { ensureRegistry, currentBot } from '../../config/bots';
 import { resolveCodexBin, codexVersion } from '../../agent/codex-appserver/locate';
 import { spawnProcessSync } from '../../platform/spawn';
+import { PRODUCT_NAME } from '../../core/branding';
 
 interface Check {
   name: string;
@@ -71,7 +72,7 @@ export async function runDoctor(): Promise<void> {
   }
 
   // render
-  console.log('\n🩺 feishu-codex-bridge 自检\n');
+  console.log(`\n🩺 ${PRODUCT_NAME} 自检\n`);
   for (const c of checks) {
     console.log(`  ${c.ok ? '✅' : '❌'} ${c.name.padEnd(12)} ${c.detail}`);
   }

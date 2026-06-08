@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { buildHelpCard, buildResumeCard, buildWelcomeCard, type ResumeCardState } from '../src/card/command-cards';
+import {
+  buildHelpCard,
+  buildModelCard,
+  buildResumeCard,
+  buildWelcomeCard,
+  type ModelCardState,
+  type ResumeCardState,
+} from '../src/card/command-cards';
 import type { ThreadSummary } from '../src/agent/types';
 
 function buttons(node: unknown, acc: any[] = []): any[] {
@@ -49,6 +56,42 @@ describe('buildResumeCard', () => {
     const card = buildResumeCard(state([]));
     expect(buttons(card).length).toBe(0);
     expect(JSON.stringify(card)).toContain('还没有历史会话');
+  });
+});
+
+describe('buildModelCard', () => {
+  it('uses Codex Chinese labels for reasoning and speed', () => {
+    const modelState: ModelCardState = {
+      chatId: 'oc_x',
+      threadId: 'omt_x',
+      requesterOpenId: 'ou_x',
+      models: [
+        {
+          id: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          description: '',
+          supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
+          defaultEffort: 'medium',
+          serviceTiers: [{ id: 'fast', name: 'Fast', description: '' }],
+          isDefault: true,
+          hidden: false,
+        },
+      ],
+      model: 'gpt-5.5',
+      effort: 'xhigh',
+      serviceTier: 'fast',
+      createdAt: Date.now(),
+      note: '✅ 已设置推理，下一轮生效',
+    };
+    const json = JSON.stringify(buildModelCard(modelState));
+
+    expect(json).toContain('模型 / 推理 / 速度');
+    expect(json).toContain('推理：超高');
+    expect(json).toContain('速度：标准');
+    expect(json).toContain('速度：快速');
+    expect(json).not.toContain('速度：Fast');
+    expect(json).not.toContain('effort：');
+    expect(json).not.toContain('极高');
   });
 });
 

@@ -69,13 +69,12 @@
 - **群置顶横幅 = 群公告**（docx block 写内容 + `im chatTopNotice.putTopNotice action_type:"2"` 置顶；chat 级）：
   一行 `📁项目名 · [📂路径(仅绑定已有目录显示)] · [🌿分支(仅 git)]`。**两步**：① docx block API 把群公告内容写成一个 text block；② put_top_notice action_type=2 把"群公告"置顶成顶部横幅（复用 `im:chat`，无需额外权限，无需 message_id）。分支变化**惰性检测**（消息进来 / run 结束时读 `git rev-parse --abbrev-ref HEAD`，变了重写群公告 block；置顶状态保持，不重复置顶）。早期"Pin 一条卡片消息"方案已废（只进 Pin 列表、不在顶部横幅，见 git 史）。
 - **主区 @bot[+首条消息]** → **会话配置卡**（预填默认，可直接创建）：
-  `模型 ▾`（动态 model/list）`effort ▾` + `[✅ 创建新会话]` `[🔁 恢复历史会话]`
-  （注：codex 无 `fast` 参数，effort 即速度/质量杆，故去掉 fast 下拉，见 .plans/decisions.md 2026-05-26）
+  `模型 ▾`（动态 model/list）`推理 ▾` `速度 ▾` + `[✅ 创建新会话]` `[🔁 恢复历史会话]`
   - 创建 → `reply_in_thread` 把这条消息变成话题、开跑
   - 恢复 → `thread/list`（按 cwd 过滤，codex 自己的会话库）列最近会话（`preview` 首条消息 + 相对时间）→ 选一条后：
     - `thread/read`（`includeTurns:true`）拉该会话的历史 turns（**不**开 turn、**不**驻留进程；含已解密思考），归一化成 `ThreadHistory`；
     - `reply_in_thread` 发一张**折叠历史卡**（`buildHistoryCard`，schema 2.0 `collapsible_panel` 嵌套：每轮收拢，展开见 👤提问/🤖回答，再下一层折叠思考+工具明细；卡底「📍上次停在」预览；长历史只显示最近 N 轮并注明）——这张卡同时就是新话题的根消息；
-    - `getThreadId` 回取话题 thread_id → `upsertSession` 把 `codexThreadId` 绑到该话题（model/effort 留空，沿用该 codex thread 自己记忆的配置）。
+    - `getThreadId` 回取话题 thread_id → `upsertSession` 把 `codexThreadId` 绑到该话题（model/effort/serviceTier 留空，沿用该 codex thread 自己记忆的配置）。
     - **不发任何填充轮**：会话靠话题下一条消息经 `resolveThread`（`getSession`→`thread/resume`）惰性续上——用户直接接着聊即可。
   - **resume 只在新建会话时可选；话题中途不允许恢复**
 
@@ -86,9 +85,9 @@
 - **@bot 文本** = 与 codex 对话
 - **运行输出卡**（流式，原地 patch 更新）：正在输出 / 工具调用块（可隐藏）/ 文本
   - 底部按钮行（即"菜单"，卡片按钮在话题里有效）：`⏹ 中止` + `⚙️ 设置`
-  - `⚙️ 设置`：展开改本会话 `模型/effort`（改下一轮）+ 显示 cwd/分支
+  - `⚙️ 设置`：展开改本会话 `模型/推理/速度`（改下一轮）+ 显示 cwd/分支
   - **设置控件仅挂最新一张卡**；新一轮开始时 patch 上一张卡移除它 → 翻历史干净
-- **会话开场**：话题首条 bot 消息播报 模型/effort/cwd/分支（一次性，会滚走，不依赖它常驻）
+- **会话开场**：话题首条 bot 消息播报 模型/推理/速度/cwd/分支（一次性，会滚走，不依赖它常驻）
 
 > 群 / 话题里**没有钉住的菜单**（机器人菜单仅单聊）；卡片底部按钮行就是事实上的菜单。
 
@@ -104,8 +103,8 @@
 - **AgentBackend 接口隔离**（`startThread / run / runStreamed / resume / abort` 等），未来可换 exec / SDK / 远程而上层不动。
 - **run 参数映射**：
   - 模型 → `thread/start.model`
-  - effort → `turn/start.effort`（none/minimal/low/medium/high/xhigh；按模型 supportedReasoningEfforts 联动）
-  - ~~fast~~ → codex 无此参数，已删（见 .plans/decisions.md）
+  - 推理 → `turn/start.effort`（none/minimal/low/medium/high/xhigh；按模型 supportedReasoningEfforts 联动）
+  - 速度 → `thread/start.serviceTier` / `turn/start.serviceTier`（按模型 `serviceTiers` 联动；兜底 standard/fast）
   - 权限 → 固定 `approvalPolicy:"never"` + `sandbox:"workspace-write"`，`writable_roots` 只给当前会话 `cwd` → 无 mid-turn 审批，但禁止写入会话目录外
   - 图片 → input `{ type:"local_image", path }`
 - **传输层**：`@larksuiteoapi/node-sdk` 长连接（WSClient）收 `im.message.receive_v1` + `card.action.trigger`(卡片回调) + `application.bot.menu_v6`(菜单)。lark-cli **收不到卡片回调**，仅用于出站动作（发卡/置顶/建群/reply_in_thread）+ OAuth onboarding。
@@ -149,7 +148,7 @@
 | `/config` | DM 菜单「⚙️ 设置」 |
 | `/doctor` | DM 菜单「🩺 诊断」 |
 | `/help` | DM 自由文本 → 引导卡 |
-| `/model` `/effort` | 话题运行卡「⚙️ 设置」下拉（codex 无 fast） |
+| `/model` | 话题运行卡「⚙️ 设置」下拉（模型 / 推理 / 速度） |
 | `/stop` | 运行卡「⏹ 中止」按钮 |
 | `/new` `/reset` `/status` | 回群开新话题 / 置顶横幅 / 运行卡 |
 | `/resume` | 配置卡「🔁 恢复历史会话」 |
@@ -184,9 +183,9 @@
 **✅ 已验证（codex app-server，本机 codex 0.131.0，零 token 成本）** —— 详见 `prototype/appserver-probe/FINDINGS.md`
 - 握手 `initialize`/`initialized`、线协议 = JSONL JSON-RPC 2.0、服务端通知经 stdout 回传。
 - 方法全表存在：`thread/start` `thread/resume` `turn/start` `turn/steer` `turn/interrupt` `model/list` 等。
-- 参数对齐：thread/start 带 model/cwd/approvalPolicy/sandbox；**turn/start 可按 turn 覆盖 model/effort/sandbox/approval 且沿用后续 turn**（= 话题内改设置改下一轮）；turn/steer 需 `expectedTurnId`；turn/interrupt 需 `threadId+turnId`。
+- 参数对齐：thread/start 带 model/serviceTier/cwd/approvalPolicy/sandbox；**turn/start 可按 turn 覆盖 model/effort/serviceTier/sandbox/approval 且沿用后续 turn**（= 话题内改设置改下一轮）；turn/steer 需 `expectedTurnId`；turn/interrupt 需 `threadId+turnId`。
 - 枚举：effort `none|minimal|low|medium|high|xhigh`；sandbox `read-only|workspace-write|danger-full-access`；approval `untrusted|on-failure|on-request|never`。
-- `model/list` 返回每模型 `supportedReasoningEfforts` → 配置卡 effort 选项可随模型联动。
+- `model/list` 返回每模型 `supportedReasoningEfforts` / `serviceTiers` → 配置卡推理和速度选项可随模型联动。
 
 **✅ 已验证（飞书侧，用现有应用 `cli_xxxxxxxxxxxxxxxx` 实跑）**
 - `im +chat-create --as bot`：建群、拉人、返回 chat_id + share_link ✓

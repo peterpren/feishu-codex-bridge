@@ -1,4 +1,4 @@
-import type { ModelInfo, ReasoningEffort, ThreadSummary } from '../agent/types';
+import type { ModelInfo, ReasoningEffort, ServiceTier, ServiceTierInfo, ThreadSummary } from '../agent/types';
 import { PRODUCT_NAME } from '../core/branding';
 import { actions, button, card, hr, linkButton, md, note, selectStatic, type CardElement, type CardObject } from './cards';
 
@@ -6,6 +6,7 @@ import { actions, button, card, hr, linkButton, md, note, selectStatic, type Car
 export const MC = {
   model: 'model.set',
   effort: 'model.effort',
+  speed: 'model.speed',
 } as const;
 
 /** Action ids for the `/resume` card. */
@@ -19,32 +20,45 @@ const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   low: '低',
   medium: '中',
   high: '高',
-  xhigh: '极高',
+  xhigh: '超高',
 };
+
+const DEFAULT_SERVICE_TIERS: ServiceTierInfo[] = [
+  { id: 'standard', name: '标准', description: '' },
+  { id: 'fast', name: '快速', description: '' },
+];
+
+function serviceTierLabel(tier: ServiceTierInfo): string {
+  if (tier.id === 'standard') return '标准';
+  if (tier.id === 'fast') return '快速';
+  return tier.name || tier.id;
+}
 
 // ── /model ────────────────────────────────────────────────────────────────
 
 /** Server-side state for a pending `/model` card, keyed by its messageId. */
 export interface ModelCardState {
   chatId: string;
-  /** the topic (session) whose model/effort this card edits */
+  /** the topic (session) whose model/effort/speed this card edits */
   threadId: string;
   requesterOpenId: string;
   models: ModelInfo[];
   model: string;
   effort: ReasoningEffort;
+  serviceTier?: ServiceTier;
   createdAt: number;
   /** transient confirmation line */
   note?: string;
 }
 
-/** The `/model` card: pick model + reasoning effort for the current session. */
+/** The `/model` card: pick model + reasoning effort + speed for the current session. */
 export function buildModelCard(state: ModelCardState): CardObject {
   const visible = state.models.filter((m) => !m.hidden);
   const cur = state.models.find((m) => m.id === state.model);
   const efforts = cur?.supportedEfforts.length ? cur.supportedEfforts : (['low', 'medium', 'high'] as ReasoningEffort[]);
+  const serviceTier: ServiceTier = state.serviceTier === 'fast' ? 'fast' : 'standard';
   const elements = [
-    md('🧠 **模型 / 推理强度**'),
+    md('🧠 **模型 / 推理 / 速度**'),
     note('选择后下一轮生效'),
     hr(),
     actions([
@@ -56,9 +70,15 @@ export function buildModelCard(state: ModelCardState): CardObject {
       }),
       selectStatic({
         actionId: MC.effort,
-        placeholder: 'effort',
+        placeholder: '推理',
         initial: state.effort,
-        options: efforts.map((e) => ({ label: `effort：${EFFORT_LABEL[e]}`, value: e })),
+        options: efforts.map((e) => ({ label: `推理：${EFFORT_LABEL[e]}`, value: e })),
+      }),
+      selectStatic({
+        actionId: MC.speed,
+        placeholder: '速度',
+        initial: serviceTier,
+        options: DEFAULT_SERVICE_TIERS.map((tier) => ({ label: `速度：${serviceTierLabel(tier)}`, value: tier.id })),
       }),
     ]),
   ];
@@ -192,7 +212,7 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
   const effectiveNoMention = noMention ?? (scope === 'single');
   const elements: CardElement[] = [];
   if (scope === 'single') {
-    const lines = [talkLine(effectiveNoMention, '交给我处理'), '· `/model` → 切换模型 / 推理强度'];
+    const lines = [talkLine(effectiveNoMention, '交给我处理'), '· `/model` → 切换模型 / 推理 / 速度'];
     if (isAdmin) lines.push('· `/settings` → 群设置（免@ 开关）');
     lines.push('· `/help` → 这张速查卡');
     elements.push(md('💬 **单会话群** — 整群就是一个会话，上下文连续。'), hr(), md(lines.join('\n')));
@@ -203,7 +223,8 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
       md(
         `${talkLine(effectiveNoMention, '继续当前会话')}\n` +
           '· `/rename 新标题` → 修改话题标题\n' +
-          '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/model` → 切换模型 / 推理 / 速度\n' +
+          '· 直接发文件（不用 @）→ 附件交给当前话题处理\n' +
           '· `/help` → 这张速查卡',
       ),
       note('只有话题发起人或管理员可驱动本话题；开新话题：回到主群区 @我 + 内容。'),
@@ -211,7 +232,7 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
   } else {
     const lines = ['· **@我 + 内容** → 开一个新话题并开始（独立工作区）'];
     if (isAdmin) lines.push('· `/resume` → 恢复历史会话', '· `/settings` → 群设置（免@ 开关）');
-    lines.push('· `/rename 新标题` → 需要在话题里用', '· `/model` → 需要在话题里用', '· `/help` → 这张速查卡');
+    lines.push('· `/rename 新标题` → 需要在话题里用', '· `/model` → 需要在话题里用（模型 / 推理 / 速度）', '· `/help` → 这张速查卡');
     elements.push(md('👥 **主群区** — @我开话题，每个话题是独立会话。'), hr(), md(lines.join('\n')));
   }
   return card(elements, { header: { title: '🤖 可用命令', template: 'blue' }, summary: '可用命令' });
@@ -234,7 +255,7 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
       md('💬 **单会话群**（整群一个会话，上下文连续）'),
       md(
         `${talkLine(effectiveNoMention, '交给我处理')}\n` +
-          '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/model` → 切换模型 / 推理 / 速度\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 命令速查卡',
       ),
@@ -248,7 +269,12 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
           '· `/settings` → 群设置（免@ 开关）',
       ),
       md('🧵 **话题内**'),
-      md(`${talkLine(effectiveNoMention, '继续当前会话')}\n· \`/rename 新标题\` → 修改话题标题\n· \`/model\` → 切换模型 / 推理强度`),
+      md(
+        `${talkLine(effectiveNoMention, '继续当前会话')}\n` +
+          '· `/rename 新标题` → 修改话题标题\n' +
+          '· `/model` → 切换模型 / 推理 / 速度\n' +
+          '· 直接发文件（不用 @）→ 附件交给当前话题处理',
+      ),
       note('只有话题发起人或管理员可驱动该话题；任意场景发 `/help` 看当前可用命令。'),
     );
   }

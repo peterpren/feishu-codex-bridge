@@ -1,14 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
-import type { ReasoningEffort } from '../agent/types';
+import type { ReasoningEffort, ServiceTier } from '../agent/types';
 import type { CloudDocFolder } from '../project/registry';
 
 /**
  * A persisted session = one Feishu topic (thread) bound to a codex thread.
  * Survives bridge restarts so @bot inside an existing topic resumes the right
  * codex thread (instead of silently starting a fresh one) and the ⚙️ per-session
- * model/effort overrides stick.
+ * model/effort/speed overrides stick.
  */
 export interface SessionRecord {
   /** Feishu topic thread_id (the key) */
@@ -19,6 +19,7 @@ export interface SessionRecord {
   codexThreadId: string;
   model?: string;
   effort?: ReasoningEffort;
+  serviceTier?: ServiceTier;
   /** first user message excerpt, for context */
   summary: string;
   /** Short Feishu topic title shown in the project/session list. */

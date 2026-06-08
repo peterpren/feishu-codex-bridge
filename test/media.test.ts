@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
-import { imageKeysFromContent, messageHasImages } from '../src/bot/media';
+import {
+  appendInboundFilesToText,
+  collectInboundFiles,
+  imageKeysFromContent,
+  messageHasFiles,
+  messageHasImages,
+} from '../src/bot/media';
 
 function msg(overrides: Partial<NormalizedMessage> = {}): NormalizedMessage {
   return {
@@ -29,6 +38,54 @@ describe('messageHasImages', () => {
   it('is false for plain text / non-image resources', () => {
     expect(messageHasImages(msg())).toBe(false);
     expect(messageHasImages(msg({ resources: [{ type: 'file', fileKey: 'file_1' }] }))).toBe(false);
+  });
+});
+
+describe('inbound file attachments', () => {
+  it('detects normal file resources', () => {
+    expect(messageHasFiles(msg({ resources: [{ type: 'file', fileKey: 'file_1', fileName: 'a.md' }] }))).toBe(true);
+    expect(messageHasFiles(msg({ resources: [{ type: 'image', fileKey: 'img_1' }] }))).toBe(false);
+  });
+
+  it('downloads files into the topic workspace inbox', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'bridge-file-'));
+    const channel = {
+      rawClient: {
+        im: {
+          v1: {
+            messageResource: {
+              get: async () => ({
+                writeFile: async (path: string) => {
+                  await import('node:fs/promises').then((fs) => fs.writeFile(path, '# hello\n', 'utf8'));
+                },
+              }),
+            },
+          },
+        },
+      },
+    };
+
+    const files = await collectInboundFiles(
+      channel as any,
+      msg({ resources: [{ type: 'file', fileKey: 'file_1', fileName: '../需求.md' }] }),
+      cwd,
+    );
+
+    expect(files).toHaveLength(1);
+    const file = files[0]!;
+    expect(file.name).toBe('.._需求.md');
+    expect(file.path).toContain('/.feishu/inbox/');
+    expect(await readFile(file.path, 'utf8')).toBe('# hello\n');
+  });
+
+  it('adds downloaded file paths to the prompt and strips Feishu placeholders', () => {
+    const text = appendInboundFilesToText('帮我处理 <file key="file_1" name="需求.md"/>', [
+      { name: '需求.md', path: '/cwd/.feishu/inbox/om/01-需求.md', fileKey: 'file_1' },
+    ]);
+
+    expect(text).toContain('帮我处理');
+    expect(text).toContain('/cwd/.feishu/inbox/om/01-需求.md');
+    expect(text).not.toContain('<file');
   });
 });
 

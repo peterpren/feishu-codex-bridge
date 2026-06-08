@@ -1,6 +1,6 @@
 import type { BotAddedEvent, CardActionEvent, CommentEvent, LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { createBackend } from '../agent';
-import type { AgentInput, AgentRun, AgentThread, ModelInfo, PermissionMode, ReasoningEffort, ThreadSummary } from '../agent/types';
+import type { AgentInput, AgentRun, AgentThread, ModelInfo, PermissionMode, ReasoningEffort, ServiceTier, ThreadSummary } from '../agent/types';
 import {
   getMaxConcurrentRuns,
   getPendingPolicy,
@@ -57,20 +57,10 @@ import {
   buildProjectSettingsCard,
   buildRmConfirmCard,
   buildSettingsCard,
-  buildUpdateCard,
   DM,
   GS,
   type DoctorInfo,
 } from '../card/dm-cards';
-import {
-  currentVersion,
-  daemonRunning,
-  installLatest,
-  isDevSource,
-  isNewer,
-  latestVersion,
-  restartDaemon,
-} from '../service/update';
 import { resolveCodexBin, codexVersion } from '../agent/codex-appserver/locate';
 import { fetchUsageBundle, UsageError } from '../agent/codex-appserver/usage';
 import {
@@ -118,7 +108,14 @@ import {
   type RunRecordContext,
 } from './run-store';
 import { handleDmConsole } from './dm-console';
-import { collectInboundImages, messageHasImages } from './media';
+import {
+  appendInboundFilesToText,
+  collectInboundFiles,
+  collectInboundImages,
+  messageHasFiles,
+  messageHasImages,
+} from './media';
+import { pickBridgeDefaults } from './model-defaults';
 import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, type TopicRequester } from './topic-title';
 import {
   addCommentReaction,
@@ -271,7 +268,7 @@ export interface Orchestrator {
  *   p2p                       → DM console (never runs codex).
  *   group @bot, no thread     → bot posts a short title message, then
  *                               reply_in_thread creates the topic → run codex
- *                               (default model/effort; tune later with /model).
+ *                               (default model/effort/speed; tune later with /model).
  *   group @bot /resume        → history picker → resume a codex thread in a new topic.
  *   group @bot, inside thread → a turn in that session (steer/queue mid-turn);
  *                               /model opens the model/effort picker for it.
@@ -316,9 +313,8 @@ export function createOrchestrator(
     return modelsCache;
   }
 
-  function pickDefault(models: ModelInfo[]): { model: string; effort: ReasoningEffort } {
-    const def = models.find((m) => m.isDefault && !m.hidden) ?? models.find((m) => !m.hidden) ?? models[0];
-    return { model: def?.id ?? 'gpt-5.5', effort: def?.defaultEffort ?? 'medium' };
+  function pickDefault(models: ModelInfo[]): { model: string; effort: ReasoningEffort; serviceTier?: ServiceTier } {
+    return pickBridgeDefaults(models);
   }
 
   function projectCloudDocAdmins(extraOpenId?: string): string[] {
@@ -578,14 +574,18 @@ export function createOrchestrator(
 
   /** Whether to respond to a non-@ message in a project group.
    * Slash commands (/help /resume /settings /model /rename) respond without @
-   * because they're explicit. For normal messages, single applies to the whole
-   * group; multi applies only inside a topic. Plain chatter in the main area
-   * still needs @, so a random sentence never opens a new topic.
+   * because they're explicit. File messages inside an existing topic also
+   * respond without @: Feishu file cards cannot @ the bot, and the topic actor
+   * gate below still limits this to the topic owner/admin.
+   * For normal messages, single applies to the whole group; multi applies only
+   * inside a topic. Plain chatter in the main area still needs @, so a random
+   * sentence never opens a new topic.
    * 即使开了免@，若消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
    * bot 不插话。(此函数仅在 !mentionedBot 时调用,故 @到 bot 的情况已被排除。) */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
     if (msg.mentionAll || msg.mentions.some((m) => !m.isBot)) return false;
     if (parseCommand(msg.content.trim()) !== null) return true;
+    if (msg.threadId && messageHasFiles(msg)) return true;
     if (!(project.noMention ?? defaultNoMention(project))) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
     return Boolean(msg.threadId);
@@ -661,6 +661,16 @@ export function createOrchestrator(
     return key?.split('#')[0];
   }
 
+  async function collectTurnInput(msg: NormalizedMessage, text: string, cwd: string): Promise<AgentInput> {
+    const hasFiles = messageHasFiles(msg);
+    const files = hasFiles ? await collectInboundFiles(channel, msg, cwd) : [];
+    const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
+    return {
+      text: hasFiles ? appendInboundFilesToText(text, files, true) : text,
+      images,
+    };
+  }
+
   /**
    * A turn in a session keyed by `sessionKey` — the topic's threadId (multi) or
    * the chatId (single, `flat`). steer/queue mid-turn; otherwise reserve + run.
@@ -677,31 +687,30 @@ export function createOrchestrator(
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
     if (existing) {
-      // Download any images first (best-effort) so the steered/queued turn can
-      // carry them. Awaited here — the session is already held by a running
-      // turn, so there's no reservation race to protect; gated on
-      // messageHasImages so the common text path stays await-free and fast.
-      const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
-      // The turn may have finished while images downloaded — re-read the session.
-      // If it's gone, start a fresh run (carrying the images we already fetched).
+      // Download attachments first so the steered/queued turn carries local
+      // paths. The session is already held by a running turn, so no reservation
+      // race; if the turn finishes while downloading, fall through to a fresh
+      // reserved run with the same prepared input.
+      const rec = await getSession(sessionKey);
+      const input = await collectTurnInput(msg, text, rec?.cwd ?? project?.cwd ?? fallbackCwd);
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, text, sessionKey, flat, project, perm, images);
+        startReservedRun(msg, text, sessionKey, flat, project, perm, input);
         return;
       }
       if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
         const tid = cur.run.turnId();
         if (tid) {
           try {
-            await cur.thread.steer({ text, images }, tid);
-            log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
+            await cur.thread.steer(input, tid);
+            log.info('intake', 'steer', { tid, images: input.images?.length ?? 0, files: messageHasFiles(msg) });
             return;
           } catch (err) {
             log.warn('intake', 'steer-failed', { err: String(err) });
           }
         }
       }
-      cur.queue.push({ text, images });
+      cur.queue.push(input);
       log.info('intake', 'queued', { depth: cur.queue.length });
       return;
     }
@@ -726,13 +735,13 @@ export function createOrchestrator(
     flat: boolean,
     project: Project | undefined,
     perm: TurnPerm,
-    preloadedImages?: string[],
+    preloadedInput?: AgentInput,
   ): void {
     const existing = active.get(sessionKey);
     if (existing) {
-      // A run appeared between handleTurn's check and here (we awaited an image
-      // download) — queue onto it rather than launch a second turn.
-      existing.queue.push({ text, images: preloadedImages });
+      // A run appeared between handleTurn's check and here (we awaited
+      // attachment download) — queue onto it rather than launch a second turn.
+      existing.queue.push(preloadedInput ?? { text });
       log.info('intake', 'queued', { depth: existing.queue.length });
       return;
     }
@@ -741,10 +750,6 @@ export function createOrchestrator(
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const reaction = runReaction(msg.messageId, !sema.hasFree());
       try {
-        // Images preloaded by handleTurn's fall-through, else fetch them now
-        // (inside the detached run, after the synchronous reservation).
-        const images =
-          preloadedImages ?? (messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined);
         let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
         let rec = await getSession(sessionKey);
         let sessionCwd = rec?.cwd;
@@ -791,6 +796,7 @@ export function createOrchestrator(
         sessionCwd = rec?.cwd ?? sessionCwd;
         runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder) ?? runCloudDocFolder;
         runCloudDocFolderError = rec?.cloudDocFolderError ?? runCloudDocFolderError;
+        const input = preloadedInput ?? (await collectTurnInput(msg, text, sessionCwd ?? (flat ? project?.cwd : fallbackCwd) ?? fallbackCwd));
         reserved.thread = thread;
         await launchRun(
           {
@@ -799,8 +805,8 @@ export function createOrchestrator(
             replyInThread: !flat,
             flat,
             thread,
-            firstText: text,
-            images,
+            firstText: input.text ?? text,
+            images: input.images,
             knownThreadId: sessionKey,
             cwd: sessionCwd ?? (flat ? project?.cwd : undefined),
             projectName: project?.name,
@@ -862,6 +868,7 @@ export function createOrchestrator(
         codexThreadId: rec.codexThreadId,
         model: rec.model,
         effort: rec.effort,
+        serviceTier: rec.serviceTier,
         mode: perm?.mode,
         network: perm?.network,
         cloudDocFolder: cloudDoc.cloudDocFolder,
@@ -875,6 +882,7 @@ export function createOrchestrator(
         cwd,
         model: rec.model,
         effort: rec.effort,
+        serviceTier: rec.serviceTier,
         mode: perm?.mode ?? project?.mode,
         network: perm?.network ?? project?.network,
         cloudDocFolder: cloudDoc.cloudDocFolder,
@@ -922,7 +930,7 @@ export function createOrchestrator(
       const perm = turnPerm(project, msg.senderId);
       // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
       if (project) void refreshBranch(channel, project).catch(() => undefined);
-      const { model, effort } = pickDefault(await listModels());
+      const { model, effort, serviceTier } = pickDefault(await listModels());
       const firstText = text || '你好，我们开始吧。';
       const topicTitle = deriveTopicTitle(firstText);
       const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
@@ -937,6 +945,7 @@ export function createOrchestrator(
           cwd,
           model,
           effort,
+          serviceTier,
           mode: perm.mode,
           network: perm.network,
           cloudDocFolder: cloudDoc.cloudDocFolder,
@@ -949,13 +958,15 @@ export function createOrchestrator(
           .catch(() => undefined);
         return;
       }
-      // Download any attached/forwarded images so the opening turn can see them.
-      const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
+      // Download any attached/forwarded media so the opening turn can see it.
+      const input = await collectTurnInput(msg, firstText, cwd);
       log.info('card', 'start', {
         project: project?.name ?? '(unregistered)',
         model,
         effort,
-        images: images?.length ?? 0,
+        serviceTier,
+        images: input.images?.length ?? 0,
+        files: messageHasFiles(msg),
         title: topicTitle,
         cloudDocFolder: cloudDoc.cloudDocFolder?.token ?? null,
         cloudDocFolderError: cloudDoc.cloudDocFolderError ?? null,
@@ -969,10 +980,11 @@ export function createOrchestrator(
           topicRequesterOpenId: msg.senderId,
           topicRequesterName: requesterName,
           thread,
-          firstText,
-          images,
+          firstText: input.text ?? firstText,
+          images: input.images,
           model,
           effort,
+          serviceTier,
           cwd,
           projectName: project?.name,
           summary: topicTitle,
@@ -1073,12 +1085,13 @@ export function createOrchestrator(
         models,
         model: rec?.model ?? def.model,
         effort: rec?.effort ?? def.effort,
+        serviceTier: rec?.serviceTier ?? def.serviceTier,
         createdAt: Date.now(),
       };
       const res = await sendManagedCard(channel, msg.chatId, buildModelCard(state), msg.messageId, true);
       pruneModelPending();
       modelPending.set(res.messageId, state);
-      log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort });
+      log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort, serviceTier: state.serviceTier ?? null });
     });
   }
 
@@ -1239,7 +1252,10 @@ export function createOrchestrator(
         if (m && m.supportedEfforts.length && !m.supportedEfforts.includes(state.effort)) {
           state.effort = m.defaultEffort;
         }
-        await patchSession(state.threadId, { model: state.model, effort: state.effort });
+        if (state.serviceTier !== 'fast') {
+          state.serviceTier = 'standard';
+        }
+        await patchSession(state.threadId, { model: state.model, effort: state.effort, serviceTier: state.serviceTier });
         state.note = `✅ 已切换模型「${m?.displayName ?? option}」，下一轮生效`;
         return buildModelCard(state);
       });
@@ -1250,7 +1266,17 @@ export function createOrchestrator(
       settleUpdate(evt.messageId, async () => {
         state.effort = option as ReasoningEffort;
         await patchSession(state.threadId, { effort: state.effort });
-        state.note = '✅ 已设置 effort，下一轮生效';
+        state.note = '✅ 已设置推理，下一轮生效';
+        return buildModelCard(state);
+      });
+    })
+    .on(MC.speed, ({ evt, option }) => {
+      const state = authPending(modelPending, evt);
+      if (!state || !option) return;
+      settleUpdate(evt.messageId, async () => {
+        state.serviceTier = option;
+        await patchSession(state.threadId, { serviceTier: state.serviceTier });
+        state.note = '✅ 已设置速度，下一轮生效';
         return buildModelCard(state);
       });
     })
@@ -1536,62 +1562,19 @@ export function createOrchestrator(
         .send(evt.chatId, { markdown: `🔄 长连接状态：**${conn}**\nSDK 会自动重连；若长期断开，请在终端重跑 \`feishu-codex-bridge run\`（前台）或 \`feishu-codex-bridge restart\`（后台守护）。` }, { replyTo: evt.messageId })
         .catch(() => undefined);
     })
-    // 版本更新（检查）：查 npm 最新版，渲染结果。npm view 走异步 execFile —— 卡片
-    // 回调里**绝不能** spawnSync，否则冻结整条 event loop。先 settle 再更新，避开
-    // 点击回调窗口；checking→checked 是顺序 await，天然有序。
     .on(DM.update, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      void (async () => {
-        await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
-        await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'checking' })).catch(
-          () => undefined,
-        );
-        const current = currentVersion();
-        const latest = await latestVersion().catch(() => null);
-        const hasUpdate = !!latest && isNewer(latest, current);
-        log.info('console', 'update-check', { current, latest, hasUpdate });
-        await updateManagedCard(
-          channel,
-          evt.messageId,
-          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
-        ).catch((e) => log.fail('console', e, { phase: 'update-check' }));
-      })();
+      log.info('console', 'update-disabled');
+      void channel
+        .send(evt.chatId, { markdown: '版本更新入口已关闭。当前是定制版 Bridge，后续更新走 GitHub 定制流程。' }, { replyTo: evt.messageId })
+        .catch(() => undefined);
     })
-    // 版本更新（执行）：npm i -g 最新版（async spawn），成功后**先发完成卡再**重启
-    // daemon —— restart 会 kill 掉当前这个 daemon 进程（卡片回调就跑在它里面），所以
-    // 必须等完成卡渲染落地后再触发 restart，否则用户看不到结果。
     .on(DM.updateDo, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      void (async () => {
-        await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
-        const from = currentVersion();
-        await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'updating', from })).catch(
-          () => undefined,
-        );
-        const res = await installLatest();
-        if (!res.ok) {
-          log.info('console', 'update-failed', { from });
-          await updateManagedCard(
-            channel,
-            evt.messageId,
-            buildUpdateCard({ phase: 'error', from, message: res.message }),
-          ).catch((e) => log.fail('console', e, { phase: 'update-error' }));
-          return;
-        }
-        const to = currentVersion();
-        const willRestart = daemonRunning();
-        log.info('console', 'update-done', { from, to, willRestart });
-        await updateManagedCard(
-          channel,
-          evt.messageId,
-          buildUpdateCard({ phase: 'done', from, to, willRestart }),
-        ).catch((e) => log.fail('console', e, { phase: 'update-done' }));
-        if (willRestart) {
-          // 给完成卡一点渲染时间，再让 launchd 重启（kill 自己）。
-          await new Promise((r) => setTimeout(r, 800));
-          await restartDaemon().catch((e) => log.fail('console', e, { phase: 'update-restart' }));
-        }
-      })();
+      log.info('console', 'update-disabled');
+      void channel
+        .send(evt.chatId, { markdown: '版本更新入口已关闭。当前是定制版 Bridge，后续更新走 GitHub 定制流程。' }, { replyTo: evt.messageId })
+        .catch(() => undefined);
     })
     // 📊 Codex 用量：loading → 并行拉 wham/usage + wham/profiles/me → 原地更新结果卡。
     // 同 DM.update 的双阶段模式：handler 立即返回让 SDK ack，慢活全在 settle 之后。
@@ -1998,6 +1981,7 @@ export function createOrchestrator(
     knownThreadId?: string;
     model?: string;
     effort?: ReasoningEffort;
+    serviceTier?: ServiceTier;
     cwd?: string;
     projectName?: string;
     summary?: string;
@@ -2043,6 +2027,7 @@ export function createOrchestrator(
         codexThreadId: opts.thread.codexThreadId,
         model: opts.model,
         effort: opts.effort,
+        serviceTier: opts.serviceTier,
         summary: opts.summary ?? opts.firstText.slice(0, 80),
         topicTitle: opts.topicTitle,
         topicTitleMessageId,
@@ -2124,10 +2109,11 @@ export function createOrchestrator(
         }
       }
       for (;;) {
-        // per-turn model/effort: prefer latest persisted (⚙️ may have changed it)
+        // per-turn model/effort/speed: prefer latest persisted (⚙️ may have changed it)
         const rec = topicThreadId ? await getSession(topicThreadId) : undefined;
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
+        const turnServiceTier = rec?.serviceTier ?? opts.serviceTier;
         const turnCwd = opts.cwd ?? rec?.cwd ?? fallbackCwd;
         currentRun = {
           ctx: {
@@ -2147,7 +2133,7 @@ export function createOrchestrator(
           finished: false,
         };
         await writeRunRecord(startedRunRecord(currentRun.ctx));
-        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort, serviceTier: turnServiceTier });
         currentRun.run = run;
         state.run = run;
         const render = new RunRender();
@@ -2410,7 +2396,7 @@ export function createOrchestrator(
           try {
             const thread = await resolveDocThread(sessionKey, ctx.question);
             const rec = await getSession(sessionKey);
-            const run = thread.runStreamed({ text: prompt }, { model: rec?.model, effort: rec?.effort });
+            const run = thread.runStreamed({ text: prompt }, { model: rec?.model, effort: rec?.effort, serviceTier: rec?.serviceTier });
             const runCtx: RunRecordContext = {
               runId: newRunId(),
               chatId: sessionKey,
@@ -2538,6 +2524,7 @@ export function createOrchestrator(
           codexThreadId: rec.codexThreadId,
           model: rec.model,
           effort: rec.effort,
+          serviceTier: rec.serviceTier,
         });
         sessions.set(sessionKey, resumed);
         return resumed;
@@ -2545,8 +2532,8 @@ export function createOrchestrator(
         log.fail('agent', err, { phase: 'comment-resume', sessionKey });
       }
     }
-    const { model, effort } = pickDefault(await listModels());
-    const fresh = await backend.startThread({ cwd: fallbackCwd, model, effort });
+    const { model, effort, serviceTier } = pickDefault(await listModels());
+    const fresh = await backend.startThread({ cwd: fallbackCwd, model, effort, serviceTier });
     sessions.set(sessionKey, fresh);
     await upsertSession({
       threadId: sessionKey,
@@ -2555,6 +2542,7 @@ export function createOrchestrator(
       codexThreadId: fresh.codexThreadId,
       model,
       effort,
+      serviceTier,
       summary: question.slice(0, 80),
       createdAt: Date.now(),
       updatedAt: Date.now(),

@@ -7,6 +7,13 @@
 import type { CloudDocFolder } from '../project/registry';
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type ServiceTier = string;
+
+export interface ServiceTierInfo {
+  id: ServiceTier;
+  name: string;
+  description: string;
+}
 
 /**
  * Permission tier for a project's codex sandbox:
@@ -31,6 +38,7 @@ export interface ModelInfo {
   description: string;
   supportedEfforts: ReasoningEffort[];
   defaultEffort: ReasoningEffort;
+  serviceTiers: ServiceTierInfo[];
   isDefault: boolean;
   hidden: boolean;
 }
@@ -117,6 +125,7 @@ export interface AgentRun {
 export interface TurnOptions {
   model?: string;
   effort?: ReasoningEffort;
+  serviceTier?: ServiceTier;
 }
 
 export interface AgentThread {
@@ -135,6 +144,7 @@ export interface StartThreadOptions {
   cwd: string;
   model?: string;
   effort?: ReasoningEffort;
+  serviceTier?: ServiceTier;
   /** permission tier; undefined → 'full' (preserves legacy danger-full-access) */
   mode?: PermissionMode;
   /** let the sandboxed agent's shell reach the network (qa/write only; full is

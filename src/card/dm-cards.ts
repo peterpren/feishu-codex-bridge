@@ -101,7 +101,6 @@ export function buildDmMenuCard(): CardObject {
         button('📊 用量', { a: DM.usage }),
         button('🩺 诊断', { a: DM.doctor }),
         button('🔄 重连', { a: DM.reconnect }),
-        button('⬆️ 版本更新', { a: DM.update }),
       ]),
     ],
     { header: { title: `🤖 ${PRODUCT_NAME} 管理台`, template: 'blue' } },

@@ -27,6 +27,9 @@ import { log } from '../core/logger';
 
 /** Cap per message so a flood of images can't wedge a turn or fill the disk. */
 const MAX_IMAGES = 9;
+/** Cap per message so one dropped batch cannot fill the topic workspace. */
+const MAX_FILES = 5;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
 /** Downloaded files live this long; codex reads them within the turn (seconds),
  * so an hour is generous. Pruned lazily on the next download. */
 const MEDIA_TTL_MS = 60 * 60_000;
@@ -37,6 +40,19 @@ interface ImageRef {
   messageId: string;
   /** Feishu image_key (img_v3_…). */
   fileKey: string;
+}
+
+interface FileRef {
+  messageId: string;
+  fileKey: string;
+  fileName?: string;
+}
+
+export interface InboundFile {
+  name: string;
+  path: string;
+  fileKey: string;
+  size?: number;
 }
 
 const EXT_BY_CONTENT_TYPE: Record<string, string> = {
@@ -57,6 +73,11 @@ export function messageHasImages(msg: NormalizedMessage): boolean {
   if ((msg.resources ?? []).some((r) => r.type === 'image')) return true;
   // merge_forward never lists resources; its sub-messages may still hold images.
   return msg.rawContentType === 'merge_forward';
+}
+
+/** Cheap synchronous check: does this message carry normal file attachments? */
+export function messageHasFiles(msg: NormalizedMessage): boolean {
+  return (msg.resources ?? []).some((r) => r.type === 'file');
 }
 
 /**
@@ -92,6 +113,47 @@ export async function collectInboundImages(channel: LarkChannel, msg: Normalized
   return out;
 }
 
+/**
+ * Download normal Feishu file attachments into the current session workspace.
+ * Files are kept under `.feishu/inbox/<messageId>/` so Codex can read them via
+ * the same cwd sandbox as the rest of the topic.
+ */
+export async function collectInboundFiles(
+  channel: LarkChannel,
+  msg: NormalizedMessage,
+  cwd: string,
+): Promise<InboundFile[]> {
+  const refs = gatherFileRefs(msg);
+  if (refs.length === 0) return [];
+
+  const dir = join(cwd, '.feishu', 'inbox', safeName(msg.messageId));
+  try {
+    await mkdir(dir, { recursive: true });
+  } catch (err) {
+    log.warn('intake', 'file-mkdir-failed', { dir, err: String(err) });
+    return [];
+  }
+
+  const out: InboundFile[] = [];
+  let index = 0;
+  for (const ref of refs.slice(0, MAX_FILES)) {
+    const file = await downloadOneFile(channel, ref, dir, index++);
+    if (file) out.push(file);
+  }
+  log.info('intake', 'files', { found: refs.length, downloaded: out.length, cwd });
+  return out;
+}
+
+export function appendInboundFilesToText(text: string, files: InboundFile[], hadFileMessage = files.length > 0): string {
+  if (!hadFileMessage) return text;
+  const base = stripFeishuFilePlaceholders(text) || '用户刚刚上传了飞书附件。请结合当前话题前文中的需求处理这些文件。';
+  if (files.length === 0) {
+    return `${base}\n\n[飞书附件]\n检测到附件消息，但 Bridge 没能下载到本地。请回复用户：需要重新上传文件，或让管理员检查机器人是否具备 im:resource 权限。`;
+  }
+  const lines = files.map((f, i) => `${i + 1}. ${f.name}：${f.path}`);
+  return `${base}\n\n[飞书附件已下载到本地]\n${lines.join('\n')}\n请直接读取以上本地路径，并按用户需求继续处理。`;
+}
+
 /** Collect (messageId, fileKey) pairs for every image: direct resources first,
  * then any inside a forwarded message. Deduped by fileKey. */
 async function gatherRefs(channel: LarkChannel, msg: NormalizedMessage): Promise<ImageRef[]> {
@@ -119,6 +181,18 @@ async function gatherRefs(channel: LarkChannel, msg: NormalizedMessage): Promise
     }
   }
 
+  return refs;
+}
+
+function gatherFileRefs(msg: NormalizedMessage): FileRef[] {
+  const refs: FileRef[] = [];
+  const seen = new Set<string>();
+  for (const raw of msg.resources ?? []) {
+    const r = raw as { type?: string; fileKey?: string; fileName?: string };
+    if (r.type !== 'file' || !r.fileKey || seen.has(r.fileKey)) continue;
+    seen.add(r.fileKey);
+    refs.push({ messageId: msg.messageId, fileKey: r.fileKey, fileName: r.fileName });
+  }
   return refs;
 }
 
@@ -188,6 +262,33 @@ async function downloadOne(channel: LarkChannel, ref: ImageRef, index: number): 
   }
 }
 
+async function downloadOneFile(
+  channel: LarkChannel,
+  ref: FileRef,
+  dir: string,
+  index: number,
+): Promise<InboundFile | undefined> {
+  const name = safeFileName(ref.fileName) || `file-${safeName(ref.fileKey)}`;
+  const file = join(dir, `${String(index + 1).padStart(2, '0')}-${name}`);
+  try {
+    const res = await channel.rawClient.im.v1.messageResource.get({
+      path: { message_id: ref.messageId, file_key: ref.fileKey },
+      params: { type: 'file' },
+    });
+    await res.writeFile(file);
+    const st = await stat(file);
+    if (st.size > MAX_FILE_BYTES) {
+      await rm(file, { force: true });
+      log.warn('intake', 'file-too-large', { name, size: st.size });
+      return undefined;
+    }
+    return { name, path: file, fileKey: ref.fileKey, size: st.size };
+  } catch (err) {
+    log.warn('intake', 'file-download-failed', { fileKey: ref.fileKey.slice(0, 24), name, err: String(err) });
+    return undefined;
+  }
+}
+
 function extFromHeaders(headers: unknown): string {
   const ct = readHeader(headers, 'content-type');
   if (ct) {
@@ -207,6 +308,26 @@ function readHeader(headers: unknown, name: string): string | undefined {
 /** Feishu image_keys are filename-safe already; sanitize defensively + clamp. */
 function safeName(fileKey: string): string {
   return fileKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(-40) || 'img';
+}
+
+function safeFileName(name: string | undefined): string {
+  const raw = (name ?? '').trim();
+  if (!raw) return '';
+  const stripped = raw
+    .replace(/[\\/]/g, '_')
+    .replace(/[<>:"|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .slice(0, 160)
+    .trim();
+  return stripped && stripped !== '.' && stripped !== '..' ? stripped : '';
+}
+
+function stripFeishuFilePlaceholders(text: string): string {
+  const cleaned = text
+    .replace(/<file\b[^>]*\/?>/gi, '')
+    .replace(/\[file\]/gi, '')
+    .trim();
+  return cleaned;
 }
 
 async function pruneOldMedia(): Promise<void> {

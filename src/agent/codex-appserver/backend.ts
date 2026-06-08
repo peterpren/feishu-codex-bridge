@@ -12,6 +12,8 @@ import type {
   PermissionMode,
   ReasoningEffort,
   ResumeThreadOptions,
+  ServiceTier,
+  ServiceTierInfo,
   StartThreadOptions,
   ThreadHistory,
   ThreadSummary,
@@ -76,6 +78,7 @@ export function sandboxParams(
 interface ThreadSessionOptions {
   cwd: string;
   model?: string;
+  serviceTier?: ServiceTier;
   mode?: PermissionMode;
   network?: boolean;
   cloudDocFolder?: CloudDocFolder;
@@ -86,21 +89,29 @@ type ThreadSessionParams = {
   approvalPolicy: typeof APPROVAL_POLICY;
   developerInstructions: string;
   model?: string;
+  serviceTier?: ServiceTier | null;
 } & Record<string, unknown>;
 
 function workspaceRoot(cwd: string): string {
   return resolve(cwd);
 }
 
+function codexServiceTier(tier: ServiceTier | undefined): ServiceTier | null | undefined {
+  if (tier === undefined) return undefined;
+  return tier === 'standard' ? null : tier;
+}
+
 export function buildThreadSessionParams(opts: ThreadSessionOptions): ThreadSessionParams {
   const root = workspaceRoot(opts.cwd);
   const sandbox = sandboxParams(opts.mode, opts.network);
+  const serviceTier = codexServiceTier(opts.serviceTier);
   return {
     cwd: root,
     approvalPolicy: APPROVAL_POLICY,
     ...sandbox,
     developerInstructions: bridgeDeveloperInstructions({ cloudDocFolder: opts.cloudDocFolder }),
     ...(opts.model ? { model: opts.model } : {}),
+    ...(serviceTier !== undefined ? { serviceTier } : {}),
   };
 }
 
@@ -181,6 +192,7 @@ class CodexThread implements AgentThread {
     readonly codexThreadId: string,
     private model: string | undefined,
     private effort: ReasoningEffort | undefined,
+    private serviceTier: ServiceTier | undefined,
   ) {}
 
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
@@ -189,6 +201,7 @@ class CodexThread implements AgentThread {
     // Per-turn overrides persist for subsequent turns (matches turn/start semantics).
     if (turn?.model) this.model = turn.model;
     if (turn?.effort) this.effort = turn.effort;
+    if (turn?.serviceTier) this.serviceTier = turn.serviceTier;
     async function* gen(): AsyncGenerator<AgentEvent> {
       const params: Record<string, unknown> = {
         threadId: self.codexThreadId,
@@ -196,6 +209,8 @@ class CodexThread implements AgentThread {
       };
       if (self.model) params.model = self.model;
       if (self.effort) params.effort = self.effort;
+      const serviceTier = codexServiceTier(self.serviceTier);
+      if (serviceTier !== undefined) params.serviceTier = serviceTier;
 
       // turn/start stays in flight for the whole turn (events arrive via
       // notifications), so we can't await it up front. But if it *rejects* —
@@ -353,7 +368,7 @@ export class CodexAppServerBackend implements AgentBackend {
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
       ...params,
     });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.serviceTier);
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
@@ -363,7 +378,7 @@ export class CodexAppServerBackend implements AgentBackend {
       threadId: opts.codexThreadId,
       ...params,
     });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.serviceTier);
   }
 
   private async spawn(cwd: string): Promise<AppServerClient> {
@@ -460,9 +475,14 @@ interface RawModel {
   isDefault?: boolean;
   supportedReasoningEfforts?: { reasoningEffort: ReasoningEffort }[];
   defaultReasoningEffort?: ReasoningEffort;
+  additionalSpeedTiers?: string[];
+  serviceTiers?: ServiceTierInfo[];
 }
 
 function mapModel(m: RawModel): ModelInfo {
+  const serviceTiers = m.serviceTiers?.length
+    ? m.serviceTiers
+    : (m.additionalSpeedTiers ?? []).map((id) => ({ id, name: id, description: '' }));
   return {
     id: m.id,
     displayName: m.displayName ?? m.id,
@@ -471,6 +491,7 @@ function mapModel(m: RawModel): ModelInfo {
     isDefault: m.isDefault ?? false,
     supportedEfforts: (m.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort),
     defaultEffort: m.defaultReasoningEffort ?? 'medium',
+    serviceTiers,
   };
 }
 
@@ -483,5 +504,9 @@ const STATIC_MODELS: ModelInfo[] = [
     isDefault: true,
     supportedEfforts: ['low', 'medium', 'high'],
     defaultEffort: 'medium',
+    serviceTiers: [
+      { id: 'standard', name: '标准', description: '' },
+      { id: 'fast', name: '快速', description: '' },
+    ],
   },
 ];

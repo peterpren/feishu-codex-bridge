@@ -351,9 +351,11 @@ describe('buildUsageShareCard', () => {
     expect(json).toContain('42.7亿');
     expect(json).toContain('活动洞察');
     expect(json).toContain('剩余 99%');
-    // 头部副标题带统计截止日；页脚右对齐「由 项目名 于 几点 生成」，项目名链到飞书介绍文档
+    // 头部副标题带统计截止日；页脚右对齐「由 项目名 于 几点 生成」，项目名保持纯文本
     expect(json).toContain('统计截至 2026-06-07');
-    expect(json).toContain('[feishu-codex-bridge](https://my.feishu.cn/docx/AFKNdf4QaooL5OxSR8bc5H7vn7b)');
+    expect(json).toContain('由 feishu-codex-bridge 于 6月7日 19:00 生成');
+    expect(json).not.toContain('[feishu-codex-bridge](');
+    expect(json).not.toContain('my.feishu.cn/docx/AFKNdf4QaooL5OxSR8bc5H7vn7b');
     expect(json).toContain('于 6月7日 19:00 生成');
     expect(json).toContain('"text_align":"right"');
     expect(json).toContain('💎 **套餐**　Pro Lite'); // 全选时套餐区块在

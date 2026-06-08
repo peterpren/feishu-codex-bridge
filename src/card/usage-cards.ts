@@ -505,14 +505,13 @@ export function buildUsageShareCard(
     sec.has('limits') ? rateLimitElements(usage.main, nowMs) : [],
     sec.has('plan') && plan ? [md(`💎 **套餐**　${plan}`)] : [],
   ]);
-  // 页脚广告位（右对齐小字）：「由 项目名 于 几点 生成」——统计截止日已在头部副标题，
-  // 页脚只留生成时刻。项目名是 markdown 链接（open_url 性质，转发后依然可点，按钮
-  // 回调才会死）；链接指向项目的飞书介绍文档（飞书内打开零跳出，比 GitHub 转化好）。
+  // 页脚右对齐小字：「由 项目名 于 几点 生成」——统计截止日已在头部副标题，
+  // 页脚只留生成时刻，项目名保持纯文本，避免点击跳转到旧介绍文档。
   const stamp = new Date(nowMs);
   const stampStr = `${stamp.getMonth() + 1}月${stamp.getDate()}日 ${String(stamp.getHours()).padStart(2, '0')}:${String(stamp.getMinutes()).padStart(2, '0')}`;
   elements.push({
     tag: 'markdown',
-    content: `<font color='grey'>🤖 由 </font>[feishu-codex-bridge](https://my.feishu.cn/docx/AFKNdf4QaooL5OxSR8bc5H7vn7b)<font color='grey'> 于 ${stampStr} 生成</font>`,
+    content: `<font color='grey'>🤖 由 feishu-codex-bridge 于 ${stampStr} 生成</font>`,
     text_size: 'notation',
     text_align: 'right',
   });

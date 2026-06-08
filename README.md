@@ -3,7 +3,7 @@
 [![npm version](https://badgen.net/npm/v/@modelzen/feishu-codex-bridge)](https://www.npmjs.com/package/@modelzen/feishu-codex-bridge)
 [![total downloads](https://badgen.net/npm/dt/@modelzen/feishu-codex-bridge)](https://www.npmjs.com/package/@modelzen/feishu-codex-bridge)
 [![downloads/month](https://badgen.net/npm/dm/@modelzen/feishu-codex-bridge)](https://www.npmjs.com/package/@modelzen/feishu-codex-bridge)
-[![license](https://badgen.net/npm/license/@modelzen/feishu-codex-bridge)](https://github.com/modelzen/feishu-codex-bridge/blob/main/LICENSE)
+[![license](https://badgen.net/npm/license/@modelzen/feishu-codex-bridge)](https://github.com/peterpren/feishu-codex-bridge/blob/main/LICENSE)
 
 > 把飞书 / Lark 桥接到你本机的 [Codex](https://github.com/openai/codex)，在群里 @ 机器人就能让 Codex 在指定项目目录里干活，结果以流式 Markdown 卡片实时回到群里。
 >
@@ -11,9 +11,7 @@
 
 一句话：你在飞书群里发「帮我加个登录接口」，机器人就在这个群绑定的代码目录里跑 Codex，边跑边把推理、命令、改动、结果更新到一张卡片上；点 ⏹ 可随时终止。
 
-> 🚀 **最快上手：把这个仓库链接 `https://github.com/modelzen/feishu-codex-bridge` 交给 Codex / Claude，照着本 README 它就能帮你把整套装好跑起来。**
->
-> 🎀 **想先看它在飞书里长啥样、能干嘛？** 看这篇图文介绍 👉 [《让 Codex 当你飞书里的同事》](https://my.feishu.cn/docx/AFKNdf4QaooL5OxSR8bc5H7vn7b)
+> 🚀 **最快上手：把这个仓库链接 `https://github.com/peterpren/feishu-codex-bridge` 交给 Codex / Claude，照着本 README 它就能帮你把整套装好跑起来。**
 
 ```
 飞书群消息 ──长连接(WSClient)──▶ bridge ──JSON-RPC/stdio──▶ codex app-server (每会话一进程)
@@ -199,10 +197,6 @@ feishu-codex-bridge bot rm <名>     # 移除一个机器人配置
 | `CODEX_HOME` | codex 配置/登录目录（默认 `~/.codex`） |
 | `FEISHU_CODEX_CWD` | 未注册群的兜底工作目录（默认进程 cwd；常驻服务建议显式设置） |
 
-> 群里那张「👈 使用说明」标签页指向的命令手册文档，可在 [`src/project/onboarding.ts`](src/project/onboarding.ts) 的 `HELP_DOC_URL` 改成你自己发布的飞书文档；设为空串则不挂该标签页。
-
----
-
 ## 🛠 CLI 一览
 
 ```
@@ -225,7 +219,7 @@ npm test              # vitest
 npm run dev           # tsup --watch
 ```
 
-本地开发：`git clone https://github.com/modelzen/feishu-codex-bridge.git && cd feishu-codex-bridge && npm i`（`prepare` 自动构建），前台跑 `npm start` 或 `./scripts/dev-run.sh`。
+本地开发：`git clone https://github.com/peterpren/feishu-codex-bridge.git && cd feishu-codex-bridge && npm i`（`prepare` 自动构建），前台跑 `npm start` 或 `./scripts/dev-run.sh`。
 
 目录结构：
 
@@ -283,11 +277,9 @@ src/
 
 ---
 
-## 💬 文档 & 交流
+## 💬 反馈 & 交流
 
-- 🎀 **图文介绍（先看它能干嘛）**：<https://my.feishu.cn/docx/AFKNdf4QaooL5OxSR8bc5H7vn7b> —— 配大量截图，讲清它在飞书里长什么样、有哪些细节、可以怎么用。
-- 📖 **命令手册（飞书文档）**：<https://taiyang.feishu.cn/docx/S41QdgAmboEFB4xsDf2cYVYVnaf> —— 各场景可用命令速查（机器人建群时也会自动挂成群标签页）。
-- 🐛 **反馈 / 贡献**：<https://github.com/modelzen/feishu-codex-bridge/issues>
+- 🐛 **反馈 / 贡献**：<https://github.com/peterpren/feishu-codex-bridge/issues>
 - 👥 **交流群**：扫码加入「Vonvon 灵感研究所」👇
 
 <p align="center"><img src="docs/assets/vonvon-group-qr.png" alt="Vonvon 灵感研究所 群二维码" width="300"></p>

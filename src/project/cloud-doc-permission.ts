@@ -22,6 +22,8 @@ export interface TopicCloudDocFolderInput extends CloudDocAccessTarget {
   title: string;
   requesterOpenId: string;
   requesterName?: string;
+  /** Extra people who should edit this topic/private-group folder. */
+  collaboratorOpenIds?: string[];
 }
 
 export interface TopicCloudDocFolderResult {
@@ -150,7 +152,8 @@ function projectAccessMembers(opts: CloudDocAccessTarget): DriveMemberData[] {
 function topicAccessMembers(opts: TopicCloudDocFolderInput): DriveMemberData[] {
   const admins = openIdMembers(opts.adminOpenIds, 'full_access');
   const requester = openIdMember(opts.requesterOpenId, 'edit');
-  return uniqueMembers([...(opts.appId ? [appMember(opts.appId)] : []), ...admins, requester]);
+  const collaborators = openIdMembers(opts.collaboratorOpenIds ?? [], 'edit');
+  return uniqueMembers([...(opts.appId ? [appMember(opts.appId)] : []), ...admins, requester, ...collaborators]);
 }
 
 function openIdMembers(ids: string[], perm: DrivePermission): DriveMemberData[] {

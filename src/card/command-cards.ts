@@ -224,13 +224,14 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
         `${talkLine(effectiveNoMention, '继续当前会话')}\n` +
           '· `/rename 新标题` → 修改话题标题\n' +
           '· `/model` → 切换模型 / 推理 / 速度\n' +
+          '· `/private [@参与者] 内容` → 创建私密协作群\n' +
           '· 直接发文件（不用 @）→ 附件交给当前话题处理\n' +
           '· `/help` → 这张速查卡',
       ),
       note('只有话题发起人或管理员可驱动本话题；开新话题：回到主群区 @我 + 内容。'),
     );
   } else {
-    const lines = ['· **@我 + 内容** → 开一个新话题并开始（独立工作区）'];
+    const lines = ['· **@我 + 内容** → 开一个新话题并开始（独立工作区）', '· `/private [@参与者] 内容` → 创建私密协作群'];
     if (isAdmin) lines.push('· `/resume` → 恢复历史会话', '· `/settings` → 群设置（免@ 开关）');
     lines.push('· `/rename 新标题` → 需要在话题里用', '· `/model` → 需要在话题里用（模型 / 推理 / 速度）', '· `/help` → 这张速查卡');
     elements.push(md('👥 **主群区** — @我开话题，每个话题是独立会话。'), hr(), md(lines.join('\n')));
@@ -265,6 +266,7 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
       md('👥 **主群区**'),
       md(
         '· **@我 + 内容** → 开一个新话题并开始（每话题独立会话 + 独立工作区）\n' +
+          '· `/private [@参与者] 内容` → 创建私密协作群\n' +
           '· `/resume` → 恢复历史会话\n' +
           '· `/settings` → 群设置（免@ 开关）',
       ),

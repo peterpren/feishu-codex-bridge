@@ -70,6 +70,20 @@ export interface Project {
   topicWorkspace?: TopicWorkspaceMode;
   /** Default Feishu Drive folder for cloud docs Codex creates for this project. */
   cloudDocFolder?: CloudDocFolder;
+  /** Private child group created from a parent project via `/private`. */
+  private?: boolean;
+  /** Parent project chat_id for private child groups. */
+  parentChatId?: string;
+  /** Parent project name for private child groups. */
+  parentProjectName?: string;
+  /** Source topic thread_id when `/private` was triggered inside a topic. */
+  sourceThreadId?: string;
+  /** Source message_id that triggered `/private`. */
+  sourceMessageId?: string;
+  /** Private group participants: initiator + explicitly @mentioned users. */
+  participants?: string[];
+  /** Users that were @mentioned for a private group but could not be added. */
+  participantAddFailures?: { openId: string; error: string; attemptedAt: number }[];
 }
 
 const FOLDER_URL_RE = /\/drive\/folder\/([^/?#]+)/;

@@ -1,4 +1,5 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
+import { mkdir } from 'node:fs/promises';
 import { log } from '../core/logger';
 import { addProject, getProjectByChatId, getProjectByName, updateProject, type CloudDocFolder, type Project } from './registry';
 import type { PermissionMode } from '../agent/types';
@@ -6,6 +7,7 @@ import { grantProjectCloudDocFolderAccess, permissionRecord } from './cloud-doc-
 import { setAnnouncement } from './announcement';
 import { onboardGroup } from './onboarding';
 import { resolveProjectCwd } from './workspace-root';
+import { privateProjectName, privateWorkspacePath } from './private-project';
 
 export interface CreateProjectInput {
   name: string;
@@ -52,6 +54,19 @@ export interface JoinGroupInput {
   adminOpenIds?: string[];
   /** Feishu app_id for granting the bot/app full access to the parent folder. */
   appId?: string;
+}
+
+export interface CreatePrivateProjectInput {
+  /** The parent multi-topic project where `/private` was invoked. */
+  parent: Project;
+  /** Human-readable private task title. */
+  title: string;
+  /** User who invoked `/private`. Invited and promoted to group admin. */
+  ownerOpenId: string;
+  /** Extra open_ids explicitly @mentioned in the `/private` command. */
+  participantOpenIds?: string[];
+  sourceThreadId?: string;
+  sourceMessageId: string;
 }
 
 /**
@@ -168,6 +183,131 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
   // branch); best-effort, the binding holds even if the welcome card fails.
   await onboardGroup(channel, project).catch((err) => log.fail('project', err, { phase: 'onboard-join' }));
   return project;
+}
+
+/**
+ * Create a private single-session child group for a parent project. It is
+ * registered like a normal project so diagnostics, sessions and permission
+ * boundaries stay inspectable, but it does not grant the parent cloud folder to
+ * the group. Cloud docs/files use lazy per-session child folders instead.
+ */
+export async function createPrivateProject(channel: LarkChannel, input: CreatePrivateProjectInput): Promise<Project> {
+  const sourceId = input.sourceThreadId ?? input.sourceMessageId;
+  const name = await uniquePrivateName(input.parent, input.title, sourceId);
+  const extraOpenIds = [...new Set((input.participantOpenIds ?? []).filter((id) => id && id !== input.ownerOpenId))];
+  const cwd = privateWorkspacePath(input.parent, sourceId);
+  await mkdir(cwd, { recursive: true });
+
+  const res = await channel.rawClient.im.v1.chat.create({
+    params: { user_id_type: 'open_id' },
+    data: { name, user_id_list: [input.ownerOpenId] },
+  });
+  const chatId = (res.data as { chat_id?: string } | undefined)?.chat_id;
+  if (!chatId) throw new Error(`创建私密群失败：${JSON.stringify(res).slice(0, 200)}`);
+
+  await channel.rawClient.im.v1.chatManagers
+    .addManagers({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id' },
+      data: { manager_ids: [input.ownerOpenId] },
+    })
+    .catch((err) => log.fail('project', err, { phase: 'private-add-manager' }));
+
+  const addedOpenIds = [input.ownerOpenId];
+  const participantAddFailures: NonNullable<Project['participantAddFailures']> = [];
+  for (const openId of extraOpenIds) {
+    const added = await addPrivateChatMember(channel, chatId, openId);
+    if (added.ok) {
+      addedOpenIds.push(openId);
+    } else {
+      participantAddFailures.push({ openId, error: added.error, attemptedAt: Date.now() });
+      log.fail('project', new Error(added.error), { phase: 'private-add-member', openId: openId.slice(-6) });
+    }
+  }
+
+  const project: Project = {
+    name,
+    chatId,
+    cwd,
+    blank: true,
+    createdAt: Date.now(),
+    kind: 'single',
+    noMention: false,
+    origin: 'created',
+    mode: input.parent.mode,
+    guestMode: input.parent.guestMode,
+    network: input.parent.network,
+    cloudDocFolder: input.parent.cloudDocFolder,
+    private: true,
+    parentChatId: input.parent.chatId,
+    parentProjectName: input.parent.name,
+    sourceThreadId: input.sourceThreadId,
+    sourceMessageId: input.sourceMessageId,
+    participants: addedOpenIds,
+    ...(participantAddFailures.length ? { participantAddFailures } : {}),
+  };
+  await addProject(project);
+  log.info('project', 'private-create', {
+    name,
+    chatId,
+    parent: input.parent.name,
+    participants: addedOpenIds.length,
+    addFailures: participantAddFailures.length,
+    cwd,
+  });
+
+  await setAnnouncement(channel, project).catch((err) => log.fail('project', err, { phase: 'private-announcement' }));
+  return project;
+}
+
+async function addPrivateChatMember(
+  channel: LarkChannel,
+  chatId: string,
+  openId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const res = await channel.rawClient.im.v1.chatMembers.create({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id' },
+      data: { id_list: [openId] },
+    });
+    const data = res.data;
+    const failed = data?.invalid_id_list?.includes(openId) || data?.not_existed_id_list?.includes(openId) || data?.pending_approval_id_list?.includes(openId);
+    if (failed) return { ok: false, error: `飞书未能加入该成员：${JSON.stringify(data).slice(0, 180)}` };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: errorText(err) };
+  }
+}
+
+function errorText(err: unknown): string {
+  const data = (err as { response?: { data?: unknown } })?.response?.data;
+  if (data) {
+    const obj = data as { code?: unknown; msg?: unknown };
+    if (obj.code || obj.msg) return truncateError(`${obj.code ?? ''} ${obj.msg ?? ''}`.trim());
+    try {
+      return truncateError(JSON.stringify(data));
+    } catch {
+      return truncateError(String(data));
+    }
+  }
+  if (err instanceof Error) return truncateError(err.message);
+  return truncateError(String(err));
+}
+
+function truncateError(value: string): string {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  return clean.length > 220 ? `${clean.slice(0, 220)}…` : clean;
+}
+
+async function uniquePrivateName(parent: Project, title: string, sourceId: string): Promise<string> {
+  const base = privateProjectName(parent, title, sourceId);
+  if (!(await getProjectByName(base))) return base;
+  for (let i = 2; i <= 20; i++) {
+    const next = `${base}-${i}`;
+    if (!(await getProjectByName(next))) return next;
+  }
+  throw new Error(`私密项目名「${base}」已存在，请稍后重试`);
 }
 
 async function grantCloudDocFolderIfConfigured(

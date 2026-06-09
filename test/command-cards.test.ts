@@ -123,6 +123,11 @@ describe('buildHelpCard 权限过滤', () => {
     expect(JSON.stringify(buildHelpCard('topic', true, false))).toContain('/rename 新标题');
   });
 
+  it('多话题群：主群区和话题内都会提示 /private', () => {
+    expect(JSON.stringify(buildHelpCard('main', true, false))).toContain('/private [@参与者] 内容');
+    expect(JSON.stringify(buildHelpCard('topic', true, false))).toContain('/private [@参与者] 内容');
+  });
+
   it('多话题群：话题内默认不承诺免@', () => {
     const json = JSON.stringify(buildHelpCard('topic'));
     expect(json).toContain('@我 + 内容');
@@ -132,6 +137,7 @@ describe('buildHelpCard 权限过滤', () => {
   it('欢迎卡：多话题群提示 /rename，单会话群不提示', () => {
     const multiJson = JSON.stringify(buildWelcomeCard('multi'));
     expect(multiJson).toContain('/rename 新标题');
+    expect(multiJson).toContain('/private [@参与者] 内容');
     expect(multiJson).toContain('@我 + 内容');
     expect(multiJson).not.toContain('直接发消息（免@）→ 继续当前会话');
     expect(JSON.stringify(buildWelcomeCard('single'))).not.toContain('/rename');

@@ -35,6 +35,7 @@ import {
   type ResumeCardState,
 } from '../card/command-cards';
 import { buildHistoryCard, type HistoryCardState } from '../card/history-card';
+import { buildPrivateCreatedCard, buildPrivateIntroCard } from '../card/private-cards';
 import { ANSWER_EID, buildRunCard, buildRunCardPlain, RC, type RunCardState } from '../card/run-card';
 import { RunCardStream } from '../card/run-card-stream';
 import { buildCleanCard, extractCardFences } from '../card/markdown-render';
@@ -101,7 +102,7 @@ import {
   type Project,
 } from '../project/registry';
 import { isIsolatedTopicWorkspace, prepareSessionCwd } from '../project/topic-workspace';
-import { createProject, joinExistingGroup } from '../project/lifecycle';
+import { createPrivateProject, createProject, joinExistingGroup } from '../project/lifecycle';
 import { normalizeWorkspaceRoot } from '../project/workspace-root';
 import { refreshBranch } from '../project/announcement';
 import {
@@ -133,6 +134,12 @@ import { fetchQuotedMessage, fetchThreadContext, weaveQuote, weaveThreadHistory 
 import { textRequestsCloudDocFolder } from './cloud-doc-intent';
 import { pickBridgeDefaults } from './model-defaults';
 import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, type TopicRequester } from './topic-title';
+import {
+  mentionedPrivateParticipants,
+  parsePrivateTaskText,
+  privateSourcePrompt,
+  type PrivateParticipant,
+} from '../project/private-project';
 import {
   addCommentReaction,
   buildCommentPrompt,
@@ -342,6 +349,18 @@ export function createOrchestrator(
     return { adminOpenIds: projectCloudDocAdmins(extraOpenId), appId: cfg.accounts.app.id };
   }
 
+  function topicCloudDocAccess(project: Project | undefined, requesterOpenId: string): {
+    adminOpenIds: string[];
+    appId: string;
+    collaboratorOpenIds?: string[];
+  } {
+    const collaborators = project?.private ? (project.participants ?? []).filter((id) => id && id !== requesterOpenId) : [];
+    return {
+      ...cloudDocAccess(requesterOpenId),
+      ...(collaborators.length ? { collaboratorOpenIds: collaborators } : {}),
+    };
+  }
+
   function usableCloudDocFolder(folder: CloudDocFolder | undefined): CloudDocFolder | undefined {
     if (!folder?.token) return undefined;
     if (folder.permission && folder.permission.status !== 'granted') return undefined;
@@ -353,11 +372,11 @@ export function createOrchestrator(
     opts: { title: string; requesterOpenId: string; requesterName?: string; existing?: CloudDocFolder },
   ): Promise<{ cloudDocFolder?: CloudDocFolder; cloudDocFolderError?: string }> {
     if (!project?.cloudDocFolder?.token) return {};
-    if ((project.kind ?? 'multi') === 'single') return { cloudDocFolder: usableCloudDocFolder(project.cloudDocFolder) };
+    if ((project.kind ?? 'multi') === 'single' && !project.private) return { cloudDocFolder: usableCloudDocFolder(project.cloudDocFolder) };
 
     if (opts.existing?.token) {
       const result = await grantTopicCloudDocFolderAccess(channel, opts.existing, {
-        ...cloudDocAccess(opts.requesterOpenId),
+        ...topicCloudDocAccess(project, opts.requesterOpenId),
         title: opts.title,
         requesterOpenId: opts.requesterOpenId,
         requesterName: opts.requesterName,
@@ -368,7 +387,7 @@ export function createOrchestrator(
     }
 
     const result = await createTopicCloudDocFolder(channel, project.cloudDocFolder, {
-      ...cloudDocAccess(opts.requesterOpenId),
+      ...topicCloudDocAccess(project, opts.requesterOpenId),
       title: opts.title,
       requesterOpenId: opts.requesterOpenId,
       requesterName: opts.requesterName,
@@ -378,7 +397,7 @@ export function createOrchestrator(
   }
 
   function turnNeedsTopicCloudDocFolder(msg: NormalizedMessage, text: string, project: Project | undefined, flat: boolean): boolean {
-    if (flat) return false;
+    if (flat && !project?.private) return false;
     if (!project?.cloudDocFolder?.token) return false;
     return messageHasFiles(msg) || textRequestsCloudDocFolder(text);
   }
@@ -388,6 +407,12 @@ export function createOrchestrator(
     rec: SessionRecord | undefined,
     flat: boolean,
   ): { cloudDocFolder?: CloudDocFolder; cloudDocFolderError?: string } {
+    if (project?.private) {
+      return {
+        cloudDocFolder: usableCloudDocFolder(rec?.cloudDocFolder),
+        cloudDocFolderError: rec?.cloudDocFolderError,
+      };
+    }
     if (flat || (project?.kind ?? 'multi') === 'single') return { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) };
     return {
       cloudDocFolder: usableCloudDocFolder(rec?.cloudDocFolder),
@@ -581,6 +606,12 @@ export function createOrchestrator(
           .catch(() => undefined);
         return;
       }
+      if (cmd === 'private') {
+        await channel
+          .send(msg.chatId, { markdown: '当前已经是单会话群，不需要再创建私密群。请直接发消息继续。' }, { replyTo: msg.messageId })
+          .catch(() => undefined);
+        return;
+      }
       handleTurn(msg, text, ts.sessionKey, true, project, ts);
       return;
     }
@@ -595,6 +626,10 @@ export function createOrchestrator(
       }
       const ts = turnSession(msg.threadId, project, msg.senderId);
       if (!(await ensureTopicActorAllowed(msg, msg.threadId))) return;
+      if (cmd === 'private') {
+        startPrivateGroup(msg, text, project);
+        return;
+      }
       if (cmd === 'model') {
         await postModelCard(msg, ts.sessionKey);
         return;
@@ -621,6 +656,10 @@ export function createOrchestrator(
       await postGroupSettings(msg, project);
       return;
     }
+    if (cmd === 'private') {
+      startPrivateGroup(msg, text, project);
+      return;
+    }
     if (cmd === 'model') {
       await channel
         .send(msg.chatId, { markdown: '`/model` 需要在话题里使用（先 @我 开个话题）。' }, { replyTo: msg.messageId })
@@ -636,11 +675,11 @@ export function createOrchestrator(
     startTopicDirectly(msg, text, project);
   };
 
-  /** Parse a leading slash command (`/resume`, `/model`, `/settings`, `/rename`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'rename' | null {
+  /** Parse a leading slash command (`/resume`, `/model`, `/settings`, `/rename`, `/private`); null otherwise. */
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'rename' | 'private' | null {
     const m = /^\/([\w-]+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' || name === 'rename'
+    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' || name === 'rename' || name === 'private'
       ? name
       : null;
   }
@@ -650,18 +689,20 @@ export function createOrchestrator(
   }
 
   /** Whether to respond to a non-@ message in a project group.
-   * Slash commands (/help /resume /settings /model /rename) respond without @
+   * Slash commands (/help /resume /settings /model /rename /private) respond without @
    * because they're explicit. File messages inside an existing topic also
    * respond without @: Feishu file cards cannot @ the bot, and the topic actor
    * gate below still limits this to the topic owner/admin.
    * For normal messages, single applies to the whole group; multi applies only
    * inside a topic. Plain chatter in the main area still needs @, so a random
    * sentence never opens a new topic.
-   * 即使开了免@，若消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
-   * bot 不插话。(此函数仅在 !mentionedBot 时调用,故 @到 bot 的情况已被排除。) */
+   * 即使开了免@，若普通消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
+   * bot 不插话；/private 是显式命令，允许携带 @参与者。(此函数仅在 !mentionedBot 时调用,
+   * 故 @到 bot 的情况已被排除。) */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
-    if (msg.mentionAll || msg.mentions.some((m) => !m.isBot)) return false;
+    if (msg.mentionAll) return false;
     if (parseCommand(msg.content.trim()) !== null) return true;
+    if (msg.mentions.some((m) => !m.isBot)) return false;
     if (msg.threadId && messageHasFiles(msg)) return true;
     if (!(project.noMention ?? defaultNoMention(project))) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
@@ -892,7 +933,7 @@ export function createOrchestrator(
           const cwd = await prepareSessionCwd(project, sessionKey, fallbackCwd, { flat });
           const topicTitle = deriveTopicTitle(text);
           const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
-          const cloudDoc = flat
+          const cloudDoc = flat && !project?.private
             ? { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) }
             : needsCloudDoc
               ? await prepareTopicCloudDocFolder(project, {
@@ -983,8 +1024,16 @@ export function createOrchestrator(
     const rec = await getSession(threadId);
     if (!rec) return undefined;
     const project = await getProjectByChatId(chatId);
-    const cloudDoc =
-      (project?.kind ?? 'multi') === 'single'
+    const cloudDoc = project?.private
+      ? rec.topicRequesterOpenId && rec.cloudDocFolder?.token
+        ? await prepareTopicCloudDocFolder(project, {
+            title: rec.topicTitle ?? rec.summary,
+            requesterOpenId: rec.topicRequesterOpenId,
+            requesterName: rec.topicRequesterName,
+            existing: rec.cloudDocFolder,
+          })
+        : { cloudDocFolder: usableCloudDocFolder(rec.cloudDocFolder), cloudDocFolderError: rec.cloudDocFolderError }
+      : (project?.kind ?? 'multi') === 'single'
         ? { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) }
         : rec.topicRequesterOpenId && rec.cloudDocFolder?.token
           ? await prepareTopicCloudDocFolder(project, {
@@ -1141,6 +1190,151 @@ export function createOrchestrator(
         () => reaction.done(), // topic created → ✅ DONE (don't wait for the reply)
       );
     }).catch((err) => log.fail('intake', err));
+  }
+
+  function startPrivateGroup(msg: NormalizedMessage, text: string, parent: Project): void {
+    void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
+      const reaction = runReaction(msg.messageId, !sema.hasFree());
+      try {
+        const mentionedParticipants = mentionedPrivateParticipants(msg.senderId, msg.mentions);
+        const participantIds = mentionedParticipants.map((p) => p.openId);
+        const names = await resolveNames(channel, [msg.senderId, ...participantIds]);
+        const participants: PrivateParticipant[] = [
+          { openId: msg.senderId, name: names.get(msg.senderId) ?? msg.senderName },
+          ...mentionedParticipants.map((p) => ({ openId: p.openId, name: p.name ?? names.get(p.openId) })),
+        ];
+        const taskText = parsePrivateTaskText(text, msg.mentions);
+        const title = deriveTopicTitle(taskText || '私密协作');
+        const privateProject = await createPrivateProject(channel, {
+          parent,
+          title,
+          ownerOpenId: msg.senderId,
+          participantOpenIds: participantIds,
+          sourceThreadId: msg.threadId,
+          sourceMessageId: msg.messageId,
+        });
+        const joinedIds = new Set(privateProject.participants ?? [msg.senderId]);
+        const actualParticipants = participants.filter((p) => joinedIds.has(p.openId));
+        const failedParticipants = participants.filter((p) => p.openId !== msg.senderId && !joinedIds.has(p.openId));
+        await sendManagedCard(
+          channel,
+          msg.chatId,
+          buildPrivateCreatedCard({ title, projectName: parent.name, participants: actualParticipants, failedParticipants }),
+          msg.messageId,
+          Boolean(msg.threadId),
+        ).catch((err) => log.fail('card', err, { phase: 'private-created-card' }));
+
+        const intro = await sendManagedCard(
+          channel,
+          privateProject.chatId,
+          buildPrivateIntroCard({
+            title,
+            parentProjectName: parent.name,
+            participants: actualParticipants,
+            failedParticipants,
+            sourceThreadId: msg.threadId,
+          }),
+        );
+        const requesterName = actualParticipants[0]?.name;
+        const needsCloudDoc = turnNeedsTopicCloudDocFolder(msg, taskText, privateProject, true);
+        const cloudDoc = needsCloudDoc
+          ? await prepareTopicCloudDocFolder(privateProject, {
+              title,
+              requesterOpenId: msg.senderId,
+              requesterName,
+            })
+          : {};
+        const { model, effort, serviceTier } = pickDefault(await listModels());
+        const perm = turnPerm(privateProject, msg.senderId);
+        const thread = await backend.startThread({
+          cwd: privateProject.cwd,
+          model,
+          effort,
+          serviceTier,
+          mode: perm.mode,
+          network: perm.network,
+          cloudDocFolder: cloudDoc.cloudDocFolder,
+        });
+        sessions.set(privateProject.chatId, thread);
+
+        const sourceHistory = msg.threadId
+          ? await fetchThreadContext(channel, msg.threadId, {
+              excludeMessageId: msg.messageId,
+              limit: 12,
+            })
+          : [];
+        const sourceText = privateSourcePrompt({
+          taskText,
+          parentProjectName: parent.name,
+          parentChatId: parent.chatId,
+          sourceThreadId: msg.threadId,
+          sourceMessageId: msg.messageId,
+          participants: actualParticipants,
+        });
+        const rawInput = await collectTurnInput(msg, weaveThreadHistory(sourceText, sourceHistory), privateProject.cwd);
+        const input = withCloudDocFolderHint(rawInput, cloudDoc.cloudDocFolder, cloudDoc.cloudDocFolderError, needsCloudDoc);
+        const now = Date.now();
+        await upsertSession({
+          threadId: privateProject.chatId,
+          chatId: privateProject.chatId,
+          cwd: privateProject.cwd,
+          codexThreadId: thread.codexThreadId,
+          model,
+          effort,
+          serviceTier,
+          summary: title,
+          topicTitle: title,
+          topicRequesterOpenId: msg.senderId,
+          topicRequesterName: requesterName,
+          cloudDocFolder: cloudDoc.cloudDocFolder,
+          cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
+          lastSeenAt: msgTime(msg),
+          createdAt: now,
+          updatedAt: now,
+        });
+        active.set(privateProject.chatId, { thread, queue: [], requesterOpenId: msg.senderId });
+        log.info('intake', 'private-start', {
+          parent: parent.name,
+          private: privateProject.name,
+          participants: actualParticipants.length,
+          failedParticipants: failedParticipants.length,
+          cloudDocFolder: cloudDoc.cloudDocFolder?.token ?? null,
+        });
+        void launchRun({
+          chatId: privateProject.chatId,
+          replyTo: intro.messageId,
+          flat: true,
+          knownThreadId: privateProject.chatId,
+          thread,
+          firstText: input.text ?? sourceText,
+          images: input.images,
+          model,
+          effort,
+          serviceTier,
+          cwd: privateProject.cwd,
+          projectName: privateProject.name,
+          summary: title,
+          cloudDocFolder: cloudDoc.cloudDocFolder,
+          cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
+          requesterOpenId: msg.senderId,
+          lastSeenAt: msgTime(msg),
+        }).catch((err) => {
+          active.delete(privateProject.chatId);
+          log.fail('intake', err, { phase: 'private-launch' });
+        });
+        reaction.done();
+      } catch (err) {
+        reaction.done();
+        log.fail('intake', err, { phase: 'private-create' });
+        await channel
+          .send(
+            msg.chatId,
+            { markdown: `❌ 创建私密协作群失败：${err instanceof Error ? err.message : String(err)}` },
+            { replyTo: msg.messageId, replyInThread: Boolean(msg.threadId) },
+          )
+          .catch(() => undefined);
+      }
+    }).catch((err) => log.fail('intake', err, { phase: 'private-trace' }));
   }
 
   async function sendTopicTitleMessage(chatId: string, title: string, requester?: TopicRequester): Promise<string | undefined> {

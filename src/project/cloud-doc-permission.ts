@@ -29,6 +29,11 @@ export interface TopicCloudDocFolderResult {
   error?: string;
 }
 
+export interface RenameTopicCloudDocFolderResult {
+  folder?: CloudDocFolder;
+  error?: string;
+}
+
 type DriveMemberType = 'openid' | 'openchat' | 'appid';
 type DrivePermission = 'edit' | 'full_access';
 type DriveMemberData = {
@@ -90,6 +95,26 @@ export async function createTopicCloudDocFolder(
   const folder = { ...created.folder, permission: permissionRecord(permission) };
   if (permission.status === 'failed') return { folder, error: permission.error ?? '话题文件夹权限配置失败' };
   return { folder };
+}
+
+export async function renameTopicCloudDocFolder(
+  folder: CloudDocFolder,
+  opts: Pick<TopicCloudDocFolderInput, 'title' | 'requesterName'>,
+): Promise<RenameTopicCloudDocFolderResult> {
+  if (!folder.token) return { error: '缺少文件夹 token' };
+
+  const name = topicCloudDocFolderName(opts.title, opts.requesterName);
+  const bot = await renameFolderWithLarkCli(folder.token, name, 'bot').catch(
+    (err): { ok?: true; error?: string } => ({ error: errorText(err) }),
+  );
+  if (bot.ok) return { folder: { ...folder, createAs: folder.createAs ?? 'bot' } };
+
+  const user = await renameFolderWithLarkCli(folder.token, name, 'user').catch(
+    (err): { ok?: true; error?: string } => ({ error: errorText(err) }),
+  );
+  if (user.ok) return { folder: { ...folder, createAs: folder.createAs ?? 'user' } };
+
+  return { error: truncate(`bot: ${bot.error ?? '失败'}; user: ${user.error ?? '失败'}`) };
 }
 
 export async function grantTopicCloudDocFolderAccess(
@@ -264,6 +289,17 @@ function createFolderWithLarkCliUser(parentToken: string, name: string): Promise
   return runLarkCliCreateFolder(args);
 }
 
+function renameFolderWithLarkCli(
+  folderToken: string,
+  name: string,
+  as: CloudDocFolder['createAs'],
+): Promise<{ ok?: true; error?: string }> {
+  const params = JSON.stringify({ file_token: folderToken, type: 'folder' });
+  const data = JSON.stringify({ new_title: name });
+  const args = ['drive', 'files', 'patch', '--as', as ?? 'user', '--params', params, '--data', data, '--format', 'json'];
+  return runLarkCliFolderRename(args);
+}
+
 function runLarkCliGrant(args: string[]): Promise<GrantCloudDocFolderPermissionResult> {
   return new Promise((resolve) => {
     const child = spawnProcess('lark-cli', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -296,6 +332,42 @@ function runLarkCliGrant(args: string[]): Promise<GrantCloudDocFolderPermissionR
       const text = `${stdout}\n${stderr}`.trim();
       if (code === 0 || isAlreadyGranted(text)) resolve({ status: 'granted' });
       else resolve({ status: 'failed', error: text || `lark-cli exit ${code ?? '?'}` });
+    });
+  });
+}
+
+function runLarkCliFolderRename(args: string[]): Promise<{ ok?: true; error?: string }> {
+  return new Promise((resolve) => {
+    const child = spawnProcess('lark-cli', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      resolve({ error: `lark-cli 超时 ${Math.round(LARK_CLI_TIMEOUT_MS / 1000)}s` });
+    }, LARK_CLI_TIMEOUT_MS);
+
+    child.stdout?.on('data', (buf: Buffer) => {
+      stdout += buf.toString('utf8');
+    });
+    child.stderr?.on('data', (buf: Buffer) => {
+      stderr += buf.toString('utf8');
+    });
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ error: err.message });
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const text = `${stdout}\n${stderr}`.trim();
+      if (code === 0) resolve({ ok: true });
+      else resolve({ error: text || `lark-cli exit ${code ?? '?'}` });
     });
   });
 }

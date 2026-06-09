@@ -9,6 +9,8 @@ import { getServiceAdapter, isServiceRunning } from './adapter';
 // and spawnProcess hides the console window (important when the background
 // service triggers a one-click update with no console of its own).
 const NPM = 'npm';
+const DEFAULT_UPDATE_TARGET = 'peterpren-feishu-codex-bridge';
+const VERSION_LOOKUP_TIMEOUT_MS = 60_000;
 
 /**
  * The installed package's own root. After bundling, every source module's
@@ -37,7 +39,24 @@ export function currentVersion(): string {
 }
 
 export function packageName(): string {
-  return pkgJson().name ?? '@modelzen/feishu-codex-bridge';
+  return pkgJson().name ?? 'peterpren-feishu-codex-bridge';
+}
+
+export function installTarget(): string {
+  return process.env.FEISHU_CODEX_BRIDGE_UPDATE_TARGET?.trim() || DEFAULT_UPDATE_TARGET;
+}
+
+export function updateSourceLabel(): string {
+  const target = installTarget();
+  if (target.startsWith('github:')) return `GitHub ${target.slice('github:'.length)}`;
+  if (target.startsWith('git+https://github.com/')) {
+    return `GitHub ${target.replace(/^git\+https:\/\/github\.com\//, '').replace(/\.git$/, '')}`;
+  }
+  return `npm ${target}`;
+}
+
+export function manualInstallCommand(): string {
+  return `npm i -g ${installTarget()}`;
 }
 
 /**
@@ -60,17 +79,17 @@ export function isNewer(a: string, b: string): boolean {
   return false;
 }
 
-/** Latest published version on the configured registry, or null if unreachable. */
+/** Latest package version on the configured update source, or null if unreachable. */
 export async function latestVersion(): Promise<string | null> {
   const v = await new Promise<string | null>((resolveP) => {
-    const child = spawnProcess(NPM, ['view', packageName(), 'version'], {
+    const child = spawnProcess(NPM, ['view', installTarget(), 'version'], {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     let out = '';
     const timer = setTimeout(() => {
       child.kill();
       resolveP(null);
-    }, 20000);
+    }, VERSION_LOOKUP_TIMEOUT_MS);
     child.stdout?.on('data', (d) => (out += d));
     child.on('error', () => {
       clearTimeout(timer);
@@ -89,12 +108,21 @@ export interface UpdateCheck {
   latest: string | null;
   hasUpdate: boolean;
   dev: boolean;
+  source: string;
+  installCommand: string;
 }
 
 export async function checkUpdate(): Promise<UpdateCheck> {
   const current = currentVersion();
   const latest = await latestVersion();
-  return { current, latest, hasUpdate: !!latest && isNewer(latest, current), dev: isDevSource() };
+  return {
+    current,
+    latest,
+    hasUpdate: !!latest && isNewer(latest, current),
+    dev: isDevSource(),
+    source: updateSourceLabel(),
+    installCommand: manualInstallCommand(),
+  };
 }
 
 export interface InstallResult {
@@ -104,13 +132,13 @@ export interface InstallResult {
 }
 
 /**
- * Run `npm install -g <pkg>@latest`. Async (spawn, never spawnSync) so card
+ * Run `npm install -g <configured source>`. Async (spawn, never spawnSync) so card
  * callbacks can call it without freezing the bridge's event loop. With
  * `inherit`, npm's progress streams straight to the terminal (CLI use); without
  * it, output is captured and the tail returned for surfacing in a card.
  */
 export async function installLatest(opts: { inherit?: boolean } = {}): Promise<InstallResult> {
-  const target = `${packageName()}@latest`;
+  const target = installTarget();
   return await new Promise<InstallResult>((resolveP) => {
     const child = spawnProcess(NPM, ['install', '-g', target], {
       stdio: opts.inherit ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'],

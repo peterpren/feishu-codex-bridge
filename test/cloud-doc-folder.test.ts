@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { describe, expect, it, vi } from 'vitest';
 import { bridgeDeveloperInstructions } from '../src/agent/codex-appserver/backend';
+import { textRequestsCloudDocFolder } from '../src/bot/cloud-doc-intent';
 import {
   buildCloudDocFolderFormCard,
   buildNewProjectDoneCard,
@@ -10,8 +12,15 @@ import {
   createTopicCloudDocFolder,
   grantProjectCloudDocFolderAccess,
   permissionRecord,
+  renameTopicCloudDocFolder,
 } from '../src/project/cloud-doc-permission';
 import type { Project } from '../src/project/registry';
+
+const spawnMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../src/platform/spawn', () => ({
+  spawnProcess: spawnMock,
+}));
 
 const project: Project = {
   name: 'demo',
@@ -27,6 +36,19 @@ const project: Project = {
     permission: { status: 'granted', via: 'user', scope: 'project_admins', updatedAt: Date.now() },
   },
 };
+
+function fakeSpawn(code: number, stdout = '{}', stderr = ''): any {
+  const child = new EventEmitter() as any;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = vi.fn();
+  queueMicrotask(() => {
+    if (stdout) child.stdout.emit('data', Buffer.from(stdout));
+    if (stderr) child.stderr.emit('data', Buffer.from(stderr));
+    child.emit('close', code);
+  });
+  return child;
+}
 
 describe('cloud doc folder cards', () => {
   it('renders the optional folder input in the new-project form', () => {
@@ -142,6 +164,33 @@ describe('cloud doc folder permissions', () => {
     expect(calls[3]).toMatchObject({ data: { member_type: 'openid', member_id: 'ou_requester', perm: 'edit', type: 'user' } });
     expect(JSON.stringify(calls)).not.toContain('openchat');
   });
+
+  it('renames an existing topic child folder through Drive files.patch', async () => {
+    spawnMock.mockReset();
+    spawnMock.mockImplementation(() => fakeSpawn(0));
+
+    const result = await renameTopicCloudDocFolder(
+      { token: 'fldcnCHILD', url: 'https://example.feishu.cn/drive/folder/fldcnCHILD', createAs: 'bot' },
+      { title: '天气查询', requesterName: '张三' },
+    );
+
+    expect(result.folder).toMatchObject({ token: 'fldcnCHILD', createAs: 'bot' });
+    expect(spawnMock).toHaveBeenCalledWith(
+      'lark-cli',
+      expect.arrayContaining([
+        'drive',
+        'files',
+        'patch',
+        '--as',
+        'bot',
+        '--params',
+        JSON.stringify({ file_token: 'fldcnCHILD', type: 'folder' }),
+        '--data',
+        JSON.stringify({ new_title: '天气查询 - 张三' }),
+      ]),
+      expect.any(Object),
+    );
+  });
 });
 
 describe('bridge developer instructions', () => {
@@ -154,5 +203,18 @@ describe('bridge developer instructions', () => {
   it('keeps the base instructions clean when no folder is configured', () => {
     const instructions = bridgeDeveloperInstructions();
     expect(instructions).not.toContain('--parent-token');
+  });
+});
+
+describe('cloud doc folder intent', () => {
+  it('does not request a topic folder for normal chat', () => {
+    expect(textRequestsCloudDocFolder('你好，帮我查下杭州天气')).toBe(false);
+    expect(textRequestsCloudDocFolder('帮我写一个需求说明')).toBe(false);
+  });
+
+  it('requests a topic folder when the user explicitly targets Feishu cloud docs', () => {
+    expect(textRequestsCloudDocFolder('帮我把这个文件转成飞书文档')).toBe(true);
+    expect(textRequestsCloudDocFolder('生成一份云文档并保存')).toBe(true);
+    expect(textRequestsCloudDocFolder('upload this to lark docs')).toBe(true);
   });
 });

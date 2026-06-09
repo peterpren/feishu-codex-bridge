@@ -1,7 +1,7 @@
 {
-  "name": "@modelzen/feishu-codex-bridge",
+  "name": "peterpren-feishu-codex-bridge",
   "displayName": "feishu-codex bridge",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "feishu-codex bridge links Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
   "type": "module",
   "bin": {
@@ -34,6 +34,9 @@
     "cross-spawn": "^7.0.6",
     "qrcode-terminal": "^0.12.0"
   },
+  "overrides": {
+    "axios": "^1.17.0"
+  },
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.10.0",
@@ -54,15 +57,15 @@
     "bridge",
     "bot"
   ],
-  "author": "modelzen",
+  "author": "peterpren",
   "license": "MIT",
-  "homepage": "https://github.com/modelzen/feishu-codex-bridge#readme",
+  "homepage": "https://github.com/peterpren/feishu-codex-bridge#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/modelzen/feishu-codex-bridge.git"
+    "url": "git+https://github.com/peterpren/feishu-codex-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/modelzen/feishu-codex-bridge/issues"
+    "url": "https://github.com/peterpren/feishu-codex-bridge/issues"
   },
   "publishConfig": {
     "access": "public"

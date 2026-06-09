@@ -61,7 +61,7 @@ program
 
 program
   .command('update')
-  .description('更新到最新版（npm i -g），并自动重启后台 daemon')
+  .description('从 npm 更新到最新版，并自动重启后台 daemon')
   .option('--check', '只检查有无新版，不安装')
   .action(async (options: { check?: boolean }) => {
     await runUpdate({ check: Boolean(options.check) });

@@ -101,6 +101,7 @@ export function buildDmMenuCard(): CardObject {
         button('📊 用量', { a: DM.usage }),
         button('🩺 诊断', { a: DM.doctor }),
         button('🔄 重连', { a: DM.reconnect }),
+        button('⬆️ 版本更新', { a: DM.update }),
       ]),
     ],
     { header: { title: `🤖 ${PRODUCT_NAME} 管理台`, template: 'blue' } },
@@ -124,6 +125,10 @@ export interface UpdateCardState {
   willRestart?: boolean;
   /** error phase: tail of npm output */
   message?: string;
+  /** human-readable update source, e.g. npm peterpren-feishu-codex-bridge */
+  source?: string;
+  /** manual fallback command shown in cards */
+  installCommand?: string;
 }
 
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
@@ -136,7 +141,7 @@ const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
 export function buildUpdateCard(state: UpdateCardState): CardObject {
   switch (state.phase) {
     case 'checking':
-      return card([md('⏳ 正在查询最新版本…'), note('从 npm registry 拉取版本信息，请稍候。')], {
+      return card([md('⏳ 正在查询最新版本…'), note(`从 ${state.source ?? 'npm'} 拉取版本信息，请稍候。`)], {
         header: { title: '⬆️ 版本更新', template: 'turquoise' },
       });
 
@@ -146,36 +151,45 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
         return card(
           [
             md(`当前版本：**v${cur}**`),
-            md('⚠️ 查不到最新版本（网络或 npm registry 问题）。'),
+            md(`⚠️ 查不到最新版本（网络或 ${state.source ?? 'npm'} 访问问题）。`),
             actions([button('🔄 重试', { a: DM.update }), button('⬅️ 菜单', { a: DM.menu })]),
           ],
           { header: { title: '⬆️ 版本更新', template: 'red' } },
         );
       }
-      if (!state.hasUpdate) {
-        return card(
-          [md(`✅ 已是最新版本：**v${cur}**`), backToMenu()],
-          { header: { title: '⬆️ 版本更新', template: 'green' } },
-        );
-      }
       const head = [
-        md(`发现新版本 🎉`),
+        state.hasUpdate ? md(`发现新版本 🎉`) : md(`✅ 当前 package 版本已是最新：**v${cur}**`),
+        note(`更新源：${state.source ?? 'npm'}`),
         note(`当前 v${cur}  →  最新 v${state.latest}`),
       ];
       if (state.dev) {
         return card(
           [
             ...head,
-            md('检测到**源码开发模式**（仓库内有 .git）。请在终端用 `git pull && npm i` 更新，而不是全局安装。'),
+            md('检测到**源码开发模式**（仓库内有 .git）。请在终端用 `git pull --ff-only && npm i && npm run build && feishu-codex-bridge restart` 更新，避免覆盖本地未提交代码。'),
             backToMenu(),
           ],
           { header: { title: '⬆️ 版本更新', template: 'orange' } },
         );
       }
+      if (!state.hasUpdate) {
+        return card(
+          [
+            ...head,
+            note('如果刚发布了新包但本地缓存还没刷新，也可以重新安装 npm 最新包。'),
+            note(`将执行：${state.installCommand ?? 'npm i -g peterpren-feishu-codex-bridge'}`),
+            actions([
+              button('⬆️ 重新安装最新代码', { a: DM.updateDo }, 'primary'),
+              button('⬅️ 菜单', { a: DM.menu }),
+            ]),
+          ],
+          { header: { title: '⬆️ 版本更新', template: 'green' } },
+        );
+      }
       return card(
         [
           ...head,
-          note('点「立即更新」会执行 `npm i -g` 并自动重启后台服务（约数十秒）。'),
+          note(`点「立即更新」会执行 \`${state.installCommand ?? 'npm i -g peterpren-feishu-codex-bridge'}\` 并自动重启后台服务（约数十秒）。`),
           actions([
             button('⬆️ 立即更新', { a: DM.updateDo }, 'primary'),
             button('⬅️ 菜单', { a: DM.menu }),
@@ -209,7 +223,7 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
         [
           md('❌ **更新失败**'),
           state.message ? note(state.message) : note('npm 安装未成功。'),
-          md('可在终端手动执行：`npm i -g ' + '@modelzen/feishu-codex-bridge@latest`（必要时加 sudo）。'),
+          md(`可在终端手动执行：\`${state.installCommand ?? 'npm i -g peterpren-feishu-codex-bridge'}\`（必要时加 sudo）。`),
           actions([button('🔄 重试', { a: DM.update }), button('⬅️ 菜单', { a: DM.menu })]),
         ],
         { header: { title: '⬆️ 版本更新', template: 'red' } },

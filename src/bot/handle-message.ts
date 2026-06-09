@@ -57,6 +57,7 @@ import {
   buildProjectSettingsCard,
   buildRmConfirmCard,
   buildSettingsCard,
+  buildUpdateCard,
   DM,
   GS,
   type DoctorInfo,
@@ -71,6 +72,16 @@ import {
   type UsageCardState,
 } from '../card/usage-cards';
 import { serviceStdoutPath, serviceStderrPath } from '../service/common';
+import {
+  checkUpdate,
+  currentVersion,
+  daemonRunning,
+  installLatest,
+  isDevSource,
+  manualInstallCommand,
+  restartDaemon,
+  updateSourceLabel,
+} from '../service/update';
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
 import { getSecret } from '../config/keystore';
@@ -96,6 +107,7 @@ import {
   grantProjectCloudDocFolderAccess,
   grantTopicCloudDocFolderAccess,
   permissionRecord,
+  renameTopicCloudDocFolder,
 } from '../project/cloud-doc-permission';
 import { leaveChat, transferOwnership } from '../project/group-ops';
 import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
@@ -115,6 +127,7 @@ import {
   messageHasFiles,
   messageHasImages,
 } from './media';
+import { textRequestsCloudDocFolder } from './cloud-doc-intent';
 import { pickBridgeDefaults } from './model-defaults';
 import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, type TopicRequester } from './topic-title';
 import {
@@ -358,6 +371,66 @@ export function createOrchestrator(
     });
     if (result.folder?.permission?.status === 'granted') return { cloudDocFolder: result.folder };
     return { cloudDocFolderError: result.error ?? '话题云文档目录创建失败' };
+  }
+
+  function turnNeedsTopicCloudDocFolder(msg: NormalizedMessage, text: string, project: Project | undefined, flat: boolean): boolean {
+    if (flat) return false;
+    if (!project?.cloudDocFolder?.token) return false;
+    return messageHasFiles(msg) || textRequestsCloudDocFolder(text);
+  }
+
+  function cloudDocFolderForSession(
+    project: Project | undefined,
+    rec: SessionRecord | undefined,
+    flat: boolean,
+  ): { cloudDocFolder?: CloudDocFolder; cloudDocFolderError?: string } {
+    if (flat || (project?.kind ?? 'multi') === 'single') return { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) };
+    return {
+      cloudDocFolder: usableCloudDocFolder(rec?.cloudDocFolder),
+      cloudDocFolderError: rec?.cloudDocFolderError,
+    };
+  }
+
+  async function ensureTopicCloudDocFolderForSession(
+    project: Project | undefined,
+    sessionKey: string,
+    opts: { title: string; requesterOpenId: string; requesterName?: string; existing?: CloudDocFolder },
+  ): Promise<{ cloudDocFolder?: CloudDocFolder; cloudDocFolderError?: string }> {
+    const cloudDoc = await prepareTopicCloudDocFolder(project, opts);
+    if (cloudDoc.cloudDocFolder || cloudDoc.cloudDocFolderError) {
+      await patchSession(sessionKey, {
+        cloudDocFolder: cloudDoc.cloudDocFolder,
+        cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
+      }).catch(() => undefined);
+    }
+    return cloudDoc;
+  }
+
+  function withCloudDocFolderHint(
+    input: AgentInput,
+    folder: CloudDocFolder | undefined,
+    error: string | undefined,
+    needed: boolean,
+  ): AgentInput {
+    if (!needed) return input;
+    if (input.text?.includes('[Bridge 云文档目录]')) return input;
+    const base = input.text?.trim() || '用户本轮需要处理飞书云文档或附件。';
+    if (!folder?.token) {
+      const tail = error
+        ? `[Bridge 云文档目录]\n本轮需要话题云文档子文件夹，但 Bridge 未能创建或授权：${error}。请不要保存到项目父目录或其它默认目录，直接向用户说明需要管理员检查云空间目录权限。`
+        : '[Bridge 云文档目录]\n本项目未配置可用的话题云文档子文件夹。请不要保存到其它默认目录，直接向用户说明需要先配置飞书云文档保存文件夹。';
+      return { ...input, text: `${base}\n\n${tail}` };
+    }
+    const createAs = folder.createAs ?? 'user';
+    const lines = [
+      '[Bridge 云文档目录]',
+      '本轮如需创建、导入、上传、输出或保存飞书云文档/文件，请默认使用当前话题的云空间子文件夹。',
+      `folder_token: ${folder.token}`,
+      folder.url ? `folder_url: ${folder.url}` : '',
+      `优先命令示例：lark-cli docs +create --api-version v2 --as ${createAs} --parent-token ${folder.token} --content '<title>标题</title><p>内容</p>'`,
+      '除非用户明确指定其它位置，不要改用项目父文件夹、my_library 或其它目录。',
+    ].filter(Boolean);
+    return { ...input, text: `${base}\n\n${lines.join('\n')}` };
   }
 
   async function reconcileProjectCloudDocFolderAccess(): Promise<void> {
@@ -692,7 +765,19 @@ export function createOrchestrator(
       // race; if the turn finishes while downloading, fall through to a fresh
       // reserved run with the same prepared input.
       const rec = await getSession(sessionKey);
-      const input = await collectTurnInput(msg, text, rec?.cwd ?? project?.cwd ?? fallbackCwd);
+      const needsCloudDoc = turnNeedsTopicCloudDocFolder(msg, text, project, flat);
+      let cloudDoc = cloudDocFolderForSession(project, rec, flat);
+      if (needsCloudDoc && !cloudDoc.cloudDocFolder) {
+        const requesterName = rec?.topicRequesterName ?? (await resolveNames(channel, [rec?.topicRequesterOpenId ?? msg.senderId])).get(rec?.topicRequesterOpenId ?? msg.senderId);
+        cloudDoc = await ensureTopicCloudDocFolderForSession(project, sessionKey, {
+          title: rec?.topicTitle ?? rec?.summary ?? deriveTopicTitle(text),
+          requesterOpenId: rec?.topicRequesterOpenId ?? msg.senderId,
+          requesterName,
+          existing: rec?.cloudDocFolder,
+        });
+      }
+      const rawInput = await collectTurnInput(msg, text, rec?.cwd ?? project?.cwd ?? fallbackCwd);
+      const input = withCloudDocFolderHint(rawInput, cloudDoc.cloudDocFolder, cloudDoc.cloudDocFolderError, needsCloudDoc);
       const cur = active.get(sessionKey);
       if (!cur) {
         startReservedRun(msg, text, sessionKey, flat, project, perm, input);
@@ -750,11 +835,25 @@ export function createOrchestrator(
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const reaction = runReaction(msg.messageId, !sema.hasFree());
       try {
-        let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
+        const needsCloudDoc = turnNeedsTopicCloudDocFolder(msg, text, project, flat);
         let rec = await getSession(sessionKey);
-        let sessionCwd = rec?.cwd;
         let runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder);
         let runCloudDocFolderError = rec?.cloudDocFolderError;
+        if (needsCloudDoc && !runCloudDocFolder && rec) {
+          const requesterName =
+            rec.topicRequesterName ?? (await resolveNames(channel, [rec.topicRequesterOpenId ?? msg.senderId])).get(rec.topicRequesterOpenId ?? msg.senderId);
+          const cloudDoc = await ensureTopicCloudDocFolderForSession(project, sessionKey, {
+            title: rec.topicTitle ?? rec.summary ?? deriveTopicTitle(text),
+            requesterOpenId: rec.topicRequesterOpenId ?? msg.senderId,
+            requesterName,
+            existing: rec.cloudDocFolder,
+          });
+          runCloudDocFolder = cloudDoc.cloudDocFolder;
+          runCloudDocFolderError = cloudDoc.cloudDocFolderError;
+          rec = await getSession(sessionKey);
+        }
+        let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
+        let sessionCwd = rec?.cwd;
         if (!thread) {
           // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd.
@@ -763,11 +862,13 @@ export function createOrchestrator(
           const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
           const cloudDoc = flat
             ? { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) }
-            : await prepareTopicCloudDocFolder(project, {
-                title: topicTitle,
-                requesterOpenId: msg.senderId,
-                requesterName,
-              });
+            : needsCloudDoc
+              ? await prepareTopicCloudDocFolder(project, {
+                  title: topicTitle,
+                  requesterOpenId: msg.senderId,
+                  requesterName,
+                })
+              : {};
           sessionCwd = cwd;
           thread = await backend.startThread({
             cwd,
@@ -787,7 +888,7 @@ export function createOrchestrator(
             topicRequesterOpenId: msg.senderId,
             topicRequesterName: requesterName,
             cloudDocFolder: cloudDoc.cloudDocFolder,
-            cloudDocFolderError: cloudDoc.cloudDocFolderError,
+            cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
@@ -796,7 +897,8 @@ export function createOrchestrator(
         sessionCwd = rec?.cwd ?? sessionCwd;
         runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder) ?? runCloudDocFolder;
         runCloudDocFolderError = rec?.cloudDocFolderError ?? runCloudDocFolderError;
-        const input = preloadedInput ?? (await collectTurnInput(msg, text, sessionCwd ?? (flat ? project?.cwd : fallbackCwd) ?? fallbackCwd));
+        const rawInput = preloadedInput ?? (await collectTurnInput(msg, text, sessionCwd ?? (flat ? project?.cwd : fallbackCwd) ?? fallbackCwd));
+        const input = withCloudDocFolderHint(rawInput, runCloudDocFolder, runCloudDocFolderError, needsCloudDoc);
         reserved.thread = thread;
         await launchRun(
           {
@@ -848,18 +950,18 @@ export function createOrchestrator(
     const cloudDoc =
       (project?.kind ?? 'multi') === 'single'
         ? { cloudDocFolder: usableCloudDocFolder(project?.cloudDocFolder) }
-        : rec.topicRequesterOpenId
+        : rec.topicRequesterOpenId && rec.cloudDocFolder?.token
           ? await prepareTopicCloudDocFolder(project, {
               title: rec.topicTitle ?? rec.summary,
               requesterOpenId: rec.topicRequesterOpenId,
               requesterName: rec.topicRequesterName,
               existing: rec.cloudDocFolder,
             })
-          : { cloudDocFolder: usableCloudDocFolder(rec.cloudDocFolder) };
+          : { cloudDocFolder: usableCloudDocFolder(rec.cloudDocFolder), cloudDocFolderError: rec.cloudDocFolderError };
     if (cloudDoc.cloudDocFolder || cloudDoc.cloudDocFolderError) {
       await patchSession(threadId, {
         cloudDocFolder: cloudDoc.cloudDocFolder,
-        cloudDocFolderError: cloudDoc.cloudDocFolderError,
+        cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
       }).catch(() => undefined);
     }
     try {
@@ -934,11 +1036,14 @@ export function createOrchestrator(
       const firstText = text || '你好，我们开始吧。';
       const topicTitle = deriveTopicTitle(firstText);
       const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
-      const cloudDoc = await prepareTopicCloudDocFolder(project, {
-        title: topicTitle,
-        requesterOpenId: msg.senderId,
-        requesterName,
-      });
+      const needsCloudDoc = turnNeedsTopicCloudDocFolder(msg, firstText, project, false);
+      const cloudDoc = needsCloudDoc
+        ? await prepareTopicCloudDocFolder(project, {
+            title: topicTitle,
+            requesterOpenId: msg.senderId,
+            requesterName,
+          })
+        : {};
       let thread: AgentThread;
       try {
         thread = await backend.startThread({
@@ -959,7 +1064,8 @@ export function createOrchestrator(
         return;
       }
       // Download any attached/forwarded media so the opening turn can see it.
-      const input = await collectTurnInput(msg, firstText, cwd);
+      const rawInput = await collectTurnInput(msg, firstText, cwd);
+      const input = withCloudDocFolderHint(rawInput, cloudDoc.cloudDocFolder, cloudDoc.cloudDocFolderError, needsCloudDoc);
       log.info('card', 'start', {
         project: project?.name ?? '(unregistered)',
         model,
@@ -989,7 +1095,7 @@ export function createOrchestrator(
           projectName: project?.name,
           summary: topicTitle,
           cloudDocFolder: cloudDoc.cloudDocFolder,
-          cloudDocFolderError: cloudDoc.cloudDocFolderError,
+          cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
           requesterOpenId: msg.senderId,
           roleSuffix: perm.roleSuffix,
         },
@@ -1130,11 +1236,39 @@ export function createOrchestrator(
           }),
         },
       });
-      await patchSession(threadId, { summary: title, topicTitle: title, topicTitleMessageId: titleMessageId });
+      const sessionPatch: Partial<Omit<SessionRecord, 'threadId'>> = {
+        summary: title,
+        topicTitle: title,
+        topicTitleMessageId: titleMessageId,
+      };
+      let folderRenameStatus: 'renamed' | 'failed' | 'none' = 'none';
+      let folderRenameError = '';
+      if (rec?.cloudDocFolder?.token) {
+        const renamed = await renameTopicCloudDocFolder(rec.cloudDocFolder, {
+          title,
+          requesterName: rec.topicRequesterName,
+        });
+        if (renamed.folder) {
+          sessionPatch.cloudDocFolder = renamed.folder;
+          sessionPatch.cloudDocFolderError = '';
+          folderRenameStatus = 'renamed';
+        } else {
+          folderRenameError = renamed.error ?? '话题云文档目录重命名失败';
+          sessionPatch.cloudDocFolderError = folderRenameError;
+          folderRenameStatus = 'failed';
+        }
+      }
+      await patchSession(threadId, sessionPatch);
+      const tail =
+        folderRenameStatus === 'renamed'
+          ? '\n云文档子文件夹已同步重命名。'
+          : folderRenameStatus === 'failed'
+            ? `\n\n⚠️ 云文档子文件夹重命名失败：${folderRenameError}`
+            : '';
       await channel
-        .send(msg.chatId, { markdown: `已重命名为：${title}` }, { replyTo: msg.messageId, replyInThread: true })
+        .send(msg.chatId, { markdown: `已重命名为：${title}${tail}` }, { replyTo: msg.messageId, replyInThread: true })
         .catch(() => undefined);
-      log.info('intake', 'topic-rename', { threadId, title });
+      log.info('intake', 'topic-rename', { threadId, title, folder: folderRenameStatus });
     } catch (err) {
       log.fail('intake', err, { phase: 'topic-rename', threadId });
       await channel
@@ -1407,6 +1541,109 @@ export function createOrchestrator(
     })();
   };
 
+  const updateCardBase = (): { source: string; installCommand: string } => ({
+    source: updateSourceLabel(),
+    installCommand: manualInstallCommand(),
+  });
+
+  const replaceConsoleCard = async (evt: CardActionEvent, card: object, phase: string): Promise<string | undefined> => {
+    const ok = await updateManagedCard(channel, evt.messageId, card).catch((e) => {
+      log.fail('console', e, { phase });
+      return false;
+    });
+    if (ok) return evt.messageId;
+    const sent = await sendManagedCard(channel, evt.chatId, card).catch((e) => {
+      log.fail('console', e, { phase: `${phase}-fallback` });
+      return undefined;
+    });
+    return sent?.messageId;
+  };
+
+  const renderConsoleCard = async (chatId: string, msgId: string, card: object, phase: string): Promise<void> => {
+    const ok = await updateManagedCard(channel, msgId, card).catch((e) => {
+      log.fail('console', e, { phase });
+      return false;
+    });
+    if (!ok) {
+      await sendManagedCard(channel, chatId, card).catch((e) => log.fail('console', e, { phase: `${phase}-fallback` }));
+    }
+  };
+
+  const runUpdateCheck = (evt: CardActionEvent): void => {
+    if (!dmAdmin(evt.operator?.openId)) return;
+    void (async () => {
+      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+      const msgId = await replaceConsoleCard(evt, buildUpdateCard({ phase: 'checking', ...updateCardBase() }), 'update-checking');
+      if (!msgId) return;
+      try {
+        const state = await checkUpdate();
+        await renderConsoleCard(evt.chatId, msgId, buildUpdateCard({ phase: 'checked', ...state }), 'update-checked');
+        log.info('console', 'update-check', { current: state.current, latest: state.latest, source: state.source, dev: state.dev });
+      } catch (err) {
+        log.fail('console', err, { phase: 'update-check' });
+        await renderConsoleCard(
+          evt.chatId,
+          msgId,
+          buildUpdateCard({
+            phase: 'error',
+            message: err instanceof Error ? err.message : String(err),
+            ...updateCardBase(),
+          }),
+          'update-check-error',
+        );
+      }
+    })();
+  };
+
+  const runUpdateInstall = (evt: CardActionEvent): void => {
+    if (!dmAdmin(evt.operator?.openId)) return;
+    void (async () => {
+      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+      const from = currentVersion();
+      const base = updateCardBase();
+      if (isDevSource()) {
+        const msgId = await replaceConsoleCard(
+          evt,
+          buildUpdateCard({
+            phase: 'error',
+            message: '当前是源码开发模式。请在终端用 git pull --ff-only && npm i && npm run build && feishu-codex-bridge restart 更新。',
+            ...base,
+          }),
+          'update-dev-blocked',
+        );
+        if (msgId) log.info('console', 'update-dev-blocked');
+        return;
+      }
+      const msgId = await replaceConsoleCard(evt, buildUpdateCard({ phase: 'updating', from, ...base }), 'update-updating');
+      if (!msgId) return;
+      const res = await installLatest();
+      if (!res.ok) {
+        await renderConsoleCard(
+          evt.chatId,
+          msgId,
+          buildUpdateCard({ phase: 'error', message: res.message, ...base }),
+          'update-error',
+        );
+        log.fail('console', new Error(res.message), { phase: 'update-install' });
+        return;
+      }
+      const to = currentVersion();
+      const willRestart = daemonRunning();
+      await renderConsoleCard(
+        evt.chatId,
+        msgId,
+        buildUpdateCard({ phase: 'done', from, to, willRestart, ...base }),
+        'update-done',
+      );
+      log.info('console', 'update-install', { from, to, willRestart });
+      if (willRestart) {
+        setTimeout(() => {
+          void restartDaemon().catch((err) => log.fail('console', err, { phase: 'update-restart' }));
+        }, 500);
+      }
+    })();
+  };
+
   // Build the project list card with each project's topics (sessions) grouped
   // by chatId, most-recent first — shared by the list/cancel/delete handlers.
   const renderProjectList = async (): Promise<object> => {
@@ -1563,18 +1800,10 @@ export function createOrchestrator(
         .catch(() => undefined);
     })
     .on(DM.update, ({ evt }) => {
-      if (!dmAdmin(evt.operator?.openId)) return;
-      log.info('console', 'update-disabled');
-      void channel
-        .send(evt.chatId, { markdown: '版本更新入口已关闭。当前是定制版 Bridge，后续更新走 GitHub 定制流程。' }, { replyTo: evt.messageId })
-        .catch(() => undefined);
+      runUpdateCheck(evt);
     })
     .on(DM.updateDo, ({ evt }) => {
-      if (!dmAdmin(evt.operator?.openId)) return;
-      log.info('console', 'update-disabled');
-      void channel
-        .send(evt.chatId, { markdown: '版本更新入口已关闭。当前是定制版 Bridge，后续更新走 GitHub 定制流程。' }, { replyTo: evt.messageId })
-        .catch(() => undefined);
+      runUpdateInstall(evt);
     })
     // 📊 Codex 用量：loading → 并行拉 wham/usage + wham/profiles/me → 原地更新结果卡。
     // 同 DM.update 的双阶段模式：handler 立即返回让 SDK ack，慢活全在 settle 之后。
@@ -1904,14 +2133,8 @@ export function createOrchestrator(
       let bound = false;
       await withTrace({ chatId: state.chatId, msgId: state.originalMsgId }, async () => {
         const cardState: HistoryCardState = { cwd: selectedCwd, projectName: state.projectName, history };
-        const project = await getProjectByChatId(state.chatId);
         const requesterName = (await resolveNames(channel, [state.requesterOpenId])).get(state.requesterOpenId);
         const topicTitle = history.name || history.preview || '(恢复会话)';
-        const cloudDoc = await prepareTopicCloudDocFolder(project, {
-          title: topicTitle,
-          requesterOpenId: state.requesterOpenId,
-          requesterName,
-        });
         // reply_in_thread on the /resume message turns it into the topic; the
         // history card is that topic's first message.
         const sent = await sendManagedCard(channel, state.chatId, buildHistoryCard(cardState), state.originalMsgId, true);
@@ -1936,8 +2159,6 @@ export function createOrchestrator(
             topicTitle: topicTitle,
             topicRequesterOpenId: state.requesterOpenId,
             topicRequesterName: requesterName,
-            cloudDocFolder: cloudDoc.cloudDocFolder,
-            cloudDocFolderError: cloudDoc.cloudDocFolderError,
             createdAt: now,
             updatedAt: now,
           });

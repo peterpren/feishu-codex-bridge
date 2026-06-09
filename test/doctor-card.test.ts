@@ -66,8 +66,8 @@ describe('buildDoctorCard', () => {
 
   it('embeds a copy-paste prompt carrying repo link, version, log paths and config', () => {
     const prompt = codeBlock(buildDoctorCard(info()));
-    expect(prompt).toContain('https://github.com/modelzen/feishu-codex-bridge');
-    expect(prompt).toContain('https://github.com/modelzen/feishu-codex-bridge/issues');
+    expect(prompt).toContain('https://github.com/peterpren/feishu-codex-bridge');
+    expect(prompt).toContain('https://github.com/peterpren/feishu-codex-bridge/issues');
     expect(prompt).toContain('v0.1.2');
     expect(prompt).toContain('codex-cli 0.45.0');
     expect(prompt).toContain('v20.11.0');
@@ -109,8 +109,8 @@ describe('buildDoctorCard', () => {
       }
     };
     walk(buildDoctorCard(info()));
-    expect(urls).toContain('https://github.com/modelzen/feishu-codex-bridge');
-    expect(urls).toContain('https://github.com/modelzen/feishu-codex-bridge/issues');
+    expect(urls).toContain('https://github.com/peterpren/feishu-codex-bridge');
+    expect(urls).toContain('https://github.com/peterpren/feishu-codex-bridge/issues');
   });
 });
 

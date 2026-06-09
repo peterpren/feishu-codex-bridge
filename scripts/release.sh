@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 发布 @modelzen/feishu-codex-bridge 到 npm —— 幂等、不会重复发、自动打 tag。
+# 发布 peterpren-feishu-codex-bridge 到 npm —— 幂等、不会重复发、自动打 tag。
 #
 # 逻辑：
 #   1. 前置门：装了 npm、已 npm login、工作区无未提交(已跟踪)改动。
@@ -16,7 +16,7 @@
 #   RELEASE_SKIP_TEST=1 npm run release   跳过 test（不建议）
 set -eo pipefail
 
-PKG="@modelzen/feishu-codex-bridge"
+PKG="peterpren-feishu-codex-bridge"
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DRY=0

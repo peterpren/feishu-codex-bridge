@@ -1,5 +1,6 @@
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
-import { isAdmin, type AppConfig } from '../config/schema';
+import { isAdmin, resolveOwner, type AppConfig } from '../config/schema';
+import { saveConfig } from '../config/store';
 import { buildDmMenuCard } from '../card/dm-cards';
 import { sendManagedCard } from '../card/managed';
 import { log, withTrace } from '../core/logger';
@@ -12,6 +13,18 @@ import { log, withTrace } from '../core/logger';
  */
 export async function handleDmConsole(channel: LarkChannel, cfg: AppConfig, msg: NormalizedMessage): Promise<void> {
   await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
+    if (!resolveOwner(cfg)) {
+      cfg.preferences = {
+        ...(cfg.preferences ?? {}),
+        access: {
+          ...(cfg.preferences?.access ?? {}),
+          ownerOpenId: msg.senderId,
+          admins: [msg.senderId],
+        },
+      };
+      await saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'owner-claim-save' }));
+      log.info('console', 'owner-claimed', { sender: msg.senderId.slice(-6) });
+    }
     if (!isAdmin(cfg, msg.senderId)) {
       log.info('console', 'deny', { sender: msg.senderId.slice(-6) });
       await channel

@@ -1,9 +1,9 @@
 # feishu-codex bridge
 
-[![npm version](https://badgen.net/npm/v/@modelzen/feishu-codex-bridge)](https://www.npmjs.com/package/@modelzen/feishu-codex-bridge)
-[![total downloads](https://badgen.net/npm/dt/@modelzen/feishu-codex-bridge)](https://www.npmjs.com/package/@modelzen/feishu-codex-bridge)
-[![downloads/month](https://badgen.net/npm/dm/@modelzen/feishu-codex-bridge)](https://www.npmjs.com/package/@modelzen/feishu-codex-bridge)
-[![license](https://badgen.net/npm/license/@modelzen/feishu-codex-bridge)](https://github.com/peterpren/feishu-codex-bridge/blob/main/LICENSE)
+[![npm version](https://badgen.net/npm/v/peterpren-feishu-codex-bridge)](https://www.npmjs.com/package/peterpren-feishu-codex-bridge)
+[![total downloads](https://badgen.net/npm/dt/peterpren-feishu-codex-bridge)](https://www.npmjs.com/package/peterpren-feishu-codex-bridge)
+[![downloads/month](https://badgen.net/npm/dm/peterpren-feishu-codex-bridge)](https://www.npmjs.com/package/peterpren-feishu-codex-bridge)
+[![license](https://badgen.net/npm/license/peterpren-feishu-codex-bridge)](https://github.com/peterpren/feishu-codex-bridge/blob/main/LICENSE)
 
 > 把飞书 / Lark 桥接到你本机的 [Codex](https://github.com/openai/codex)，在群里 @ 机器人就能让 Codex 在指定项目目录里干活，结果以流式 Markdown 卡片实时回到群里。
 >
@@ -57,10 +57,10 @@
 
 ```bash
 # 推荐：全局安装到稳定路径（后台 daemon 需要稳定的 CLI 路径）
-npm i -g @modelzen/feishu-codex-bridge
+npm i -g peterpren-feishu-codex-bridge
 
 # 或：免安装、单次前台运行
-npx -y @modelzen/feishu-codex-bridge run
+npx -y peterpren-feishu-codex-bridge run
 ```
 
 > 安装只装命令、**不会自动建机器人**（包已预编译，安装即用）；装好后命令名是 `feishu-codex-bridge`。
@@ -288,4 +288,4 @@ src/
 
 ## 📄 License
 
-[MIT](LICENSE) © modelzen
+[MIT](LICENSE) © peterpren

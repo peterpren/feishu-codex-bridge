@@ -275,6 +275,11 @@ async function downloadOneFile(
       path: { message_id: ref.messageId, file_key: ref.fileKey },
       params: { type: 'file' },
     });
+    const declaredSize = Number(readHeader(res.headers, 'content-length'));
+    if (Number.isFinite(declaredSize) && declaredSize > MAX_FILE_BYTES) {
+      log.warn('intake', 'file-too-large', { name, size: declaredSize, phase: 'headers' });
+      return undefined;
+    }
     await res.writeFile(file);
     const st = await stat(file);
     if (st.size > MAX_FILE_BYTES) {
@@ -324,6 +329,7 @@ function safeFileName(name: string | undefined): string {
 
 function stripFeishuFilePlaceholders(text: string): string {
   const cleaned = text
+    .replace(/<file\b[^<]*\/>/gi, '')
     .replace(/<file\b[^>]*\/?>/gi, '')
     .replace(/\[file\]/gi, '')
     .trim();

@@ -75,6 +75,8 @@ export interface AppPreferences {
   access?: AppAccess;
   /** SIGTERM→SIGKILL grace (ms) for the app-server child. Default 5000. */
   agentStopGraceMs?: number;
+  /** Absolute local root directory that this bot may create/bind projects under. */
+  localWorkspaceRoot?: string;
 }
 
 export interface AppConfig {

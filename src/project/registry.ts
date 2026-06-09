@@ -31,7 +31,7 @@ export interface Project {
   chatId: string;
   /** absolute working directory codex runs in for this project */
   cwd: string;
-  /** true when bridge created the cwd as a blank project (under projectsRootDir) */
+  /** true when bridge created the cwd as a blank project (under this bot's local workspace root) */
   blank: boolean;
   createdAt: number;
   /** last branch shown in the announcement (for lazy change detection) */

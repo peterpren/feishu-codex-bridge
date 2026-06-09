@@ -78,8 +78,38 @@ describe('inbound file attachments', () => {
     expect(await readFile(file.path, 'utf8')).toBe('# hello\n');
   });
 
+  it('skips oversized files before writing when Feishu exposes content-length', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'bridge-file-'));
+    let wrote = false;
+    const channel = {
+      rawClient: {
+        im: {
+          v1: {
+            messageResource: {
+              get: async () => ({
+                headers: { 'content-length': String(51 * 1024 * 1024) },
+                writeFile: async () => {
+                  wrote = true;
+                },
+              }),
+            },
+          },
+        },
+      },
+    };
+
+    const files = await collectInboundFiles(
+      channel as any,
+      msg({ resources: [{ type: 'file', fileKey: 'file_1', fileName: 'big.md' }] }),
+      cwd,
+    );
+
+    expect(files).toHaveLength(0);
+    expect(wrote).toBe(false);
+  });
+
   it('adds downloaded file paths to the prompt and strips Feishu placeholders', () => {
-    const text = appendInboundFilesToText('帮我处理 <file key="file_1" name="需求.md"/>', [
+    const text = appendInboundFilesToText('帮我处理 <file key="file_1" name="需求 > 版本.md"/>', [
       { name: '需求.md', path: '/cwd/.feishu/inbox/om/01-需求.md', fileKey: 'file_1' },
     ]);
 

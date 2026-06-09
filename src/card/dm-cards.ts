@@ -17,6 +17,7 @@ import type { PermissionMode } from '../agent/types';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
 import { isIsolatedTopicWorkspace } from '../project/topic-workspace';
+import { localWorkspaceRootLabel } from '../project/workspace-root';
 import { PRODUCT_NAME, REPOSITORY_URL } from '../core/branding';
 import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject, type SelectOption } from './cards';
 import { relativeTime } from './command-cards';
@@ -56,6 +57,9 @@ export const DM = {
   setWatchdog: 'dm.set.watchdog',
   setPending: 'dm.set.pending',
   setConcurrency: 'dm.set.concurrency',
+  workspaceRootForm: 'dm.workspaceRoot.form',
+  workspaceRootSubmit: 'dm.workspaceRoot.submit',
+  workspaceRootClear: 'dm.workspaceRoot.clear',
   // 权限管理：全局 admins（settings 卡进入）+ 项目响应白名单（项目列表 / 建项目完成卡进入）
   admins: 'dm.admins',
   addAdminForm: 'dm.admin.addForm',
@@ -454,10 +458,10 @@ export function buildNewProjectFormCard(
   const elements = [];
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   elements.push(
-    md('填项目名（必填）。**本地文件夹路径留空** = 自动新建空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
+    md('填项目名（必填）。**本地文件夹路径留空** = 在本 Bot 的工作根目录下自动新建空白项目；**填绝对路径** = 绑定根目录内已有文件夹。'),
     form('new_project', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
-      input({ name: 'cwd', label: '本地文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({ name: 'cwd', label: '本地文件夹路径（选填，必须在 Bot 工作根目录内）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
       input({
         name: 'cloud_doc_folder',
         label: '飞书云文档保存文件夹（选填）',
@@ -490,10 +494,10 @@ export function buildJoinGroupFormCard(
   if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
   elements.push(
     md('我已被加入这个群。填一下要绑定的项目信息即可开始用。'),
-    md('项目名默认用群名，可改。**本地文件夹路径留空** = 自动新建空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
+    md('项目名默认用群名，可改。**本地文件夹路径留空** = 在本 Bot 的工作根目录下自动新建空白项目；**填绝对路径** = 绑定根目录内已有文件夹。'),
     form('join_group', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
-      input({ name: 'cwd', label: '本地文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({ name: 'cwd', label: '本地文件夹路径（选填，必须在 Bot 工作根目录内）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
       input({
         name: 'cloud_doc_folder',
         label: '飞书云文档保存文件夹（选填）',
@@ -627,9 +631,18 @@ function optionRow(
  */
 export function buildSettingsCard(cfg: AppConfig): CardObject {
   const watchdogSec = cfg.preferences?.runIdleTimeoutSeconds ?? 120;
+  const localRoot = cfg.preferences?.localWorkspaceRoot;
   return card(
     [
       md('**全局设置**（管理员）'),
+      md('**本地工作根目录**'),
+      note(`当前：${localWorkspaceRootLabel(localRoot)}`),
+      note('新建/绑定项目时，本地目录必须在这个根目录内；留空创建项目也会自动落在这里。'),
+      actions([
+        button(localRoot ? '修改根目录' : '设置根目录', { a: DM.workspaceRootForm }, 'primary'),
+        ...(localRoot ? [button('清空', { a: DM.workspaceRootClear }, 'danger')] : []),
+      ]),
+      hr(),
       ...optionRow('🔧 工具调用', DM.setTools, getShowToolCalls(cfg) ? 'on' : 'off', [
         { label: '显示', value: 'on' },
         { label: '隐藏', value: 'off' },
@@ -656,6 +669,27 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
     ],
     { header: { title: '⚙️ 设置', template: 'blue' } },
   );
+}
+
+export function buildWorkspaceRootFormCard(opts: { current?: string; error?: string } = {}): CardObject {
+  const elements: CardElement[] = [];
+  if (opts.error) elements.push(md(`❌ **保存失败**：${opts.error}`));
+  elements.push(
+    md('设置这个 Bot 可以使用的本地工作根目录。保存后，新建/绑定项目只能落在这个目录里面。'),
+    form('workspace_root', [
+      input({
+        name: 'local_workspace_root',
+        label: '本地工作根目录',
+        placeholder: '/Users/you/Documents/Codex/财务团队',
+        value: opts.current,
+        required: true,
+      }),
+      note('如果目录不存在，保存时会自动创建；最终保存为真实路径，用来拦截软链接跳出目录。'),
+      actions([submitButton('✅ 保存', { a: DM.workspaceRootSubmit }, 'primary', 'submit_workspace_root')]),
+      actions([button('⬅️ 设置', { a: DM.settings })]),
+    ]),
+  );
+  return card(elements, { header: { title: '📂 本地工作根目录', template: 'turquoise' } });
 }
 
 /**

@@ -58,6 +58,7 @@ import {
   buildRmConfirmCard,
   buildSettingsCard,
   buildUpdateCard,
+  buildWorkspaceRootFormCard,
   DM,
   GS,
   type DoctorInfo,
@@ -101,6 +102,7 @@ import {
 } from '../project/registry';
 import { isIsolatedTopicWorkspace, prepareSessionCwd } from '../project/topic-workspace';
 import { createProject, joinExistingGroup } from '../project/lifecycle';
+import { normalizeWorkspaceRoot } from '../project/workspace-root';
 import { refreshBranch } from '../project/announcement';
 import {
   createTopicCloudDocFolder,
@@ -127,6 +129,7 @@ import {
   messageHasFiles,
   messageHasImages,
 } from './media';
+import { fetchQuotedMessage, fetchThreadContext, weaveQuote, weaveThreadHistory } from './context-weave';
 import { textRequestsCloudDocFolder } from './cloud-doc-intent';
 import { pickBridgeDefaults } from './model-defaults';
 import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, type TopicRequester } from './topic-title';
@@ -300,6 +303,7 @@ export function createOrchestrator(
 ): Orchestrator {
   const backend = createBackend();
   const sessions = new Map<string, AgentThread>();
+  const recreatedSessions = new Set<string>();
   const active = new Map<string, ActiveState>();
   /** Per-doc serialization for comment runs (see {@link withDocLock}). */
   const docLocks = new Map<string, Promise<void>>();
@@ -738,10 +742,34 @@ export function createOrchestrator(
     const hasFiles = messageHasFiles(msg);
     const files = hasFiles ? await collectInboundFiles(channel, msg, cwd) : [];
     const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
+    let body = hasFiles ? appendInboundFilesToText(text, files, true) : text;
+    if (msg.replyToMessageId) {
+      const quoted = await fetchQuotedMessage(channel, msg.replyToMessageId);
+      body = weaveQuote(body, quoted);
+    }
     return {
-      text: hasFiles ? appendInboundFilesToText(text, files, true) : text,
+      text: body,
       images,
     };
+  }
+
+  function msgTime(msg: NormalizedMessage): number {
+    return Number(msg.createTime) || Date.now();
+  }
+
+  async function weaveTopicContextForTurn(
+    msg: NormalizedMessage,
+    text: string,
+    flat: boolean,
+    freshSession: boolean,
+    priorLastSeenAt: number | undefined,
+  ): Promise<string> {
+    if (!msg.threadId || flat || (!freshSession && priorLastSeenAt === undefined)) return text;
+    const history = await fetchThreadContext(channel, msg.threadId, {
+      sinceTime: freshSession ? 0 : priorLastSeenAt,
+      excludeMessageId: msg.messageId,
+    });
+    return weaveThreadHistory(text, history);
   }
 
   /**
@@ -777,7 +805,9 @@ export function createOrchestrator(
         });
       }
       const rawInput = await collectTurnInput(msg, text, rec?.cwd ?? project?.cwd ?? fallbackCwd);
-      const input = withCloudDocFolderHint(rawInput, cloudDoc.cloudDocFolder, cloudDoc.cloudDocFolderError, needsCloudDoc);
+      const inputText = await weaveTopicContextForTurn(msg, rawInput.text ?? text, flat, false, rec?.lastSeenAt);
+      void patchSession(sessionKey, { lastSeenAt: msgTime(msg) }).catch(() => undefined);
+      const input = withCloudDocFolderHint({ ...rawInput, text: inputText }, cloudDoc.cloudDocFolder, cloudDoc.cloudDocFolderError, needsCloudDoc);
       const cur = active.get(sessionKey);
       if (!cur) {
         startReservedRun(msg, text, sessionKey, flat, project, perm, input);
@@ -837,6 +867,7 @@ export function createOrchestrator(
       try {
         const needsCloudDoc = turnNeedsTopicCloudDocFolder(msg, text, project, flat);
         let rec = await getSession(sessionKey);
+        const priorLastSeenAt = rec?.lastSeenAt;
         let runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder);
         let runCloudDocFolderError = rec?.cloudDocFolderError;
         if (needsCloudDoc && !runCloudDocFolder && rec) {
@@ -853,6 +884,7 @@ export function createOrchestrator(
           rec = await getSession(sessionKey);
         }
         let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
+        const freshSession = !thread || recreatedSessions.delete(sessionKey);
         let sessionCwd = rec?.cwd;
         if (!thread) {
           // Unknown session (created before this bridge, or store lost): treat as
@@ -889,6 +921,7 @@ export function createOrchestrator(
             topicRequesterName: requesterName,
             cloudDocFolder: cloudDoc.cloudDocFolder,
             cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
+            lastSeenAt: msgTime(msg),
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
@@ -898,7 +931,10 @@ export function createOrchestrator(
         runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder) ?? runCloudDocFolder;
         runCloudDocFolderError = rec?.cloudDocFolderError ?? runCloudDocFolderError;
         const rawInput = preloadedInput ?? (await collectTurnInput(msg, text, sessionCwd ?? (flat ? project?.cwd : fallbackCwd) ?? fallbackCwd));
-        const input = withCloudDocFolderHint(rawInput, runCloudDocFolder, runCloudDocFolderError, needsCloudDoc);
+        const firstText = await weaveTopicContextForTurn(msg, rawInput.text ?? text, flat, freshSession, priorLastSeenAt);
+        void patchSession(sessionKey, { lastSeenAt: msgTime(msg) }).catch(() => undefined);
+        const runInput = { ...rawInput, text: firstText };
+        const input = withCloudDocFolderHint(runInput, runCloudDocFolder, runCloudDocFolderError, needsCloudDoc);
         reserved.thread = thread;
         await launchRun(
           {
@@ -990,6 +1026,7 @@ export function createOrchestrator(
         cloudDocFolder: cloudDoc.cloudDocFolder,
       });
       sessions.set(threadId, fresh);
+      recreatedSessions.add(threadId);
       return fresh;
     }
   }
@@ -1097,6 +1134,7 @@ export function createOrchestrator(
           cloudDocFolder: cloudDoc.cloudDocFolder,
           cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
           requesterOpenId: msg.senderId,
+          lastSeenAt: msgTime(msg),
           roleSuffix: perm.roleSuffix,
         },
         reaction,
@@ -1662,7 +1700,12 @@ export function createOrchestrator(
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
     })
     .on(DM.newProject, ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) patch(evt, buildNewProjectFormCard());
+      if (!dmAdmin(evt.operator?.openId)) return;
+      if (!cfg.preferences?.localWorkspaceRoot) {
+        patch(evt, buildWorkspaceRootFormCard({ error: '请先设置本地工作根目录，再新建项目' }));
+        return;
+      }
+      patch(evt, buildNewProjectFormCard());
     })
     .on(DM.newProjectSubmit, ({ evt, formValue, value }) => {
       const op = evt.operator?.openId;
@@ -1686,6 +1729,7 @@ export function createOrchestrator(
               name,
               ownerOpenId: op,
               existingPath: cwdIn || undefined,
+              workspaceRoot: cfg.preferences?.localWorkspaceRoot,
               kind,
               cloudDocFolder,
               ...cloudDocAccess(op),
@@ -1726,6 +1770,7 @@ export function createOrchestrator(
               chatId,
               addedBy: op,
               existingPath: cwdIn || undefined,
+              workspaceRoot: cfg.preferences?.localWorkspaceRoot,
               kind,
               cloudDocFolder,
               ...cloudDocAccess(op),
@@ -1747,6 +1792,39 @@ export function createOrchestrator(
     })
     .on(DM.settings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt, buildSettingsCard(cfg));
+    })
+    .on(DM.workspaceRootForm, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      patch(evt, buildWorkspaceRootFormCard({ current: cfg.preferences?.localWorkspaceRoot }));
+    })
+    .on(DM.workspaceRootSubmit, ({ evt, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const raw = String(formValue?.local_workspace_root ?? '').trim();
+      void (async () => {
+        try {
+          const root = await normalizeWorkspaceRoot(raw);
+          cfg.preferences = { ...(cfg.preferences ?? {}), localWorkspaceRoot: root };
+          await saveConfig(cfg);
+          log.info('console', 'workspace-root-set', { root });
+          await sendManagedCard(channel, evt.chatId, buildSettingsCard(cfg)).catch((e) =>
+            log.fail('console', e, { phase: 'workspace-root-result' }),
+          );
+        } catch (err) {
+          const next = buildWorkspaceRootFormCard({
+            current: raw || cfg.preferences?.localWorkspaceRoot,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await sendManagedCard(channel, evt.chatId, next).catch((e) =>
+            log.fail('console', e, { phase: 'workspace-root-error' }),
+          );
+        }
+      })();
+    })
+    .on(DM.workspaceRootClear, ({ evt }) => {
+      applyPref(evt, (p) => {
+        delete p.localWorkspaceRoot;
+      });
+      log.info('console', 'workspace-root-clear');
     })
     .on(DM.doctor, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -2214,6 +2292,8 @@ export function createOrchestrator(
     cloudDocFolderError?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
     requesterOpenId?: string;
+    /** Feishu message timestamp already fed to Codex on this turn. */
+    lastSeenAt?: number;
     /** single-session group: reply by quoting (no reply_in_thread / topic). */
     flat?: boolean;
     /** when admin/guest tiers are split: 'admin'|'guest' to namespace the
@@ -2256,6 +2336,7 @@ export function createOrchestrator(
         topicRequesterName: opts.topicRequesterName,
         cloudDocFolder: opts.cloudDocFolder,
         cloudDocFolderError: opts.cloudDocFolderError,
+        lastSeenAt: opts.lastSeenAt,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       }).catch(() => undefined);

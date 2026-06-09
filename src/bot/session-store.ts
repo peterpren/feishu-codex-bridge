@@ -33,6 +33,8 @@ export interface SessionRecord {
   cloudDocFolder?: CloudDocFolder;
   /** Last topic-folder creation/permission error, for local troubleshooting. */
   cloudDocFolderError?: string;
+  /** Last Feishu message timestamp fed to Codex; used to weave only new topic context. */
+  lastSeenAt?: number;
   createdAt: number;
   updatedAt: number;
 }

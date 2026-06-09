@@ -1,14 +1,11 @@
-import { mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
-import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { addProject, getProjectByChatId, getProjectByName, updateProject, type CloudDocFolder, type Project } from './registry';
 import type { PermissionMode } from '../agent/types';
 import { grantProjectCloudDocFolderAccess, permissionRecord } from './cloud-doc-permission';
 import { setAnnouncement } from './announcement';
 import { onboardGroup } from './onboarding';
+import { resolveProjectCwd } from './workspace-root';
 
 export interface CreateProjectInput {
   name: string;
@@ -16,6 +13,8 @@ export interface CreateProjectInput {
   ownerOpenId: string;
   /** when set, bind this existing folder; otherwise create a blank project. */
   existingPath?: string;
+  /** Bot-level local root directory; all new/bound projects must live inside it. */
+  workspaceRoot?: string;
   /** session model for the group (default 'multi'). */
   kind?: 'multi' | 'single';
   /** permission tier (default 'full' for self-created projects). */
@@ -39,6 +38,8 @@ export interface JoinGroupInput {
   addedBy: string;
   /** when set, bind this existing folder; otherwise create a blank project. */
   existingPath?: string;
+  /** Bot-level local root directory; all new/bound projects must live inside it. */
+  workspaceRoot?: string;
   /** session model for the group (default 'multi'). */
   kind?: 'multi' | 'single';
   /** permission tier (default 'qa' — read-only — for joined external groups). */
@@ -54,23 +55,6 @@ export interface JoinGroupInput {
 }
 
 /**
- * Resolve the working directory for a project: an explicit `existingPath` (must
- * exist) binds a folder you already have; otherwise a blank project dir is
- * created under {@link paths.projectsRootDir}. Throws before any group is
- * touched so a bad path never leaves an orphan group.
- */
-async function resolveCwd(name: string, existingPath?: string): Promise<{ cwd: string; blank: boolean }> {
-  if (existingPath) {
-    const cwd = isAbsolute(existingPath) ? existingPath : resolve(existingPath);
-    if (!existsSync(cwd)) throw new Error(`文件夹不存在：${cwd}`);
-    return { cwd, blank: false };
-  }
-  const cwd = join(paths.projectsRootDir, name);
-  await mkdir(cwd, { recursive: true });
-  return { cwd, blank: true };
-}
-
-/**
  * Create a project: resolve/prepare the cwd, create a bound Feishu group
  * (bot stays owner, creator invited + promoted to admin), register it, and set
  * the group announcement.
@@ -83,7 +67,11 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   if (await getProjectByName(name)) throw new Error(`项目名「${name}」已存在，换个名或用 /projects 看已有的`);
 
   // 1. resolve cwd
-  const { cwd, blank } = await resolveCwd(name, input.existingPath);
+  const { cwd, blank } = await resolveProjectCwd({
+    name,
+    existingPath: input.existingPath,
+    workspaceRoot: input.workspaceRoot,
+  });
 
   // 2. create the bound group — bot stays as owner (no owner_id passed); the
   //    creator is invited as a member here, then promoted to admin in 2b so the
@@ -150,7 +138,11 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
   const bound = await getProjectByChatId(input.chatId);
   if (bound) throw new Error(`该群已绑定为项目「${bound.name}」`);
 
-  const { cwd, blank } = await resolveCwd(name, input.existingPath);
+  const { cwd, blank } = await resolveProjectCwd({
+    name,
+    existingPath: input.existingPath,
+    workspaceRoot: input.workspaceRoot,
+  });
 
   const project: Project = {
     name,

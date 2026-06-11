@@ -6,8 +6,10 @@ import type {
   AgentInput,
   AgentRun,
   AgentThread,
+  CompactResult,
   HistoryTool,
   HistoryTurn,
+  McpServerConfig,
   ModelInfo,
   PermissionMode,
   ReasoningEffort,
@@ -26,6 +28,7 @@ import { codexVersion, resolveCodexBin } from './locate';
 import type { Thread, ThreadItem, Turn } from './protocol';
 
 const APPROVAL_POLICY = 'never';
+const AUTO_COMPACT_OFF_LIMIT = 1_000_000_000;
 
 /**
  * Map a permission tier to the thread/start|resume params that enforce it.
@@ -75,6 +78,15 @@ export function sandboxParams(
   };
 }
 
+export function withAutoCompact(
+  params: Record<string, unknown>,
+  autoCompact: boolean | undefined,
+): Record<string, unknown> {
+  if (autoCompact !== false) return params;
+  const config = (params.config as Record<string, unknown> | undefined) ?? {};
+  return { ...params, config: { ...config, model_auto_compact_token_limit: AUTO_COMPACT_OFF_LIMIT } };
+}
+
 interface ThreadSessionOptions {
   cwd: string;
   model?: string;
@@ -82,6 +94,8 @@ interface ThreadSessionOptions {
   mode?: PermissionMode;
   network?: boolean;
   cloudDocFolder?: CloudDocFolder;
+  autoCompact?: boolean;
+  mcpServers?: McpServerConfig[];
 }
 
 type ThreadSessionParams = {
@@ -103,13 +117,13 @@ function codexServiceTier(tier: ServiceTier | undefined): ServiceTier | null | u
 
 export function buildThreadSessionParams(opts: ThreadSessionOptions): ThreadSessionParams {
   const root = workspaceRoot(opts.cwd);
-  const sandbox = sandboxParams(opts.mode, opts.network);
+  const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
   const serviceTier = codexServiceTier(opts.serviceTier);
   return {
     cwd: root,
     approvalPolicy: APPROVAL_POLICY,
     ...sandbox,
-    developerInstructions: bridgeDeveloperInstructions({ cloudDocFolder: opts.cloudDocFolder }),
+    developerInstructions: bridgeDeveloperInstructions({ cloudDocFolder: opts.cloudDocFolder, mcpServers: opts.mcpServers }),
     ...(opts.model ? { model: opts.model } : {}),
     ...(serviceTier !== undefined ? { serviceTier } : {}),
   };
@@ -138,26 +152,40 @@ const BRIDGE_DEVELOPER_INSTRUCTIONS = [
   '不要手写飞书卡片的 JSON。普通问答正常回复即可，只有用户要卡片时才用 ```feishu-card 代码块。',
 ].join('\n');
 
-export function bridgeDeveloperInstructions(opts: { cloudDocFolder?: CloudDocFolder } = {}): string {
+export function bridgeDeveloperInstructions(opts: { cloudDocFolder?: CloudDocFolder; mcpServers?: McpServerConfig[] } = {}): string {
   const folder = opts.cloudDocFolder;
-  if (!folder?.token) return BRIDGE_DEVELOPER_INSTRUCTIONS;
-
-  const createAs = folder.createAs ?? 'user';
-  return [
-    BRIDGE_DEVELOPER_INSTRUCTIONS,
-    '',
-    '3) 飞书云文档：当用户要求创建、输出、保存飞书云文档时，默认保存到当前会话配置的云空间文件夹。',
-    `默认 folder_token：${folder.token}`,
-    folder.url ? `文件夹链接：${folder.url}` : '',
-    `创建文档时优先使用：lark-cli docs +create --api-version v2 --as ${createAs} --parent-token ${folder.token} --content '<title>标题</title><p>内容</p>'`,
-    '除非用户本轮明确指定其它位置，不要改用 my_library 或其它父目录。',
-    '如果 lark-cli 权限不足或目录不可访问，直接说明需要为当前 lark-cli 用户授权或给该文件夹授权。',
-  ]
-    .filter(Boolean)
-    .join('\n');
+  const sections = [BRIDGE_DEVELOPER_INSTRUCTIONS];
+  if (folder?.token) {
+    const createAs = folder.createAs ?? 'user';
+    sections.push(
+      [
+        '3) 飞书云文档：当用户要求创建、输出、保存飞书云文档时，默认保存到当前会话配置的云空间文件夹。',
+        `默认 folder_token：${folder.token}`,
+        folder.url ? `文件夹链接：${folder.url}` : '',
+        `创建文档时优先使用：lark-cli docs +create --api-version v2 --as ${createAs} --parent-token ${folder.token} --content '<title>标题</title><p>内容</p>'`,
+        '除非用户本轮明确指定其它位置，不要改用 my_library 或其它父目录。',
+        '如果 lark-cli 权限不足或目录不可访问，直接说明需要为当前 lark-cli 用户授权或给该文件夹授权。',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+  }
+  if ((opts.mcpServers ?? []).some((s) => s.enabled !== false)) {
+    sections.push(FOOD_MCP_DEVELOPER_INSTRUCTIONS);
+  }
+  return sections.join('\n\n');
 }
+
+const FOOD_MCP_DEVELOPER_INSTRUCTIONS = [
+  '3) 餐饮 MCP：当前项目可能启用了瑞幸咖啡 / 麦当劳 MCP。',
+  '可以用 MCP 查询地址、门店、菜单、商品、优惠、配送/自提信息和预览订单。',
+  '创建订单前必须先向用户复述：品牌、门店或配送地址、商品、数量、规格、优惠、预计金额、取餐/配送方式，并等待用户明确确认。',
+  '不要替用户支付。MCP 返回支付链接或待支付订单时，只把支付入口交给用户本人处理。',
+  '不要输出、保存或转述任何 MCP Token、Authorization header 或环境变量值。',
+].join('\n');
 /** Hard ceiling on a history read so a wedged codex can't hang the resume card. */
 const READ_HISTORY_TIMEOUT_MS = 20_000;
+const COMPACT_TIMEOUT_MS = 120_000;
 
 /** Reject `p` if it hasn't settled within `ms` (the timer never keeps the event
  * loop alive past resolution). */
@@ -257,6 +285,43 @@ class CodexThread implements AgentThread {
 
   async abort(turnId: string): Promise<void> {
     await this.client.request('turn/interrupt', { threadId: this.codexThreadId, turnId });
+  }
+
+  async compact(): Promise<CompactResult> {
+    let startError: Error | undefined;
+    const startFailed: Promise<'start-failed'> = new Promise((resolve) => {
+      this.client.request('thread/compact/start', { threadId: this.codexThreadId }).then(undefined, (err: unknown) => {
+        startError = err instanceof Error ? err : new Error(String(err));
+        log.fail('agent', startError, { phase: 'thread/compact/start' });
+        resolve('start-failed');
+      });
+    });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout: Promise<'timeout'> = new Promise((resolveTimeout) => {
+      timer = setTimeout(() => resolveTimeout('timeout'), COMPACT_TIMEOUT_MS);
+    });
+
+    const stream = this.client.stream()[Symbol.asyncIterator]();
+    let compacted = false;
+    let usage: CompactResult['usage'] = null;
+    try {
+      while (true) {
+        const step = await Promise.race([stream.next(), startFailed, timeout]);
+        if (step === 'start-failed') throw startError ?? new Error('thread/compact/start 请求失败');
+        if (step === 'timeout') throw new Error(`压缩超时（Codex 未在 ${COMPACT_TIMEOUT_MS / 1000}s 内完成）`);
+        if (step.done) break;
+        const ev = mapNotification(step.value);
+        if (!ev) continue;
+        if (ev.type === 'context_usage') usage = { usedTokens: ev.usedTokens, contextWindow: ev.contextWindow };
+        else if (ev.type === 'context_compacted') compacted = true;
+        else if (ev.type === 'error' && !ev.willRetry) throw new Error(ev.message);
+        else if (ev.type === 'done') break;
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return { compacted, usage };
   }
 
   async close(): Promise<void> {
@@ -364,7 +429,7 @@ export class CodexAppServerBackend implements AgentBackend {
 
   async startThread(opts: StartThreadOptions): Promise<AgentThread> {
     const params = buildThreadSessionParams(opts);
-    const client = await this.spawn(params.cwd);
+    const client = await this.spawn(params.cwd, opts.mcpServers);
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
       ...params,
     });
@@ -373,7 +438,7 @@ export class CodexAppServerBackend implements AgentBackend {
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
     const params = buildThreadSessionParams(opts);
-    const client = await this.spawn(params.cwd);
+    const client = await this.spawn(params.cwd, opts.mcpServers);
     const res = await client.request<{ thread: { id: string } }>('thread/resume', {
       threadId: opts.codexThreadId,
       ...params,
@@ -381,10 +446,10 @@ export class CodexAppServerBackend implements AgentBackend {
     return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.serviceTier);
   }
 
-  private async spawn(cwd: string): Promise<AppServerClient> {
+  private async spawn(cwd: string, mcpServers?: McpServerConfig[]): Promise<AppServerClient> {
     const bin = resolveCodexBin();
     if (!bin) throw new Error('codex CLI not found (set CODEX_BIN or install @openai/codex)');
-    const client = new AppServerClient({ bin, cwd });
+    const client = new AppServerClient({ bin, cwd, mcpServers });
     await client.connect();
     return client;
   }

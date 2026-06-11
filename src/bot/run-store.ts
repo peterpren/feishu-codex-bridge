@@ -180,6 +180,13 @@ function summarizeFailure(
   }
 
   if (terminal === 'interrupted') {
+    if (state?.interruptedReason === 'shutdown') {
+      return {
+        failureClass: 'bridge_error',
+        mainReason: '后台服务重启/关闭中断了本轮运行',
+        evidence: withLogFile({}),
+      };
+    }
     return {
       failureClass: 'user_interrupted',
       mainReason: '用户点击终止按钮中止了本轮运行',

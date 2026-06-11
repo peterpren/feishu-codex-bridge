@@ -7,7 +7,13 @@ const addProjectMock = vi.hoisted(() => vi.fn());
 const getProjectByNameMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/project/registry', () => ({
+  DEFAULT_ADMIN_MODE: 'full',
+  DEFAULT_GUEST_MODE: 'write',
+  DEFAULT_NETWORK: true,
   addProject: addProjectMock,
+  effectiveGuestMode: (p: { guestMode?: string }) => p.guestMode ?? 'write',
+  effectiveMode: (p: { mode?: string }) => p.mode ?? 'full',
+  effectiveNetwork: (p: { network?: boolean }) => p.network ?? true,
   getProjectByChatId: vi.fn(),
   getProjectByName: getProjectByNameMock,
   updateProject: vi.fn(),
@@ -36,6 +42,7 @@ describe('createPrivateProject', () => {
       origin: 'created',
       mode: 'write',
       network: false,
+      mcpServers: [{ name: 'mcd-mcp', url: 'https://mcp.mcd.cn', bearerTokenEnvVar: 'MCD_MCP_TOKEN' }],
     };
     const channel = {
       rawClient: {
@@ -60,5 +67,7 @@ describe('createPrivateProject', () => {
     expect(registered.kind).toBe('single');
     expect(registered.private).toBe(true);
     expect(registered.noMention).toBe(false);
+    expect(registered.mcpServers).toEqual(parent.mcpServers);
+    expect(registered.mcpServers).not.toBe(parent.mcpServers);
   });
 });

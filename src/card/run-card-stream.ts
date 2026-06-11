@@ -1,6 +1,7 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
 import type { CardObject } from './cards';
+import { isCardIdNotReady } from './managed';
 
 /**
  * Min gap between throttled whole-card stream updates. Finer = smoother chunked
@@ -149,34 +150,48 @@ export class RunCardStream {
     initialCard: CardObject,
     opts: { replyTo?: string; replyInThread?: boolean },
   ): Promise<string> {
-    const created = await channel.rawClient.cardkit.v1.card.create({
-      data: { type: 'card_json', data: JSON.stringify(initialCard) },
-    });
-    const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
-    if (!cardId) {
-      throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
-    }
-    this.cardId = cardId;
-    this.lastContent = JSON.stringify(initialCard);
+    const data = JSON.stringify(initialCard);
+    const attempt = async (): Promise<{ cardId: string; messageId: string }> => {
+      const created = await channel.rawClient.cardkit.v1.card.create({
+        data: { type: 'card_json', data },
+      });
+      const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
+      if (!cardId) {
+        throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
+      }
 
-    const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-    let messageId: string | undefined;
-    if (opts.replyTo) {
-      const r = await channel.rawClient.im.v1.message.reply({
-        path: { message_id: opts.replyTo },
-        data: { msg_type: 'interactive', content, reply_in_thread: opts.replyInThread ?? false },
-      });
-      messageId = (r as { data?: { message_id?: string } }).data?.message_id;
-    } else {
-      const r = await channel.rawClient.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, msg_type: 'interactive', content },
-      });
-      messageId = (r as { data?: { message_id?: string } }).data?.message_id;
+      const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+      let messageId: string | undefined;
+      if (opts.replyTo) {
+        const r = await channel.rawClient.im.v1.message.reply({
+          path: { message_id: opts.replyTo },
+          data: { msg_type: 'interactive', content, reply_in_thread: opts.replyInThread ?? false },
+        });
+        messageId = (r as { data?: { message_id?: string } }).data?.message_id;
+      } else {
+        const r = await channel.rawClient.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: { receive_id: chatId, msg_type: 'interactive', content },
+        });
+        messageId = (r as { data?: { message_id?: string } }).data?.message_id;
+      }
+      if (!messageId) throw new Error('run card send returned no message_id');
+      return { cardId, messageId };
+    };
+
+    for (let i = 0; ; i++) {
+      try {
+        const { cardId, messageId } = await attempt();
+        this.cardId = cardId;
+        this.lastContent = data;
+        this._messageId = messageId;
+        return messageId;
+      } catch (err) {
+        if (i >= 2 || !isCardIdNotReady(err)) throw err;
+        log.fail('card', err, { phase: 'run-create', attempt: i, retry: true });
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+      }
     }
-    if (!messageId) throw new Error('run card send returned no message_id');
-    this._messageId = messageId;
-    return messageId;
   }
 
   /** Throttled whole-card stream update. Skips identical/too-soon pushes;

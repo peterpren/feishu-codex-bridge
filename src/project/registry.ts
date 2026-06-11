@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
-import type { PermissionMode } from '../agent/types';
+import type { McpServerConfig, PermissionMode } from '../agent/types';
 
 export type CloudDocCreateAs = 'user' | 'bot';
 
@@ -22,6 +22,33 @@ export interface CloudDocFolder {
 }
 
 export type TopicWorkspaceMode = 'shared' | 'isolated';
+
+export const DEFAULT_ADMIN_MODE: PermissionMode = 'full';
+export const DEFAULT_GUEST_MODE: PermissionMode = 'write';
+export const DEFAULT_NETWORK = true;
+
+export type ProjectMcpServer = McpServerConfig;
+
+export const FOOD_MCP_SERVERS: readonly ProjectMcpServer[] = [
+  {
+    name: 'luckin-coffee',
+    title: '瑞幸咖啡',
+    url: 'https://gwmcp.lkcoffee.com/order/user/mcp',
+    bearerTokenEnvVar: 'LUCKIN_MCP_TOKEN',
+    bearerTokenSecretId: 'mcp:LUCKIN_MCP_TOKEN',
+    enabled: true,
+  },
+  {
+    name: 'mcd-mcp',
+    title: '麦当劳',
+    url: 'https://mcp.mcd.cn',
+    bearerTokenEnvVar: 'MCD_MCP_TOKEN',
+    bearerTokenSecretId: 'mcp:MCD_MCP_TOKEN',
+    enabled: true,
+  },
+];
+
+const FOOD_MCP_NAMES = new Set(FOOD_MCP_SERVERS.map((server) => server.name));
 
 /** A project = a Feishu group bound to a fixed working directory. */
 export interface Project {
@@ -52,24 +79,27 @@ export interface Project {
   /** 项目级响应白名单：谁能让 bot 在本群响应/跑 codex。空/缺省 = 所有人；
    * admin/owner 恒豁免（见 isUserAllowedInProject）。 */
   allowedUsers?: string[];
-  /** permission tier for codex's sandbox — the tier ADMINS/owner get. Omitted on
-   * old data → treated as 'full' (danger-full-access), preserving prior behavior.
+  /** permission tier for codex's sandbox — the tier ADMINS/owner get. Omitted →
+   * treated as 'full' (danger-full-access).
    * Read via {@link effectiveMode}. 'qa'/'write' confine reads+writes to `cwd`. */
   mode?: PermissionMode;
-  /** permission tier for NON-admin senders. Unset → same as `mode` (no split,
-   * the historical single-tier behavior). When set to a distinct tier, admin and
-   * guest turns run on SEPARATE codex threads (see {@link turnTier}). Read via
-   * {@link effectiveGuestMode}. */
+  /** permission tier for NON-admin senders. Omitted → 'write'. When set to a
+   * distinct tier, admin and guest turns run on SEPARATE codex threads (see
+   * {@link turnTier}). Read via {@link effectiveGuestMode}. */
   guestMode?: PermissionMode;
   /** allow the sandboxed agent's shell to reach the network (only meaningful for
-   * 'qa'/'write'; 'full' is always networked). Default false. */
+   * 'qa'/'write'; 'full' is always networked). Omitted → true. */
   network?: boolean;
+  /** Codex auto-compacts old context near the model window. Missing = on. */
+  autoCompact?: boolean;
   /** Multi-topic file boundary. 'isolated' gives each topic its own writable cwd;
    * 'shared' keeps the legacy behavior where every topic writes the project cwd.
    * Missing = isolated for multi-topic groups, shared for single-session groups. */
   topicWorkspace?: TopicWorkspaceMode;
   /** Default Feishu Drive folder for cloud docs Codex creates for this project. */
   cloudDocFolder?: CloudDocFolder;
+  /** Project-scoped MCP servers. Tokens are referenced by env var only. */
+  mcpServers?: ProjectMcpServer[];
   /** Private child group created from a parent project via `/private`. */
   private?: boolean;
   /** Parent project chat_id for private child groups. */
@@ -143,21 +173,58 @@ export function defaultNoMention(p: Pick<Project, 'kind' | 'origin'>): boolean {
  * `mode ?? …` read goes through here.
  */
 export function effectiveMode(p: Pick<Project, 'mode'>): PermissionMode {
-  return p.mode ?? 'full';
+  return p.mode ?? DEFAULT_ADMIN_MODE;
 }
 
 /**
- * The effective tier for NON-admin senders. Unset `guestMode` → same as the
- * admin tier ({@link effectiveMode}), i.e. no split (everyone shares one tier,
- * the historical behavior). Single source of truth for the guest-side read.
+ * The effective tier for NON-admin senders. Unset `guestMode` → project read
+ * and write, so ordinary group members stay inside the project folder by
+ * default.
  */
 export function effectiveGuestMode(p: Pick<Project, 'mode' | 'guestMode'>): PermissionMode {
-  return p.guestMode ?? effectiveMode(p);
+  return p.guestMode ?? DEFAULT_GUEST_MODE;
+}
+
+/** Effective network switch for confined tiers. Full access is networked by the
+ * Codex backend regardless, but callers still use this for UI and qa/write. */
+export function effectiveNetwork(p: Pick<Project, 'network'>): boolean {
+  return p.network ?? DEFAULT_NETWORK;
+}
+
+export function enabledProjectMcpServers(p: Pick<Project, 'mcpServers'> | undefined): ProjectMcpServer[] {
+  return (p?.mcpServers ?? [])
+    .filter((server) => server.enabled !== false && server.name.trim() && server.url.trim())
+    .map((server) => ({
+      ...server,
+      name: server.name.trim(),
+      url: server.url.trim(),
+      bearerTokenEnvVar: server.bearerTokenEnvVar?.trim(),
+      bearerTokenSecretId: server.bearerTokenSecretId?.trim(),
+    }));
+}
+
+export function foodMcpEnabled(p: Pick<Project, 'mcpServers'>): boolean {
+  const enabled = new Set(enabledProjectMcpServers(p).map((server) => server.name));
+  return FOOD_MCP_SERVERS.every((server) => enabled.has(server.name));
+}
+
+export function withFoodMcpServers(existing: readonly ProjectMcpServer[] | undefined): ProjectMcpServer[] {
+  const byName = new Map<string, ProjectMcpServer>();
+  for (const server of existing ?? []) byName.set(server.name, { ...server });
+  for (const server of FOOD_MCP_SERVERS) {
+    byName.set(server.name, { ...byName.get(server.name), ...server, enabled: true });
+  }
+  return [...byName.values()];
+}
+
+export function withoutFoodMcpServers(existing: readonly ProjectMcpServer[] | undefined): ProjectMcpServer[] | undefined {
+  const next = (existing ?? []).filter((server) => !FOOD_MCP_NAMES.has(server.name));
+  return next.length ? next.map((server) => ({ ...server })) : undefined;
 }
 
 /**
  * Resolve a turn's permission tier + role from the sender's admin status.
- * `split` is true only when a distinct `guestMode` is configured — then the
+ * `split` is true when the effective admin and guest tiers differ — then the
  * sandbox AND the codex conversation history (both bound per thread) differ by
  * role, so admin and guest turns MUST run on separate threads. The caller
  * namespaces the session key by `role` when `split` to keep a guest from ever
@@ -264,6 +331,26 @@ export async function updateProject(
       else target[k] = v;
     }
     await write(projects);
+  });
+}
+
+/** Rename a project registry key. Used by private child groups whose visible
+ * chat title can be changed after creation. The bound chat_id/cwd stay stable. */
+export async function renameProject(oldName: string, newName: string): Promise<Project | undefined> {
+  const targetName = newName.trim();
+  if (!targetName) throw new Error('项目名不能为空');
+
+  return withLock(async () => {
+    const projects = await read();
+    const p = projects.find((x) => x.name === oldName);
+    if (!p) return undefined;
+    if (p.name === targetName) return p;
+    if (projects.some((x) => x.name === targetName)) {
+      throw new Error(`项目名「${targetName}」已存在`);
+    }
+    p.name = targetName;
+    await write(projects);
+    return p;
   });
 }
 

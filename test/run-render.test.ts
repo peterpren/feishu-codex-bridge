@@ -95,6 +95,11 @@ describe('reduce', () => {
     expect(s.terminal).toBe('error');
     expect(s.errorMsg).toBe('boom');
   });
+
+  it('captures context usage for the run card gauge', () => {
+    const s = run([{ type: 'context_usage', usedTokens: 70, contextWindow: 100 }]);
+    expect(s.usage).toEqual({ used: 70, window: 100 });
+  });
 });
 
 describe('buildRunCard', () => {
@@ -167,6 +172,17 @@ describe('buildRunCard — terminal collapse', () => {
     expect(els.some((e) => e.tag === 'markdown' && e.content === 'partial ans')).toBe(true);
     expect(JSON.stringify(els)).toContain('已被中断');
     expect(JSON.stringify(els)).not.toContain('终止');
+  });
+
+  it('explains shutdown-interrupted runs instead of implying a user stop', () => {
+    let rs = run([{ type: 'text_delta', itemId: 'a', delta: 'partial ans' }]);
+    rs = markInterrupted(rs, 'shutdown');
+    const json = JSON.stringify(bodyEls(buildRunCard({ rs, cardKey: 'm1' })));
+
+    expect(json).toContain('后台服务重启/关闭');
+    expect(json).toContain('请重新发送指令');
+    expect(json).not.toContain('⏹ 已被中断');
+    expect(json).not.toContain('终止');
   });
 
   it('folds process and shows the error note when the agent fails', () => {

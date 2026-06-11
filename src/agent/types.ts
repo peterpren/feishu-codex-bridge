@@ -112,6 +112,8 @@ export type AgentEvent =
   | { type: 'tool_use'; itemId: string; title: string; detail?: string }
   | { type: 'tool_result'; itemId: string; output?: string; exitCode?: number | null }
   | { type: 'usage'; inputTokens?: number; outputTokens?: number }
+  | { type: 'context_usage'; usedTokens: number; contextWindow: number | null }
+  | { type: 'context_compacted' }
   | { type: 'done'; turnId: string }
   | { type: 'error'; message: string; willRetry: boolean };
 
@@ -119,6 +121,11 @@ export interface AgentRun {
   events: AsyncIterable<AgentEvent>;
   /** current turn id, available after `turn_started` */
   turnId(): string | undefined;
+}
+
+export interface CompactResult {
+  compacted: boolean;
+  usage: { usedTokens: number; contextWindow: number | null } | null;
 }
 
 /** Per-turn overrides (apply to this turn and persist for subsequent turns). */
@@ -136,8 +143,19 @@ export interface AgentThread {
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */
   abort(turnId: string): Promise<void>;
+  /** summarize older context and resolve after the background compaction finishes */
+  compact(): Promise<CompactResult>;
   /** terminate the underlying app-server process */
   close(): Promise<void>;
+}
+
+export interface McpServerConfig {
+  name: string;
+  url: string;
+  bearerTokenEnvVar?: string;
+  bearerTokenSecretId?: string;
+  enabled?: boolean;
+  title?: string;
 }
 
 export interface StartThreadOptions {
@@ -152,6 +170,10 @@ export interface StartThreadOptions {
   network?: boolean;
   /** default Feishu Drive folder for docs created by this thread */
   cloudDocFolder?: CloudDocFolder;
+  /** Codex built-in auto context compaction. Undefined = keep Codex default. */
+  autoCompact?: boolean;
+  /** Project-scoped MCP servers injected into this app-server process. */
+  mcpServers?: McpServerConfig[];
 }
 
 export interface ResumeThreadOptions extends StartThreadOptions {

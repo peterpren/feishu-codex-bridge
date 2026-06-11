@@ -47,6 +47,10 @@ export interface RunState {
   errorMsg?: string;
   /** set when terminal === 'idle_timeout' — minutes idle before watchdog gave up */
   idleTimeoutMinutes?: number;
+  /** why an interrupted run stopped; user clicks and bridge shutdown need different copy. */
+  interruptedReason?: 'user' | 'shutdown';
+  /** latest context-window usage from Codex; shown only when it crosses a warning tier. */
+  usage?: { used: number; window: number | null };
 }
 
 export const initialState: RunState = {
@@ -173,6 +177,9 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
       return { ...state, blocks };
     }
 
+    case 'context_usage':
+      return { ...state, usage: { used: evt.usedTokens, window: evt.contextWindow } };
+
     case 'error':
       return { ...state, terminal: 'error', errorMsg: evt.message, footer: null };
 
@@ -190,13 +197,14 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
   }
 }
 
-export function markInterrupted(state: RunState): RunState {
+export function markInterrupted(state: RunState, reason: RunState['interruptedReason'] = 'user'): RunState {
   return {
     ...state,
     blocks: closeStreamingText(state.blocks),
     reasoningActive: false,
     terminal: 'interrupted',
     footer: null,
+    interruptedReason: reason,
   };
 }
 

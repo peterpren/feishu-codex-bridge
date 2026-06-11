@@ -1,6 +1,7 @@
 import { ensureOnboarded, confirmReadyForDaemon } from '../../bot/onboarding';
 import { activeBots, loadBots } from '../../config/bots';
 import { getServiceAdapter, type ServiceStatus } from '../../service/adapter';
+import { markRestartIntent } from '../../service/restart-notice';
 
 /**
  * Daemon lifecycle. `start` installs ONE launchd/systemd/login service whose
@@ -63,6 +64,7 @@ export async function runStop(): Promise<void> {
 }
 
 export async function runRestart(): Promise<void> {
+  await markRestartIntent('manual_restart').catch(() => undefined);
   const status = await getServiceAdapter().restart();
   console.log('✓ 后台服务已重启。');
   printStatus(status);

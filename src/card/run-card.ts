@@ -19,6 +19,11 @@ import {
 } from './run-state';
 import { renderRichText } from './markdown-render';
 import { toolBodyMd, toolHeaderText } from './tool-render';
+import { runCardGauge } from './context-gauge';
+
+function gaugeEl(state: RunState): CardElement | null {
+  return state.usage ? runCardGauge(state.usage.used, state.usage.window) : null;
+}
 
 /** Action ids for the in-topic run card. */
 export const RC = {
@@ -118,6 +123,8 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
 
   if (state.footer) elements.push(footerStatus(state.footer));
   if (rc.cardKey) elements.push(actions([button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger')]));
+  const gauge = gaugeEl(state);
+  if (gauge) elements.push(gauge);
   return elements;
 }
 
@@ -159,7 +166,13 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   if (answer) elements.push(...renderRichText(answer, rc.images));
 
   if (state.terminal === 'interrupted') {
-    elements.push(noteMd('_⏹ 已被中断_'));
+    elements.push(
+      noteMd(
+        state.interruptedReason === 'shutdown'
+          ? '_后台服务重启/关闭，本轮已中断。请重新发送指令。_'
+          : '_⏹ 已被中断_',
+      ),
+    );
   } else if (state.terminal === 'idle_timeout') {
     elements.push(noteMd(`_⏱ ${state.idleTimeoutMinutes ?? 0} 分钟无响应，已自动终止_`));
   } else if (state.terminal === 'error' && state.errorMsg) {
@@ -168,6 +181,8 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
     elements.push(noteMd('_（未返回内容）_'));
   }
 
+  const gauge = gaugeEl(state);
+  if (gauge) elements.push(gauge);
   return elements;
 }
 

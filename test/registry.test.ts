@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { cloudDocFolderLabel, defaultNoMention, parseCloudDocFolder } from '../src/project/registry';
+import {
+  enabledProjectMcpServers,
+  cloudDocFolderLabel,
+  defaultNoMention,
+  foodMcpEnabled,
+  parseCloudDocFolder,
+  withFoodMcpServers,
+  withoutFoodMcpServers,
+} from '../src/project/registry';
 
 describe('defaultNoMention', () => {
   it('multi-topic groups default 免@ off', () => {
@@ -37,5 +45,27 @@ describe('parseCloudDocFolder', () => {
     expect(parseCloudDocFolder('fldcnXYZ_123')?.token).toBe('fldcnXYZ_123');
     expect(parseCloudDocFolder('')).toBeUndefined();
     expect(() => parseCloudDocFolder('我的空间/项目文档')).toThrow('文件夹 URL');
+  });
+});
+
+describe('food MCP project helpers', () => {
+  it('adds and removes the official Luckin/McDonald servers', () => {
+    const enabled = withFoodMcpServers([{ name: 'other', url: 'https://example.com/mcp' }]);
+
+    expect(foodMcpEnabled({ mcpServers: enabled })).toBe(true);
+    expect(enabledProjectMcpServers({ mcpServers: enabled }).map((server) => server.name)).toEqual([
+      'other',
+      'luckin-coffee',
+      'mcd-mcp',
+    ]);
+    expect(withoutFoodMcpServers(enabled)).toEqual([{ name: 'other', url: 'https://example.com/mcp' }]);
+  });
+
+  it('keeps token references as environment variable names only', () => {
+    const enabled = withFoodMcpServers(undefined);
+
+    expect(enabled.map((server) => server.bearerTokenEnvVar)).toEqual(['LUCKIN_MCP_TOKEN', 'MCD_MCP_TOKEN']);
+    expect(enabled.map((server) => server.bearerTokenSecretId)).toEqual(['mcp:LUCKIN_MCP_TOKEN', 'mcp:MCD_MCP_TOKEN']);
+    expect(JSON.stringify(enabled)).not.toContain('Bearer ');
   });
 });

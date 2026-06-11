@@ -1,7 +1,20 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { mkdir } from 'node:fs/promises';
 import { log } from '../core/logger';
-import { addProject, getProjectByChatId, getProjectByName, updateProject, type CloudDocFolder, type Project } from './registry';
+import {
+  DEFAULT_ADMIN_MODE,
+  DEFAULT_GUEST_MODE,
+  DEFAULT_NETWORK,
+  addProject,
+  effectiveGuestMode,
+  effectiveMode,
+  effectiveNetwork,
+  getProjectByChatId,
+  getProjectByName,
+  updateProject,
+  type CloudDocFolder,
+  type Project,
+} from './registry';
 import type { PermissionMode } from '../agent/types';
 import { grantProjectCloudDocFolderAccess, permissionRecord } from './cloud-doc-permission';
 import { setAnnouncement } from './announcement';
@@ -19,9 +32,11 @@ export interface CreateProjectInput {
   workspaceRoot?: string;
   /** session model for the group (default 'multi'). */
   kind?: 'multi' | 'single';
-  /** permission tier (default 'full' for self-created projects). */
+  /** permission tier for owner/admins (default 'full'). */
   mode?: PermissionMode;
-  /** allow the sandboxed shell to reach the network (default false). */
+  /** permission tier for ordinary members (default 'write'). */
+  guestMode?: PermissionMode;
+  /** allow the sandboxed shell to reach the network (default true). */
   network?: boolean;
   /** default Feishu Drive folder for cloud docs created in this project */
   cloudDocFolder?: CloudDocFolder;
@@ -44,9 +59,11 @@ export interface JoinGroupInput {
   workspaceRoot?: string;
   /** session model for the group (default 'multi'). */
   kind?: 'multi' | 'single';
-  /** permission tier (default 'qa' — read-only — for joined external groups). */
+  /** permission tier for owner/admins (default 'full'). */
   mode?: PermissionMode;
-  /** allow the sandboxed shell to reach the network (default false). */
+  /** permission tier for ordinary members (default 'write'). */
+  guestMode?: PermissionMode;
+  /** allow the sandboxed shell to reach the network (default true). */
   network?: boolean;
   /** default Feishu Drive folder for cloud docs created in this project */
   cloudDocFolder?: CloudDocFolder;
@@ -119,8 +136,9 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     createdAt: Date.now(),
     kind: input.kind ?? 'multi',
     origin: 'created',
-    mode: input.mode ?? 'full',
-    network: input.network ?? false,
+    mode: input.mode ?? DEFAULT_ADMIN_MODE,
+    guestMode: input.guestMode ?? DEFAULT_GUEST_MODE,
+    network: input.network ?? DEFAULT_NETWORK,
     ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
@@ -168,8 +186,9 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     kind: input.kind ?? 'multi',
     origin: 'joined',
     addedBy: input.addedBy,
-    mode: input.mode ?? 'qa',
-    network: input.network ?? false,
+    mode: input.mode ?? DEFAULT_ADMIN_MODE,
+    guestMode: input.guestMode ?? DEFAULT_GUEST_MODE,
+    network: input.network ?? DEFAULT_NETWORK,
     ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
@@ -234,10 +253,11 @@ export async function createPrivateProject(channel: LarkChannel, input: CreatePr
     kind: 'single',
     noMention: false,
     origin: 'created',
-    mode: input.parent.mode,
-    guestMode: input.parent.guestMode,
-    network: input.parent.network,
+    mode: effectiveMode(input.parent),
+    guestMode: effectiveGuestMode(input.parent),
+    network: effectiveNetwork(input.parent),
     cloudDocFolder: input.parent.cloudDocFolder,
+    ...(input.parent.mcpServers?.length ? { mcpServers: input.parent.mcpServers.map((server) => ({ ...server })) } : {}),
     private: true,
     parentChatId: input.parent.chatId,
     parentProjectName: input.parent.name,

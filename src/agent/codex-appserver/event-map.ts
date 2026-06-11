@@ -23,6 +23,14 @@ export function mapNotification(n: ServerNotification): AgentEvent | null {
       return mapItemStart(n.params.item);
     case 'item/completed':
       return mapItemComplete(n.params.item);
+    case 'thread/tokenUsage/updated':
+      return {
+        type: 'context_usage',
+        usedTokens: n.params.tokenUsage.last.totalTokens,
+        contextWindow: n.params.tokenUsage.modelContextWindow,
+      };
+    case 'thread/compacted':
+      return { type: 'context_compacted' };
     case 'turn/completed':
       return { type: 'done', turnId: n.params.turn.id };
     case 'error':

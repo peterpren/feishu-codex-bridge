@@ -126,4 +126,16 @@ describe('run-store', () => {
     expect(bridge.failureClass).toBe('bridge_error');
     expect(bridge.mainReason).toBe('Bridge 运行异常：card update failed');
   });
+
+  it('summarizes shutdown-interrupted runs as bridge-side interruptions', () => {
+    const rec = finishedRunRecord(ctx(), {
+      terminal: 'interrupted',
+      endedAt: '2026-06-06T15:00:05.000Z',
+      state: { ...initialState, terminal: 'interrupted', interruptedReason: 'shutdown' },
+    });
+
+    expect(rec.status).toBe('interrupted');
+    expect(rec.failureClass).toBe('bridge_error');
+    expect(rec.mainReason).toBe('后台服务重启/关闭中断了本轮运行');
+  });
 });

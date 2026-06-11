@@ -1,6 +1,8 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { getSecret } from '../../config/keystore';
 import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
 import { log } from '../../core/logger';
+import type { McpServerConfig } from '../types';
 import type { ServerNotification } from './protocol';
 
 /** Simple async queue: push() from the reader, async-iterate from consumers. */
@@ -44,6 +46,48 @@ export interface AppServerClientOptions {
   cwd: string;
   env?: Record<string, string>;
   clientName?: string;
+  mcpServers?: McpServerConfig[];
+}
+
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+export function mcpServerConfigArgs(servers: readonly McpServerConfig[] | undefined): string[] {
+  const args: string[] = [];
+  for (const server of servers ?? []) {
+    if (server.enabled === false) continue;
+    const name = server.name.trim();
+    const url = server.url.trim();
+    if (!name || !url) continue;
+    if (!MCP_SERVER_NAME_RE.test(name)) {
+      throw new Error(`MCP server name "${name}" can only contain letters, numbers, "_" and "-"`);
+    }
+    args.push('-c', `mcp_servers.${name}.url=${tomlString(url)}`);
+    const bearerTokenEnvVar = server.bearerTokenEnvVar?.trim();
+    if (bearerTokenEnvVar) {
+      args.push('-c', `mcp_servers.${name}.bearer_token_env_var=${tomlString(bearerTokenEnvVar)}`);
+    }
+  }
+  return args;
+}
+
+async function mcpServerSecretEnv(servers: readonly McpServerConfig[] | undefined): Promise<Record<string, string>> {
+  const env: Record<string, string> = {};
+  for (const server of servers ?? []) {
+    if (server.enabled === false) continue;
+    const envVar = server.bearerTokenEnvVar?.trim();
+    const secretId = server.bearerTokenSecretId?.trim();
+    if (!envVar || !secretId || process.env[envVar]) continue;
+    const value = await getSecret(secretId).catch((err) => {
+      log.warn('agent', 'mcp-secret-read-failed', { server: server.name, secretId, err: String(err).slice(0, 160) });
+      return undefined;
+    });
+    if (value) env[envVar] = value;
+  }
+  return env;
 }
 
 /**
@@ -70,13 +114,15 @@ export class AppServerClient {
     // Launch via cross-spawn (platform/spawn) so a Windows `.cmd` codex shim
     // runs instead of throwing EINVAL (CVE-2024-27980). With stdio all-piped the
     // streams are non-null, so the cast to *WithoutNullStreams is sound.
-    const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
+    const mcpArgs = mcpServerConfigArgs(this.opts.mcpServers);
+    const mcpEnv = await mcpServerSecretEnv(this.opts.mcpServers);
+    const child = spawnProcess(this.opts.bin, ['app-server', ...mcpArgs, '--listen', 'stdio://'], {
       cwd: this.opts.cwd,
-      env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
+      env: mergeProcessEnv(process.env, { ...mcpEnv, ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ChildProcessWithoutNullStreams;
     this.child = child;
-    log.info('agent', 'spawn', { pid: child.pid ?? null, cwd: this.opts.cwd });
+    log.info('agent', 'spawn', { pid: child.pid ?? null, cwd: this.opts.cwd, mcp: (this.opts.mcpServers ?? []).map((s) => s.name) });
 
     child.stdout.on('data', (d: Buffer) => this.onStdout(d));
     child.stderr.on('data', (d: Buffer) => {

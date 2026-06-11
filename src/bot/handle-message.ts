@@ -38,6 +38,13 @@ import { buildHistoryCard, type HistoryCardState } from '../card/history-card';
 import { buildPrivateCreatedCard, buildPrivateIntroCard } from '../card/private-cards';
 import { ANSWER_EID, buildRunCard, buildRunCardPlain, RC, type RunCardState } from '../card/run-card';
 import { RunCardStream } from '../card/run-card-stream';
+import {
+  buildAutoCompactCard,
+  buildCompactFailedCard,
+  buildCompactedCard,
+  buildCompactingCard,
+  buildContextCard,
+} from '../card/context-gauge';
 import { buildCleanCard, extractCardFences } from '../card/markdown-render';
 import { imageSources, uploadOutboundImages } from '../card/outbound-images';
 import { log, withTrace } from '../core/logger';
@@ -84,6 +91,7 @@ import {
   restartDaemon,
   updateSourceLabel,
 } from '../service/update';
+import { recordRestartInterruptedRuns, type RestartInterruptedRun } from '../service/restart-notice';
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
 import { getSecret } from '../config/keystore';
@@ -91,20 +99,26 @@ import { buildScopeGrantUrl, CLOUD_DOC_FOLDER_SCOPES, JOIN_GROUP_SCOPES } from '
 import { validateAppCredentials } from '../utils/feishu-auth';
 import {
   defaultNoMention,
+  effectiveMode,
+  effectiveNetwork,
+  enabledProjectMcpServers,
   getProjectByChatId,
   getProjectByName,
   listProjects,
   parseCloudDocFolder,
+  renameProject,
   removeProject,
   turnTier,
   updateProject,
+  withFoodMcpServers,
+  withoutFoodMcpServers,
   type CloudDocFolder,
   type Project,
 } from '../project/registry';
 import { isIsolatedTopicWorkspace, prepareSessionCwd } from '../project/topic-workspace';
 import { createPrivateProject, createProject, joinExistingGroup } from '../project/lifecycle';
 import { normalizeWorkspaceRoot } from '../project/workspace-root';
-import { refreshBranch } from '../project/announcement';
+import { refreshBranch, setAnnouncement } from '../project/announcement';
 import {
   createTopicCloudDocFolder,
   grantProjectCloudDocFolderAccess,
@@ -112,7 +126,7 @@ import {
   permissionRecord,
   renameTopicCloudDocFolder,
 } from '../project/cloud-doc-permission';
-import { leaveChat, transferOwnership } from '../project/group-ops';
+import { leaveChat, renameChat, transferOwnership } from '../project/group-ops';
 import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
 import {
   appendRunRecord,
@@ -137,6 +151,7 @@ import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, t
 import {
   mentionedPrivateParticipants,
   parsePrivateTaskText,
+  privateProjectName,
   privateSourcePrompt,
   type PrivateParticipant,
 } from '../project/private-project';
@@ -256,6 +271,10 @@ interface ActiveState {
    * while a run is in flight; codex emits no mappable terminal on interrupt, so
    * the loop must be stopped locally rather than waiting on the backend. */
   interrupt?: () => void;
+  interruptReason?: RunState['interruptedReason'];
+  /** Persisted during shutdown so the restarted bridge can notify the original
+   * requester in the same Feishu topic/message node. */
+  restartNotice?: RestartInterruptedRun;
 }
 
 /** Message-reaction lifecycle controller (see {@link runReaction}). */
@@ -330,7 +349,18 @@ export function createOrchestrator(
   const runStreams = new Map<string, RunCardStream>();
   /** the latest settings-bearing run card per topic thread */
   const lastRunCard = new Map<string, string>();
+  const lastUsage = new Map<string, { used: number; window: number | null }>();
+  const launchPromises = new Set<Promise<unknown>>();
   let modelsCache: ModelInfo[] | null = null;
+
+  function trackLaunch<T>(promise: Promise<T>): Promise<T> {
+    launchPromises.add(promise);
+    promise.then(
+      () => launchPromises.delete(promise),
+      () => launchPromises.delete(promise),
+    );
+    return promise;
+  }
 
   async function listModels(): Promise<ModelInfo[]> {
     if (!modelsCache) modelsCache = await backend.listModels();
@@ -588,7 +618,7 @@ export function createOrchestrator(
     // Commands: /settings (群设置) + /model. /resume has no topic list here.
     if ((project?.kind ?? 'multi') === 'single') {
       if (cmd === 'help') {
-        await postHelpCard(msg, 'single', false, project);
+        await postHelpCard(msg, project.private ? 'private' : 'single', false, project);
         return;
       }
       if (cmd === 'settings') {
@@ -600,7 +630,19 @@ export function createOrchestrator(
         await postModelCard(msg, ts.sessionKey);
         return;
       }
+      if (cmd === 'context') {
+        await postContextCard(msg, ts.sessionKey, false);
+        return;
+      }
+      if (cmd === 'compact') {
+        await runCompact(msg, ts.sessionKey, false, ts);
+        return;
+      }
       if (cmd === 'rename') {
+        if (project.private) {
+          await renamePrivateProject(msg, text, project);
+          return;
+        }
         await channel
           .send(msg.chatId, { markdown: '`/rename 新名字` 只适用于多话题群里的具体话题。' }, { replyTo: msg.messageId })
           .catch(() => undefined);
@@ -634,6 +676,14 @@ export function createOrchestrator(
         await postModelCard(msg, ts.sessionKey);
         return;
       }
+      if (cmd === 'context') {
+        await postContextCard(msg, ts.sessionKey, true);
+        return;
+      }
+      if (cmd === 'compact') {
+        await runCompact(msg, ts.sessionKey, true, ts);
+        return;
+      }
       if (cmd === 'rename') {
         await renameTopic(msg, text);
         return;
@@ -660,9 +710,9 @@ export function createOrchestrator(
       startPrivateGroup(msg, text, project);
       return;
     }
-    if (cmd === 'model') {
+    if (cmd === 'model' || cmd === 'context' || cmd === 'compact') {
       await channel
-        .send(msg.chatId, { markdown: '`/model` 需要在话题里使用（先 @我 开个话题）。' }, { replyTo: msg.messageId })
+        .send(msg.chatId, { markdown: `\`/${cmd}\` 需要在话题里使用（先 @我 开个话题）。` }, { replyTo: msg.messageId })
         .catch(() => undefined);
       return;
     }
@@ -675,11 +725,18 @@ export function createOrchestrator(
     startTopicDirectly(msg, text, project);
   };
 
-  /** Parse a leading slash command (`/resume`, `/model`, `/settings`, `/rename`, `/private`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'rename' | 'private' | null {
+  /** Parse a leading slash command; null otherwise. */
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'rename' | 'private' | 'context' | 'compact' | null {
     const m = /^\/([\w-]+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' || name === 'rename' || name === 'private'
+    return name === 'resume' ||
+      name === 'model' ||
+      name === 'settings' ||
+      name === 'help' ||
+      name === 'rename' ||
+      name === 'private' ||
+      name === 'context' ||
+      name === 'compact'
       ? name
       : null;
   }
@@ -736,7 +793,12 @@ export function createOrchestrator(
 
   /** @bot /settings in a group: post the in-group settings card (owner/admin-gated). */
   async function postGroupSettings(msg: NormalizedMessage, project?: Project): Promise<void> {
-    if (!isAdmin(cfg, msg.senderId)) {
+    if (project && !(await canManageProjectSettings(project, msg.senderId))) {
+      const reason = project.private ? '仅私密群发起人或管理员可用。' : '仅 bot 管理员可用。';
+      await channel.send(msg.chatId, { markdown: `⚠️ \`/settings\` ${reason}` }, { replyTo: msg.messageId }).catch(() => undefined);
+      return;
+    }
+    if (!project && !isAdmin(cfg, msg.senderId)) {
       await denyAdminCommand(msg, 'settings');
       return;
     }
@@ -752,16 +814,29 @@ export function createOrchestrator(
     });
   }
 
+  async function privateRequesterOpenId(project: Project): Promise<string | undefined> {
+    if (!project.private) return undefined;
+    const rec = await getSession(project.chatId);
+    return rec?.topicRequesterOpenId ?? project.participants?.[0];
+  }
+
+  async function canManageProjectSettings(project: Project, openId: string | undefined): Promise<boolean> {
+    if (!openId) return false;
+    if (isAdmin(cfg, openId)) return true;
+    if (!project.private) return false;
+    return (await privateRequesterOpenId(project)) === openId;
+  }
+
   /** A turn's resolved permission, by sender role. `roleSuffix` is set only when
    * the project splits admin/guest tiers — then the session key is namespaced by
    * it so a guest never shares the admin thread (sandbox + codex history). */
-  type TurnPerm = { mode?: PermissionMode; network?: boolean; roleSuffix?: 'admin' | 'guest' };
+  type TurnPerm = { mode?: PermissionMode; network?: boolean; autoCompact?: boolean; roleSuffix?: 'admin' | 'guest' };
 
   /** Pick this sender's tier (admin vs guest) for `project`. */
   function turnPerm(project: Project | undefined, senderId: string): TurnPerm {
     if (!project) return {};
     const t = turnTier(project, isAdmin(cfg, senderId));
-    return { mode: t.mode, network: project.network, roleSuffix: t.split ? t.role : undefined };
+    return { mode: t.mode, network: effectiveNetwork(project), autoCompact: project.autoCompact, roleSuffix: t.split ? t.role : undefined };
   }
 
   /** As {@link turnPerm}, plus the role-namespaced session key (only namespaced
@@ -924,7 +999,7 @@ export function createOrchestrator(
           runCloudDocFolderError = cloudDoc.cloudDocFolderError;
           rec = await getSession(sessionKey);
         }
-        let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network });
+        let thread = await resolveThread(sessionKey, msg.chatId, { mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
         const freshSession = !thread || recreatedSessions.delete(sessionKey);
         let sessionCwd = rec?.cwd;
         if (!thread) {
@@ -947,7 +1022,9 @@ export function createOrchestrator(
             cwd,
             mode: perm.mode,
             network: perm.network,
+            autoCompact: perm.autoCompact,
             cloudDocFolder: cloudDoc.cloudDocFolder,
+            mcpServers: enabledProjectMcpServers(project),
           });
           sessions.set(sessionKey, thread);
           runCloudDocFolder = cloudDoc.cloudDocFolder;
@@ -977,7 +1054,7 @@ export function createOrchestrator(
         const runInput = { ...rawInput, text: firstText };
         const input = withCloudDocFolderHint(runInput, runCloudDocFolder, runCloudDocFolderError, needsCloudDoc);
         reserved.thread = thread;
-        await launchRun(
+        await trackLaunch(launchRun(
           {
             chatId: msg.chatId,
             replyTo: msg.messageId,
@@ -994,7 +1071,7 @@ export function createOrchestrator(
             requesterOpenId: msg.senderId,
           },
           reaction,
-        );
+        ));
       } catch (err) {
         active.delete(sessionKey); // release the reservation so the session isn't wedged
         reaction.done();
@@ -1017,7 +1094,7 @@ export function createOrchestrator(
   async function resolveThread(
     threadId: string,
     chatId: string,
-    perm?: { mode?: PermissionMode; network?: boolean },
+    perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
   ): Promise<AgentThread | undefined> {
     const live = sessions.get(threadId);
     if (live) return live;
@@ -1058,7 +1135,9 @@ export function createOrchestrator(
         serviceTier: rec.serviceTier,
         mode: perm?.mode,
         network: perm?.network,
+        autoCompact: perm?.autoCompact,
         cloudDocFolder: cloudDoc.cloudDocFolder,
+        mcpServers: enabledProjectMcpServers(project),
       });
       sessions.set(threadId, resumed);
       return resumed;
@@ -1070,9 +1149,11 @@ export function createOrchestrator(
         model: rec.model,
         effort: rec.effort,
         serviceTier: rec.serviceTier,
-        mode: perm?.mode ?? project?.mode,
-        network: perm?.network ?? project?.network,
+        mode: perm?.mode ?? (project ? effectiveMode(project) : undefined),
+        network: perm?.network ?? (project ? effectiveNetwork(project) : undefined),
+        autoCompact: perm?.autoCompact ?? project?.autoCompact,
         cloudDocFolder: cloudDoc.cloudDocFolder,
+        mcpServers: enabledProjectMcpServers(project),
       });
       sessions.set(threadId, fresh);
       recreatedSessions.add(threadId);
@@ -1139,7 +1220,9 @@ export function createOrchestrator(
           serviceTier,
           mode: perm.mode,
           network: perm.network,
+          autoCompact: perm.autoCompact,
           cloudDocFolder: cloudDoc.cloudDocFolder,
+          mcpServers: enabledProjectMcpServers(project),
         });
       } catch (err) {
         reaction.done();
@@ -1163,7 +1246,7 @@ export function createOrchestrator(
         cloudDocFolder: cloudDoc.cloudDocFolder?.token ?? null,
         cloudDocFolderError: cloudDoc.cloudDocFolderError ?? null,
       });
-      await launchRun(
+      await trackLaunch(launchRun(
         {
           chatId: msg.chatId,
           replyTo: msg.messageId,
@@ -1188,7 +1271,7 @@ export function createOrchestrator(
         },
         reaction,
         () => reaction.done(), // topic created → ✅ DONE (don't wait for the reply)
-      );
+      ));
     }).catch((err) => log.fail('intake', err));
   }
 
@@ -1253,7 +1336,9 @@ export function createOrchestrator(
           serviceTier,
           mode: perm.mode,
           network: perm.network,
+          autoCompact: perm.autoCompact,
           cloudDocFolder: cloudDoc.cloudDocFolder,
+          mcpServers: enabledProjectMcpServers(privateProject),
         });
         sessions.set(privateProject.chatId, thread);
 
@@ -1300,25 +1385,27 @@ export function createOrchestrator(
           failedParticipants: failedParticipants.length,
           cloudDocFolder: cloudDoc.cloudDocFolder?.token ?? null,
         });
-        void launchRun({
-          chatId: privateProject.chatId,
-          replyTo: intro.messageId,
-          flat: true,
-          knownThreadId: privateProject.chatId,
-          thread,
-          firstText: input.text ?? sourceText,
-          images: input.images,
-          model,
-          effort,
-          serviceTier,
-          cwd: privateProject.cwd,
-          projectName: privateProject.name,
-          summary: title,
-          cloudDocFolder: cloudDoc.cloudDocFolder,
-          cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
-          requesterOpenId: msg.senderId,
-          lastSeenAt: msgTime(msg),
-        }).catch((err) => {
+        void trackLaunch(
+          launchRun({
+            chatId: privateProject.chatId,
+            replyTo: intro.messageId,
+            flat: true,
+            knownThreadId: privateProject.chatId,
+            thread,
+            firstText: input.text ?? sourceText,
+            images: input.images,
+            model,
+            effort,
+            serviceTier,
+            cwd: privateProject.cwd,
+            projectName: privateProject.name,
+            summary: title,
+            cloudDocFolder: cloudDoc.cloudDocFolder,
+            cloudDocFolderError: cloudDoc.cloudDocFolder ? '' : cloudDoc.cloudDocFolderError,
+            requesterOpenId: msg.senderId,
+            lastSeenAt: msgTime(msg),
+          }),
+        ).catch((err) => {
           active.delete(privateProject.chatId);
           log.fail('intake', err, { phase: 'private-launch' });
         });
@@ -1433,6 +1520,93 @@ export function createOrchestrator(
     });
   }
 
+  async function postContextCard(msg: NormalizedMessage, sessionKey: string, inThread: boolean): Promise<void> {
+    const u = lastUsage.get(sessionKey);
+    await sendManagedCard(channel, msg.chatId, buildContextCard(u?.used ?? 0, u?.window ?? null), msg.messageId, inThread).catch(
+      (err) => log.fail('card', err, { phase: 'context' }),
+    );
+  }
+
+  const COMPACT_ANIM_INTERVAL_MS = 800;
+
+  async function runCompact(
+    msg: NormalizedMessage,
+    sessionKey: string,
+    inThread: boolean,
+    perm: TurnPerm,
+  ): Promise<void> {
+    const reply = (markdown: string): Promise<void> =>
+      channel
+        .send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: inThread })
+        .then(() => undefined, () => undefined);
+
+    if (active.get(sessionKey)) {
+      await reply('⏳ 这一轮还在跑，结束后再 `/compact`。');
+      return;
+    }
+    const thread = await resolveThread(sessionKey, msg.chatId, {
+      mode: perm.mode,
+      network: perm.network,
+      autoCompact: perm.autoCompact,
+    });
+    if (!thread) {
+      await reply('这个会话还没开始，先发条消息聊两句再 `/compact`。');
+      return;
+    }
+
+    let cardMsgId: string | undefined;
+    try {
+      const sent = await sendManagedCard(channel, msg.chatId, buildCompactingCard(0), msg.messageId, inThread);
+      cardMsgId = sent.messageId;
+    } catch (err) {
+      log.fail('card', err, { phase: 'compact-start-card' });
+    }
+
+    let stop = false;
+    const wakers: Array<() => void> = [];
+    const sleep = (ms: number): Promise<void> =>
+      new Promise((resolveSleep) => {
+        const t = setTimeout(resolveSleep, ms);
+        wakers.push(() => {
+          clearTimeout(t);
+          resolveSleep();
+        });
+      });
+    const anim = (async () => {
+      let tick = 0;
+      while (!stop && cardMsgId) {
+        await sleep(COMPACT_ANIM_INTERVAL_MS);
+        if (stop || !cardMsgId) break;
+        tick++;
+        await updateManagedCard(channel, cardMsgId, buildCompactingCard(tick)).catch(() => undefined);
+      }
+    })();
+
+    const settle = async (result: object): Promise<void> => {
+      stop = true;
+      wakers.forEach((w) => w());
+      await anim;
+      if (cardMsgId && (await updateManagedCard(channel, cardMsgId, result))) return;
+      await sendManagedCard(channel, msg.chatId, result, msg.messageId, inThread).catch((err) =>
+        log.fail('card', err, { phase: 'compact-settle' }),
+      );
+    };
+
+    const before = lastUsage.get(sessionKey) ?? null;
+    try {
+      const { usage } = await thread.compact();
+      if (usage) lastUsage.set(sessionKey, { used: usage.usedTokens, window: usage.contextWindow });
+      else lastUsage.delete(sessionKey);
+      log.info('intake', 'compact', { sessionKey, used: usage?.usedTokens ?? null, before: before?.used ?? null });
+      await settle(buildCompactedCard(usage, before));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const unsupported = /method not found|-32601|unknown (method|request)|compact/i.test(message);
+      log.fail('intake', err, { phase: 'compact' });
+      await settle(buildCompactFailedCard(unsupported ? '当前 Codex 版本不支持 /compact，请升级后再试。' : message));
+    }
+  }
+
   async function renameTopic(msg: NormalizedMessage, text: string): Promise<void> {
     const threadId = msg.threadId;
     if (!threadId) return;
@@ -1513,6 +1687,70 @@ export function createOrchestrator(
     }
   }
 
+  async function renamePrivateProject(msg: NormalizedMessage, text: string, project: Project): Promise<void> {
+    if (!(await canManageProjectSettings(project, msg.senderId))) {
+      await channel
+        .send(msg.chatId, { markdown: '⚠️ `/rename` 仅私密群发起人或管理员可用。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
+
+    const title = parseRenameTitle(text);
+    if (!title) {
+      await channel.send(msg.chatId, { markdown: '用法：`/rename 新私密群名`' }, { replyTo: msg.messageId }).catch(() => undefined);
+      return;
+    }
+
+    try {
+      const rec = await getSession(project.chatId);
+      await renameChat(channel, project.chatId, title);
+
+      const sourceId = project.sourceThreadId ?? project.sourceMessageId ?? project.chatId;
+      const registryName = project.parentProjectName
+        ? privateProjectName({ name: project.parentProjectName }, title, sourceId)
+        : title;
+      const renamedProject = (await renameProject(project.name, registryName)) ?? { ...project, name: registryName };
+
+      const sessionPatch: Partial<Omit<SessionRecord, 'threadId'>> = {
+        summary: title,
+        topicTitle: title,
+      };
+      let folderRenameStatus: 'renamed' | 'failed' | 'none' = 'none';
+      let folderRenameError = '';
+      if (rec?.cloudDocFolder?.token) {
+        const renamed = await renameTopicCloudDocFolder(rec.cloudDocFolder, {
+          title,
+          requesterName: rec.topicRequesterName,
+        });
+        if (renamed.folder) {
+          sessionPatch.cloudDocFolder = renamed.folder;
+          sessionPatch.cloudDocFolderError = '';
+          folderRenameStatus = 'renamed';
+        } else {
+          folderRenameError = renamed.error ?? '私密群云文档目录重命名失败';
+          sessionPatch.cloudDocFolderError = folderRenameError;
+          folderRenameStatus = 'failed';
+        }
+      }
+      await patchSession(project.chatId, sessionPatch);
+      await setAnnouncement(channel, renamedProject).catch((err) => log.fail('project', err, { phase: 'private-rename-announcement' }));
+
+      const tail =
+        folderRenameStatus === 'renamed'
+          ? '\n云文档子文件夹已同步重命名。'
+          : folderRenameStatus === 'failed'
+            ? `\n\n⚠️ 云文档子文件夹重命名失败：${folderRenameError}`
+            : '';
+      await channel.send(msg.chatId, { markdown: `已重命名为：${title}${tail}` }, { replyTo: msg.messageId }).catch(() => undefined);
+      log.info('intake', 'private-rename', { chatId: project.chatId, title, folder: folderRenameStatus });
+    } catch (err) {
+      log.fail('intake', err, { phase: 'private-rename', chatId: project.chatId });
+      await channel
+        .send(msg.chatId, { markdown: `重命名失败：${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+    }
+  }
+
   /** `/help`: post the command cheat-sheet for the caller's current scope. */
   async function postHelpCard(
     msg: NormalizedMessage,
@@ -1521,8 +1759,9 @@ export function createOrchestrator(
     project?: Project,
   ): Promise<void> {
     const noMention = project ? (project.noMention ?? defaultNoMention(project)) : true;
+    const canManageSettings = project ? await canManageProjectSettings(project, msg.senderId) : isAdmin(cfg, msg.senderId);
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
-      await sendManagedCard(channel, msg.chatId, buildHelpCard(scope, noMention, isAdmin(cfg, msg.senderId)), msg.messageId, inThread).catch((err) =>
+      await sendManagedCard(channel, msg.chatId, buildHelpCard(scope, noMention, canManageSettings), msg.messageId, inThread).catch((err) =>
         log.fail('card', err, { cmd: 'help', scope }),
       );
       log.info('card', 'help', { scope });
@@ -1677,7 +1916,25 @@ export function createOrchestrator(
     .on(RC.stop, ({ evt, value }) => {
       const key = typeof value.m === 'string' ? value.m : evt.messageId;
       const st = runsByCard.get(key);
-      if (!st || !runOwnerOrAdmin(evt, st.requesterOpenId)) return;
+      if (!st) {
+        if (!runAllowed(evt)) return;
+        log.info('card', 'stale-run-stop', { key });
+        void channel
+          .send(
+            evt.chatId,
+            { markdown: 'ℹ️ 这张运行卡片已经不在当前后台进程里，通常是后台重启或任务已结束。请重新发送指令。' },
+            { replyTo: evt.messageId },
+          )
+          .catch((err) => log.fail('card', err, { phase: 'stale-run-stop-reply' }));
+        return;
+      }
+      if (!runOwnerOrAdmin(evt, st.requesterOpenId)) {
+        void channel
+          .send(evt.chatId, { markdown: '⚠️ 只有本轮发起人或管理员可以终止这次运行。' }, { replyTo: evt.messageId })
+          .catch((err) => log.fail('card', err, { phase: 'run-stop-denied-reply' }));
+        return;
+      }
+      st.interruptReason = 'user';
       st.interrupt?.();
       log.info('card', 'action', { actionId: 'run.stop', stopped: Boolean(st.interrupt) });
     });
@@ -1982,7 +2239,18 @@ export function createOrchestrator(
     })
     .on(DM.projects, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      patch(evt, renderProjectList);
+      // Project lists are often opened from older console cards in a busy DM.
+      // Posting a fresh card keeps the result visible at the bottom instead of
+      // relying on the mobile client to repaint an older in-place card.
+      void (async () => {
+        try {
+          const card = await renderProjectList();
+          await sendManagedCard(channel, evt.chatId, card);
+          log.info('console', 'projects-list-sent');
+        } catch (e) {
+          log.fail('console', e, { phase: 'projects-list' });
+        }
+      })();
     })
     .on(DM.settings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt, buildSettingsCard(cfg));
@@ -2181,16 +2449,34 @@ export function createOrchestrator(
     })
     // In-group settings: toggle 免@ for the project bound to evt.chatId. Admin-gated.
     .on(GS.setNoMention, ({ evt, value }) => {
-      if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
+      const operatorOpenId = evt.operator?.openId;
       const on = value.v === 'on';
       patch(evt, async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (project) {
+          if (!(await canManageProjectSettings(project, operatorOpenId))) return buildGroupSettingsCard(project);
           await updateProject(project.name, { noMention: on });
           log.info('console', 'group-nomention', { project: project.name, on });
           return buildGroupSettingsCard({ ...project, noMention: on });
         }
+        if (!isAdmin(cfg, operatorOpenId ?? '')) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
         return buildGroupSettingsCard({ name: '本群', kind: 'multi', noMention: on });
+      });
+    })
+    .on(GS.setAutoCompact, ({ evt, value }) => {
+      const operatorOpenId = evt.operator?.openId;
+      const on = value.v === 'on';
+      patch(evt, async () => {
+        const project = await getProjectByChatId(evt.chatId);
+        if (project) {
+          if (!(await canManageProjectSettings(project, operatorOpenId))) return buildGroupSettingsCard(project);
+          await updateProject(project.name, { autoCompact: on });
+          await evictLiveSessionsForChat(project.chatId);
+          log.info('console', 'group-autocompact', { project: project.name, on });
+          return buildGroupSettingsCard({ ...project, autoCompact: on });
+        }
+        if (!isAdmin(cfg, operatorOpenId ?? '')) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
+        return buildGroupSettingsCard({ name: '本群', kind: 'multi', autoCompact: on });
       });
     })
     // ── 权限管理回调（admins 全局 / 项目响应白名单）。均 dmAdmin 门控（私聊管理台）。
@@ -2342,6 +2628,22 @@ export function createOrchestrator(
         return fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
       });
     })
+    .on(DM.foodMcpSet, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      const enabled = value.v === 'on';
+      patch(evt, async () => {
+        const p = await getProjectByName(name);
+        if (!p) return buildDmMenuCard();
+        await updateProject(name, (current) => ({
+          mcpServers: enabled ? withFoodMcpServers(current.mcpServers) : withoutFoodMcpServers(current.mcpServers),
+        }));
+        await evictLiveSessionsForChat(p.chatId);
+        log.info('console', 'food-mcp', { project: name, enabled });
+        const fresh = await getProjectByName(name);
+        return fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
+      });
+    })
     .on(DM.setNoMentionDm, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
@@ -2351,6 +2653,19 @@ export function createOrchestrator(
         if (!p) return buildDmMenuCard();
         await updateProject(name, { noMention: on });
         return buildProjectSettingsCard({ ...p, noMention: on });
+      });
+    })
+    .on(DM.setAutoCompactDm, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      const on = value.v === 'on';
+      patch(evt, async () => {
+        const p = await getProjectByName(name);
+        if (!p) return buildDmMenuCard();
+        await updateProject(name, { autoCompact: on });
+        await evictLiveSessionsForChat(p.chatId);
+        log.info('console', 'project-autocompact', { project: name, on });
+        return buildProjectSettingsCard({ ...p, autoCompact: on });
       });
     })
     // 🔐 权限：打开下拉表单子卡（管理员档 + 普通用户档 + 联网，选完提交）。
@@ -2611,6 +2926,8 @@ export function createOrchestrator(
         const turnEffort = rec?.effort ?? opts.effort;
         const turnServiceTier = rec?.serviceTier ?? opts.serviceTier;
         const turnCwd = opts.cwd ?? rec?.cwd ?? fallbackCwd;
+        const requesterOpenId = opts.requesterOpenId ?? opts.topicRequesterOpenId ?? rec?.topicRequesterOpenId;
+        const requesterName = opts.topicRequesterName ?? rec?.topicRequesterName;
         currentRun = {
           ctx: {
             runId: newRunId(),
@@ -2621,12 +2938,25 @@ export function createOrchestrator(
             projectName: opts.projectName,
             cwd: turnCwd,
             topicTitle: opts.topicTitle ?? rec?.topicTitle,
-            requesterOpenId: opts.requesterOpenId ?? opts.topicRequesterOpenId ?? rec?.topicRequesterOpenId,
-            requesterName: opts.topicRequesterName ?? rec?.topicRequesterName,
+            requesterOpenId,
+            requesterName,
             promptPreview: turnInput.text,
             startedAt: new Date().toISOString(),
           },
           finished: false,
+        };
+        state.restartNotice = {
+          appId: cfg.accounts.app.id,
+          chatId: opts.chatId,
+          replyToMessageId: replyTo,
+          replyInThread,
+          feishuThreadId: feishuThreadIdFromSessionKey(topicThreadId),
+          requesterOpenId,
+          requesterName,
+          projectName: opts.projectName,
+          topicTitle: opts.topicTitle ?? rec?.topicTitle,
+          promptPreview: turnInput.text,
+          startedAt: currentRun.ctx.startedAt,
         };
         await writeRunRecord(startedRunRecord(currentRun.ctx));
         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort, serviceTier: turnServiceTier });
@@ -2657,12 +2987,14 @@ export function createOrchestrator(
               topicThreadId = key;
               rc.threadId = key;
               if (currentRun) currentRun.ctx.feishuThreadId = tid;
+              if (state.restartNotice) state.restartNotice.feishuThreadId = tid;
               await persist(key);
             }
           } else {
             topicThreadId = activeKey;
             rc.threadId = activeKey;
             if (currentRun) currentRun.ctx.feishuThreadId = feishuThreadIdFromSessionKey(activeKey);
+            if (state.restartNotice) state.restartNotice.feishuThreadId = feishuThreadIdFromSessionKey(activeKey);
           }
         };
 
@@ -2672,6 +3004,7 @@ export function createOrchestrator(
         cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(rc), { replyTo, replyInThread });
         curCardKey = cardMsgId;
         if (currentRun) currentRun.ctx.cardMessageId = cardMsgId;
+        if (state.restartNotice) state.restartNotice.cardMessageId = cardMsgId;
         rc.cardKey = cardMsgId;
         runsByCard.set(cardMsgId, state);
         runStreams.set(cardMsgId, stream);
@@ -2731,6 +3064,14 @@ export function createOrchestrator(
           }
           lastEvAt = tEv;
           evCount++;
+          if (et === 'context_usage' && topicThreadId) {
+            const cu = ev as { usedTokens: number; contextWindow: number | null };
+            lastUsage.set(topicThreadId, { used: cu.usedTokens, window: cu.contextWindow });
+          } else if (et === 'context_compacted' && cardMsgId) {
+            void sendManagedCard(channel, opts.chatId, buildAutoCompactCard(), cardMsgId, !opts.flat).catch((err) =>
+              log.fail('card', err, { phase: 'auto-compact-notice' }),
+            );
+          }
           render.apply(ev);
           rc.rs = render.snapshot();
           // Non-blocking: never stall event consumption on a round-trip. The pump
@@ -2740,10 +3081,12 @@ export function createOrchestrator(
         }
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         await stream.drain(); // flush the last coalesced frame before terminal
+        const interruptReason = state.interruptReason ?? 'user';
         state.interrupt = undefined; // turn done; nothing left to interrupt
+        state.interruptReason = undefined;
         const killed = interrupted || timedOut;
         if (timedOut) render.timeout(Math.max(1, Math.round(idleMs / 60_000)));
-        else if (interrupted) render.interrupt();
+        else if (interrupted) render.interrupt(interruptReason);
         else render.finalize();
         rc.rs = render.snapshot();
         if (currentRun) currentRun.state = rc.rs;
@@ -2807,6 +3150,7 @@ export function createOrchestrator(
         }
         await finishCurrentRun(render.terminal());
         currentRun = undefined;
+        state.restartNotice = undefined;
 
         for (const fence of fences) {
           try {
@@ -3116,12 +3460,31 @@ export function createOrchestrator(
   }
 
   async function shutdown(): Promise<void> {
-    const live = [...sessions.values()];
+    const activeStates = [...new Set([...active.values(), ...runsByCard.values()])];
+    const interruptedRuns = activeStates.map((s) => s.restartNotice).filter((r): r is RestartInterruptedRun => Boolean(r));
+    await recordRestartInterruptedRuns(cfg.accounts.app.id, interruptedRuns).catch((err) =>
+      log.warn('bridge', 'restart-runs-record-failed', { err: String(err), runs: interruptedRuns.length }),
+    );
+    for (const st of activeStates) {
+      st.interruptReason = 'shutdown';
+      st.interrupt?.();
+    }
+
+    let drained = launchPromises.size === 0;
+    if (!drained) {
+      drained = await Promise.race([
+        Promise.allSettled([...launchPromises]).then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
+      ]);
+    }
+
+    const activeThreads = activeStates.map((s) => s.thread).filter((t): t is AgentThread => Boolean(t));
+    const live = [...new Set([...sessions.values(), ...activeThreads])];
     sessions.clear();
     // close() SIGKILLs each app-server child; settle all so one hang/throw
     // doesn't block reaping the rest.
     await Promise.allSettled(live.map((t) => t.close()));
-    log.info('bridge', 'shutdown', { closed: live.length });
+    log.info('bridge', 'shutdown', { closed: live.length, active: activeStates.length, drained, pendingLaunches: launchPromises.size });
   }
 
   return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, dispatcher, shutdown };

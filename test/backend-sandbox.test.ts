@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildThreadSessionParams } from '../src/agent/codex-appserver/backend';
+import { mcpServerConfigArgs } from '../src/agent/codex-appserver/app-server-client';
 
 describe('buildThreadSessionParams', () => {
   it('builds thread params with project cwd, permission tier, and cloud-doc guidance', () => {
@@ -31,5 +32,37 @@ describe('buildThreadSessionParams', () => {
     });
 
     expect(params.serviceTier).toBeNull();
+  });
+
+  it('adds food-ordering safety guidance when MCP servers are enabled', () => {
+    const params = buildThreadSessionParams({
+      cwd: './project-a',
+      mode: 'full',
+      mcpServers: [{ name: 'mcd-mcp', url: 'https://mcp.mcd.cn', bearerTokenEnvVar: 'MCD_MCP_TOKEN' }],
+    });
+
+    expect(params.developerInstructions).toContain('餐饮 MCP');
+    expect(params.developerInstructions).toContain('创建订单前必须先向用户复述');
+    expect(params.developerInstructions).toContain('不要替用户支付');
+  });
+});
+
+describe('mcpServerConfigArgs', () => {
+  it('builds codex -c overrides without exposing token values', () => {
+    expect(
+      mcpServerConfigArgs([
+        { name: 'mcd-mcp', url: 'https://mcp.mcd.cn', bearerTokenEnvVar: 'MCD_MCP_TOKEN', bearerTokenSecretId: 'mcp:MCD_MCP_TOKEN' },
+        { name: 'disabled', url: 'https://example.com/mcp', enabled: false },
+      ]),
+    ).toEqual([
+      '-c',
+      'mcp_servers.mcd-mcp.url="https://mcp.mcd.cn"',
+      '-c',
+      'mcp_servers.mcd-mcp.bearer_token_env_var="MCD_MCP_TOKEN"',
+    ]);
+  });
+
+  it('rejects unsafe MCP server names', () => {
+    expect(() => mcpServerConfigArgs([{ name: 'bad.name', url: 'https://example.com/mcp' }])).toThrow('can only contain');
   });
 });

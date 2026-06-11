@@ -194,7 +194,7 @@ export function pickerTime(unixSeconds: number): string {
 // ── /help & 建群欢迎卡 ────────────────────────────────────────────────────────
 
 /** Where the user is when they ask for help — drives which commands we list. */
-export type HelpScope = 'main' | 'topic' | 'single';
+export type HelpScope = 'main' | 'topic' | 'single' | 'private';
 
 /** First bullet describing how to talk to the bot, honoring the group's
  * effective 免@ state so the card never promises免@ when it's actually off. */
@@ -212,10 +212,26 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
   const effectiveNoMention = noMention ?? (scope === 'single');
   const elements: CardElement[] = [];
   if (scope === 'single') {
-    const lines = [talkLine(effectiveNoMention, '交给我处理'), '· `/model` → 切换模型 / 推理 / 速度'];
+    const lines = [
+      talkLine(effectiveNoMention, '交给我处理'),
+      '· `/model` → 切换模型 / 推理 / 速度',
+      '· `/context` → 查看上下文用量',
+      '· `/compact` → 压缩上下文',
+    ];
     if (isAdmin) lines.push('· `/settings` → 群设置（免@ 开关）');
     lines.push('· `/help` → 这张速查卡');
     elements.push(md('💬 **单会话群** — 整群就是一个会话，上下文连续。'), hr(), md(lines.join('\n')));
+  } else if (scope === 'private') {
+    const lines = [
+      talkLine(effectiveNoMention, '继续这个私密会话'),
+      '· `/rename 新群名` → 修改私密群名称，并同步已创建的云文档子文件夹',
+      '· `/model` → 切换模型 / 推理 / 速度',
+      '· `/context` → 查看上下文用量',
+      '· `/compact` → 压缩上下文',
+    ];
+    if (isAdmin) lines.push('· `/settings` → 群设置（免@ 开关）');
+    lines.push('· `/help` → 这张速查卡');
+    elements.push(md('🔒 **私密协作群** — 独立会话，只在本群内继续。'), hr(), md(lines.join('\n')));
   } else if (scope === 'topic') {
     elements.push(
       md('🧵 **话题内** — 每个话题是一个独立会话。'),
@@ -224,6 +240,8 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
         `${talkLine(effectiveNoMention, '继续当前会话')}\n` +
           '· `/rename 新标题` → 修改话题标题\n' +
           '· `/model` → 切换模型 / 推理 / 速度\n' +
+          '· `/context` → 查看上下文用量\n' +
+          '· `/compact` → 压缩上下文\n' +
           '· `/private [@参与者] 内容` → 创建私密协作群\n' +
           '· 直接发文件（不用 @）→ 附件交给当前话题处理\n' +
           '· `/help` → 这张速查卡',
@@ -233,7 +251,12 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
   } else {
     const lines = ['· **@我 + 内容** → 开一个新话题并开始（独立工作区）', '· `/private [@参与者] 内容` → 创建私密协作群'];
     if (isAdmin) lines.push('· `/resume` → 恢复历史会话', '· `/settings` → 群设置（免@ 开关）');
-    lines.push('· `/rename 新标题` → 需要在话题里用', '· `/model` → 需要在话题里用（模型 / 推理 / 速度）', '· `/help` → 这张速查卡');
+    lines.push(
+      '· `/rename 新标题` → 需要在话题里用',
+      '· `/model` → 需要在话题里用（模型 / 推理 / 速度）',
+      '· `/context` / `/compact` → 需要在话题里用',
+      '· `/help` → 这张速查卡',
+    );
     elements.push(md('👥 **主群区** — @我开话题，每个话题是独立会话。'), hr(), md(lines.join('\n')));
   }
   return card(elements, { header: { title: '🤖 可用命令', template: 'blue' }, summary: '可用命令' });
@@ -257,6 +280,8 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
       md(
         `${talkLine(effectiveNoMention, '交给我处理')}\n` +
           '· `/model` → 切换模型 / 推理 / 速度\n' +
+          '· `/context` → 查看上下文用量\n' +
+          '· `/compact` → 压缩上下文\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 命令速查卡',
       ),
@@ -275,6 +300,8 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
         `${talkLine(effectiveNoMention, '继续当前会话')}\n` +
           '· `/rename 新标题` → 修改话题标题\n' +
           '· `/model` → 切换模型 / 推理 / 速度\n' +
+          '· `/context` → 查看上下文用量\n' +
+          '· `/compact` → 压缩上下文\n' +
           '· 直接发文件（不用 @）→ 附件交给当前话题处理',
       ),
       note('只有话题发起人或管理员可驱动该话题；任意场景发 `/help` 看当前可用命令。'),

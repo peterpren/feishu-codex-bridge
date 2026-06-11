@@ -113,6 +113,12 @@ export function note(content: string): CardElement {
   return { tag: 'div', text: { tag: 'lark_md', content, text_size: 'notation', text_color: 'grey' } };
 }
 
+export type NoteColor = 'grey' | 'green' | 'yellow' | 'orange' | 'red' | 'blue';
+
+export function colorNote(content: string, color: NoteColor): CardElement {
+  return { tag: 'div', text: { tag: 'lark_md', content, text_size: 'notation', text_color: color } };
+}
+
 export function hr(): CardElement {
   return { tag: 'hr' };
 }

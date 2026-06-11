@@ -3,6 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnProcess } from '../platform/spawn';
 import { getServiceAdapter, isServiceRunning } from './adapter';
+import { markRestartIntent } from './restart-notice';
 
 // `npm` via cross-spawn: on Windows it's an `npm.cmd` shim that a bare
 // spawn/execFile would reject with EINVAL (CVE-2024-27980); cross-spawn runs it,
@@ -170,5 +171,6 @@ export function daemonRunning(): boolean {
  * terminates the caller — send any "done" UI before calling it.
  */
 export async function restartDaemon(): Promise<void> {
+  await markRestartIntent('version_update').catch(() => undefined);
   await getServiceAdapter().restart();
 }

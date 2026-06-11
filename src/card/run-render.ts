@@ -40,8 +40,8 @@ export class RunRender {
   }
 
   /** Mark the run as user-interrupted (⏹). */
-  interrupt(): void {
-    this.state = markInterrupted(this.state);
+  interrupt(reason: RunState['interruptedReason'] = 'user'): void {
+    this.state = markInterrupted(this.state, reason);
   }
 
   /** Force a terminal state if the stream ended without done/error. */

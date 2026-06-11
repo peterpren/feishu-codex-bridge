@@ -1,6 +1,12 @@
 import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
-import type { AppConfig } from '../config/schema';
+import { resolveOwner, type AppConfig } from '../config/schema';
 import { log } from '../core/logger';
+import {
+  markRestartNoticeSent,
+  restartNoticeForApp,
+  type RestartInterruptedRun,
+  type RestartNotice,
+} from '../service/restart-notice';
 import { createOrchestrator } from './handle-message';
 
 export interface BridgeOptions {
@@ -85,6 +91,7 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
 
   await channel.connect();
   log.info('ws', 'connected', { appId: app.id, fallbackCwd: opts.fallbackCwd });
+  void notifyRestartComplete(channel, opts.cfg).catch((err) => log.fail('ws', err, { phase: 'restart-notice' }));
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
@@ -94,4 +101,114 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
   return { channel, shutdown };
+}
+
+async function notifyRestartComplete(channel: LarkChannel, cfg: AppConfig): Promise<void> {
+  const appId = cfg.accounts.app.id;
+  const notice = await restartNoticeForApp(appId);
+  if (!notice) return;
+
+  const targets = [...new Set([resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])].filter((x): x is string => Boolean(x)))];
+  const runTargets = (notice.runs ?? []).filter((run) => run.appId === appId);
+  let sent = 0;
+  let runSent = 0;
+  for (const run of runTargets) {
+    const ok = await sendRestartRunNotice(channel, notice, run);
+    if (ok) {
+      sent++;
+      runSent++;
+    }
+  }
+
+  for (const openId of targets) {
+    try {
+      await channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: {
+          receive_id: openId,
+          msg_type: 'text',
+          content: JSON.stringify({ text: restartNoticeText(appId, notice) }),
+        },
+      });
+      sent++;
+    } catch (err) {
+      log.fail('ws', err, { phase: 'restart-notice-send', appId, openId: openId.slice(-6) });
+    }
+  }
+
+  if (sent > 0 || (targets.length === 0 && runTargets.length === 0)) {
+    await markRestartNoticeSent(appId, notice.id);
+    log.info('ws', 'restart-notice-sent', { appId, sent, runSent });
+  }
+}
+
+async function sendRestartRunNotice(channel: LarkChannel, notice: RestartNotice, run: RestartInterruptedRun): Promise<boolean> {
+  const text = restartRunNoticeText(notice, run);
+  const anchor = run.cardMessageId || run.replyToMessageId;
+  try {
+    await channel.rawClient.im.v1.message.reply({
+      path: { message_id: anchor },
+      data: {
+        msg_type: 'text',
+        content: JSON.stringify({ text }),
+        reply_in_thread: run.replyInThread ?? Boolean(run.feishuThreadId),
+      },
+    });
+    return true;
+  } catch (err) {
+    log.fail('ws', err, { phase: 'restart-run-notice-reply', appId: run.appId, anchor: anchor.slice(-6) });
+  }
+
+  if (!run.requesterOpenId) return false;
+  try {
+    await channel.rawClient.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data: {
+        receive_id: run.requesterOpenId,
+        msg_type: 'text',
+        content: JSON.stringify({ text }),
+      },
+    });
+    return true;
+  } catch (err) {
+    log.fail('ws', err, { phase: 'restart-run-notice-dm', appId: run.appId, openId: run.requesterOpenId.slice(-6) });
+    return false;
+  }
+}
+
+function restartNoticeText(appId: string, notice: RestartNotice): string {
+  const when = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  const label = notice.reason === 'version_update' ? '版本更新重启' : '后台重启';
+  return [
+    `✅ Feishu-Codex Bridge 已恢复运行`,
+    ``,
+    `机器人：${appId}`,
+    `原因：${label}`,
+    `时间：${when}（北京时间）`,
+    ``,
+    `如果重启前有正在执行的任务，那一轮不会自动继续。请回到原话题重新发送指令。`,
+  ].join('\n');
+}
+
+function restartRunNoticeText(notice: RestartNotice, run: RestartInterruptedRun): string {
+  const label = notice.reason === 'version_update' ? '版本更新重启' : '后台重启';
+  const who = mentionUser(run.requesterOpenId, run.requesterName);
+  const topic = run.topicTitle ? `\n话题：${sanitizeText(run.topicTitle)}` : '';
+  return [
+    `${who} Bridge 已恢复运行。`,
+    ``,
+    `刚才这轮任务因${label}中断，无法自动继续。`,
+    `请在本话题重新发送指令，我会继续使用这个会话上下文处理。${topic}`,
+  ].join('\n');
+}
+
+function mentionUser(openId: string | undefined, name: string | undefined): string {
+  const safeName = sanitizeText(name || '发起人');
+  const id = (openId ?? '').trim();
+  if (!/^ou_[a-zA-Z0-9_-]+$/.test(id)) return safeName;
+  return `<at user_id="${id}">${safeName}</at>`;
+}
+
+function sanitizeText(input: string): string {
+  return input.replace(/[<>]/g, (ch) => (ch === '<' ? '＜' : '＞'));
 }

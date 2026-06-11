@@ -6,11 +6,14 @@ import {
   type AppConfig,
 } from '../config/schema';
 import {
+  FOOD_MCP_SERVERS,
   cloudDocFolderLabel,
   cloudDocFolderPermissionLabel,
   defaultNoMention,
   effectiveGuestMode,
   effectiveMode,
+  effectiveNetwork,
+  foodMcpEnabled,
   type Project,
 } from '../project/registry';
 import type { PermissionMode } from '../agent/types';
@@ -72,22 +75,29 @@ export const DM = {
   // 项目设置容器（项目列表 / 建项目完成卡 进入），以后的项目级设置项往这里加
   projectSettings: 'dm.projectSettings',
   setNoMentionDm: 'dm.proj.noMention',
+  setAutoCompactDm: 'dm.proj.autoCompact',
   // 🔐 权限：codex 沙箱档位（管理员档 + 普通用户档）+ 联网，做成下拉表单（选+提交）
   permission: 'dm.proj.perm',
   permissionSubmit: 'dm.proj.perm.submit',
   cloudDocFolderForm: 'dm.proj.cloudDoc.form',
   cloudDocFolderSubmit: 'dm.proj.cloudDoc.submit',
   cloudDocFolderClear: 'dm.proj.cloudDoc.clear',
+  foodMcpSet: 'dm.proj.foodMcp',
 } as const;
 
 /** Action ids for the in-group settings card (@bot /settings). */
 export const GS = {
   setNoMention: 'gs.noMention',
+  setAutoCompact: 'gs.autoCompact',
 } as const;
 
 /** Human label for a project's session-model kind. */
 export function kindLabel(kind?: 'multi' | 'single'): string {
   return kind === 'single' ? '💬 单会话群' : '👥 多话题群';
+}
+
+function escapeMd(value: string): string {
+  return value.replace(/([\\`*_{}\[\]()#+\-.!|>])/g, '\\$1');
 }
 
 /** The top-level management menu. */
@@ -136,6 +146,7 @@ export interface UpdateCardState {
 }
 
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
+const MAX_PROJECT_LIST_ITEMS = 20;
 
 /**
  * Version-update console card. A single builder renders every phase so the same
@@ -214,7 +225,7 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
 
     case 'done': {
       const tail = state.willRestart
-        ? note('正在重启后台服务以生效 —— 重启期间本卡片停止更新；稍后发我任意消息可重开管理台。')
+        ? note('正在重启后台服务以生效 —— 重启期间本卡片停止更新；恢复后会私聊管理员通知。')
         : note('前台模式：请在终端手动重启 `run` 进程使新版本生效。');
       return card(
         [md(`✅ 已更新 **v${state.from ?? '?'} → v${state.to ?? '?'}**`), tail],
@@ -554,35 +565,44 @@ export function buildProjectListCard(
     );
   }
   const elements: CardObject[] = [];
-  for (const p of projects) {
-    elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
-    elements.push(note(`📂 \`${p.cwd}\`${p.branch && p.branch !== '—' ? `   🌿 ${p.branch}` : ''}`));
-    if (isIsolatedTopicWorkspace(p)) elements.push(note('🧵 话题工作区：独立'));
+  const visibleProjects = projects.slice(0, MAX_PROJECT_LIST_ITEMS);
+  for (const p of visibleProjects) {
+    const sessions = (p.chatId ? sessionsByChat.get(p.chatId) : undefined) ?? [];
+    const latest = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    const meta = [
+      p.chatId ? kindLabel(p.kind) : '⚠️ 未绑定群',
+      (p.origin ?? 'created') === 'joined' ? '已加入' : undefined,
+      `免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`,
+      isIsolatedTopicWorkspace(p) ? '话题工作区：独立' : undefined,
+      sessions.length ? `话题 ${sessions.length}` : '暂无话题',
+    ].filter(Boolean);
     elements.push(
-      note(
-        p.chatId
-          ? `💬 群：**${p.name}**   ·   ${kindLabel(p.kind)}${(p.origin ?? 'created') === 'joined' ? ' · 🔗已加入' : ''}   ·   免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`
-          : '⚠️ 未绑定群',
+      md(
+        [
+          `**${p.name}**${p.blank ? ' _(空白)_' : ''}`,
+          `📂 \`${p.cwd}\`${p.branch && p.branch !== '—' ? `   🌿 ${p.branch}` : ''}`,
+          `💬 ${meta.join(' · ')}`,
+          latest ? `最近：${escapeMd((latest.summary || '(空)').replace(/\s+/g, ' ').slice(0, 40))} · ${relativeTime(latest.updatedAt)}` : undefined,
+        ]
+          .filter(Boolean)
+          .join('\n'),
       ),
     );
-    const sessions = (p.chatId ? sessionsByChat.get(p.chatId) : undefined) ?? [];
-    if (sessions.length === 0) {
-      elements.push(note('（暂无话题）'));
-    } else {
-      const sorted = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
-      for (const s of sorted) {
-        const title = (s.summary || '(空)').replace(/\s+/g, ' ').slice(0, 40);
-        elements.push(note(`· ${title} · ${relativeTime(s.updatedAt)}`));
-      }
-    }
     const row: CardObject[] = [];
     if (p.chatId) row.push(linkButton('💬 打开群聊', openChatUrl(p.chatId)));
     row.push(button('⚙️ 设置', { a: DM.projectSettings, n: p.name }));
     row.push(button('🗑 删除', { a: DM.rmConfirm, n: p.name }, 'danger'));
     elements.push(actions(row));
-    elements.push(hr());
   }
-  elements.push(note(`共 ${projects.length} 个项目`));
+  elements.push(hr());
+  const hidden = projects.length - visibleProjects.length;
+  elements.push(
+    note(
+      hidden > 0
+        ? `共 ${projects.length} 个项目；为避免飞书卡片超限，本卡显示前 ${visibleProjects.length} 个。`
+        : `共 ${projects.length} 个项目`,
+    ),
+  );
   elements.push(actions([button('⬅️ 菜单', { a: DM.menu })]));
   return card(elements, { header: { title: '📁 项目列表', template: 'wathet' } });
 }
@@ -697,9 +717,10 @@ export function buildWorkspaceRootFormCard(opts: { current?: string; error?: str
  * (read-only label); 免@ is a live toggle. Uses option buttons (never lock) like
  * {@link buildSettingsCard}. Admin-gated by the handler.
  */
-export function buildGroupSettingsCard(project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin'>): CardObject {
+export function buildGroupSettingsCard(project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact'>): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
+  const autoCompact = project.autoCompact !== false;
   const scopeNote =
     kind === 'single'
       ? '开启后：本群所有消息(不用 @)都交给我处理。'
@@ -714,6 +735,12 @@ export function buildGroupSettingsCard(project: Pick<Project, 'name' | 'kind' | 
       ]),
       note(scopeNote),
       note('⚠️ 免@ 需应用已开通「接收群内所有消息」(im:message.group_msg)权限，否则收不到非 @ 消息。'),
+      hr(),
+      ...optionRow('🗜️ 自动压缩上下文', GS.setAutoCompact, autoCompact ? 'on' : 'off', [
+        { label: '开', value: 'on' },
+        { label: '关', value: 'off' },
+      ]),
+      note('开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。改动下一轮生效。'),
     ],
     { header: { title: '⚙️ 群设置', template: 'blue' } },
   );
@@ -828,7 +855,7 @@ export function permissionSummary(p: Pick<Project, 'mode' | 'guestMode'>): strin
  * 选完点提交；提交 handler 落盘 + 驱逐活跃会话让新档立刻生效。
  */
 export function buildPermissionCard(p: Pick<Project, 'name' | 'mode' | 'guestMode' | 'network'>): CardObject {
-  const network = p.network ?? false;
+  const network = effectiveNetwork(p);
   return card(
     [
       md(`**🔐 权限** · ${p.name}`),
@@ -851,8 +878,8 @@ export function buildPermissionCard(p: Pick<Project, 'name' | 'mode' | 'guestMod
           name: 'network',
           placeholder: '联网开关',
           options: [
-            { label: '关（默认，更安全）', value: 'off' },
-            { label: '开', value: 'on' },
+            { label: '开（默认）', value: 'on' },
+            { label: '关', value: 'off' },
           ],
           initial: network ? 'on' : 'off',
         }),
@@ -873,12 +900,27 @@ export function buildPermissionCard(p: Pick<Project, 'name' | 'mode' | 'guestMod
 export function buildProjectSettingsCard(
   project: Pick<
     Project,
-    'name' | 'kind' | 'noMention' | 'origin' | 'cwd' | 'mode' | 'guestMode' | 'network' | 'cloudDocFolder' | 'topicWorkspace'
+    | 'name'
+    | 'kind'
+    | 'noMention'
+    | 'origin'
+    | 'cwd'
+    | 'mode'
+    | 'guestMode'
+    | 'network'
+    | 'autoCompact'
+    | 'cloudDocFolder'
+    | 'mcpServers'
+    | 'topicWorkspace'
   >,
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
+  const autoCompact = project.autoCompact !== false;
   const hasCloudDocFolder = Boolean(project.cloudDocFolder?.token);
+  const hasFoodMcp = foodMcpEnabled(project);
+  const foodEnvVars = FOOD_MCP_SERVERS.map((server) => server.bearerTokenEnvVar).filter(Boolean).join(' / ');
+  const foodSecretIds = FOOD_MCP_SERVERS.map((server) => server.bearerTokenSecretId).filter(Boolean).join(' / ');
   return card(
     [
       md(`**项目设置** · ${project.name}`),
@@ -897,6 +939,12 @@ export function buildProjectSettingsCard(
       actions([button('🔐 权限', { a: DM.permission, n: project.name }, 'primary')]),
       note(`当前 ${permissionSummary(project)}　·　codex 沙箱可访问的范围（管理员 / 普通用户可分设）。`),
       hr(),
+      md('🍔 餐饮 MCP'),
+      actions([
+        button(hasFoodMcp ? '停用瑞幸/麦当劳' : '启用瑞幸/麦当劳', { a: DM.foodMcpSet, v: hasFoodMcp ? 'off' : 'on', n: project.name }, hasFoodMcp ? 'danger' : 'primary'),
+      ]),
+      note(`Token 从环境变量或本地密钥库读取：${foodEnvVars}；密钥库 ${foodSecretIds}。启用后下一轮/新会话生效，付款仍需人工确认。`),
+      hr(),
       md('✋ 免@（不用 @ 也回复）'),
       actions([
         button('开', { a: DM.setNoMentionDm, v: 'on', n: project.name }, noMention ? 'primary' : 'default'),
@@ -907,6 +955,13 @@ export function buildProjectSettingsCard(
           ? '开启后：本群所有消息(不用 @)都交给我处理。'
           : '开启后：话题内消息(不用 @)都处理；**开新话题仍需 @我**。',
       ),
+      hr(),
+      md('🗜️ 自动压缩上下文'),
+      actions([
+        button('开', { a: DM.setAutoCompactDm, v: 'on', n: project.name }, autoCompact ? 'primary' : 'default'),
+        button('关', { a: DM.setAutoCompactDm, v: 'off', n: project.name }, autoCompact ? 'default' : 'primary'),
+      ]),
+      note('开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。保存后下一轮生效。'),
       hr(),
       actions([button('🛡 响应白名单', { a: DM.allowlist, n: project.name }, 'primary')]),
       note('设置谁能让我在本群响应 / 跑 codex（空 = 所有人）。'),

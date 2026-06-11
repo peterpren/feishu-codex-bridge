@@ -17,6 +17,17 @@ export async function transferOwnership(channel: LarkChannel, chatId: string, to
   log.info('project', 'owner-transfer', { chatId: chatId.slice(-6), to: toOpenId.slice(-6) });
 }
 
+/** Rename the Feishu group itself. The bot must have permission to update the
+ * chat; private child groups are created by the bot, so this should normally
+ * succeed there. */
+export async function renameChat(channel: LarkChannel, chatId: string, name: string): Promise<void> {
+  await channel.rawClient.im.v1.chat.update({
+    path: { chat_id: chatId },
+    data: { name },
+  });
+  log.info('project', 'chat-rename', { chatId: chatId.slice(-6), name });
+}
+
 /**
  * The bot leaves a group on its own (`me_leave`). Used to unbind a `joined`
  * project: the group is the user's, so the bot just exits — it never disbands

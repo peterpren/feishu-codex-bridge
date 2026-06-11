@@ -118,6 +118,13 @@ describe('buildHelpCard 权限过滤', () => {
     expect(JSON.stringify(buildHelpCard('single', true, false))).not.toContain('/rename');
   });
 
+  it('私密协作群：发起人或管理员可以看到 /rename 和 /settings', () => {
+    const json = JSON.stringify(buildHelpCard('private', false, true));
+    expect(json).toContain('/rename 新群名');
+    expect(json).toContain('/settings');
+    expect(json).toContain('本群默认需 @');
+  });
+
   it('多话题群：主群区和话题内都会提示 /rename 的使用位置', () => {
     expect(JSON.stringify(buildHelpCard('main', true, false))).toContain('/rename 新标题');
     expect(JSON.stringify(buildHelpCard('topic', true, false))).toContain('/rename 新标题');

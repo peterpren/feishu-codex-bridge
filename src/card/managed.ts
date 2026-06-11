@@ -61,6 +61,11 @@ export interface ManagedCardSendResult {
   cardId: string;
 }
 
+export function isCardIdNotReady(err: unknown): boolean {
+  const data = (err as { response?: { data?: { code?: number; msg?: string } } })?.response?.data;
+  return data?.code === 230099 || /11310|cardid is invalid/i.test(data?.msg ?? '');
+}
+
 /**
  * Create a CardKit entity and send a message referencing it. With `replyTo`
  * the card threads under the triggering message (im.v1.message.reply);
@@ -79,35 +84,49 @@ export async function sendManagedCard(
   receiveIdType: 'chat_id' | 'open_id' = 'chat_id',
 ): Promise<ManagedCardSendResult> {
   stampRenderToken(card);
-  const created = await channel.rawClient.cardkit.v1.card.create({
-    data: { type: 'card_json', data: JSON.stringify(card) },
-  });
-  const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
-  if (!cardId) {
-    throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
-  }
+  const data = JSON.stringify(card);
 
-  const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-  let messageId: string | undefined;
-  if (replyTo) {
-    const sent = await channel.rawClient.im.v1.message.reply({
-      path: { message_id: replyTo },
-      data: { msg_type: 'interactive', content, reply_in_thread: replyInThread },
+  const attempt = async (): Promise<ManagedCardSendResult> => {
+    const created = await channel.rawClient.cardkit.v1.card.create({
+      data: { type: 'card_json', data },
     });
-    messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
-  } else {
-    const sent = await channel.rawClient.im.v1.message.create({
-      params: { receive_id_type: receiveIdType },
-      data: { receive_id: to, msg_type: 'interactive', content },
-    });
-    messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
-  }
-  if (!messageId) {
-    throw new Error('send card-by-reference returned no message_id');
-  }
+    const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
+    if (!cardId) {
+      throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
+    }
 
-  byMessageId.set(messageId, { cardId, sequence: 0 });
-  return { messageId, cardId };
+    const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+    let messageId: string | undefined;
+    if (replyTo) {
+      const sent = await channel.rawClient.im.v1.message.reply({
+        path: { message_id: replyTo },
+        data: { msg_type: 'interactive', content, reply_in_thread: replyInThread },
+      });
+      messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
+    } else {
+      const sent = await channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: receiveIdType },
+        data: { receive_id: to, msg_type: 'interactive', content },
+      });
+      messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
+    }
+    if (!messageId) {
+      throw new Error('send card-by-reference returned no message_id');
+    }
+
+    byMessageId.set(messageId, { cardId, sequence: 0 });
+    return { messageId, cardId };
+  };
+
+  for (let i = 0; ; i++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (i >= 2 || !isCardIdNotReady(err)) throw err;
+      log.fail('card', err, { phase: 'managed-send', attempt: i, retry: true });
+      await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+    }
+  }
 }
 
 /**

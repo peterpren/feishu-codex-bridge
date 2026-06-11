@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { effectiveGuestMode, effectiveMode, turnTier } from '../src/project/registry';
+import { effectiveGuestMode, effectiveMode, effectiveNetwork, turnTier } from '../src/project/registry';
 import { sandboxParams } from '../src/agent/codex-appserver/backend';
 import { buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
 
@@ -16,20 +16,31 @@ describe('effectiveMode', () => {
 });
 
 describe('effectiveGuestMode', () => {
-  it('unset guestMode falls back to the admin tier (no split)', () => {
-    expect(effectiveGuestMode({ mode: 'full' })).toBe('full');
-    expect(effectiveGuestMode({ mode: 'qa' })).toBe('qa');
-    expect(effectiveGuestMode({})).toBe('full'); // legacy
+  it('defaults missing guestMode to project read-write', () => {
+    expect(effectiveGuestMode({ mode: 'full' })).toBe('write');
+    expect(effectiveGuestMode({ mode: 'qa' })).toBe('write');
+    expect(effectiveGuestMode({})).toBe('write');
   });
   it('explicit guestMode wins', () => {
     expect(effectiveGuestMode({ mode: 'full', guestMode: 'qa' })).toBe('qa');
   });
 });
 
+describe('effectiveNetwork', () => {
+  it('defaults missing network to on', () => {
+    expect(effectiveNetwork({})).toBe(true);
+    expect(effectiveNetwork({ network: undefined })).toBe(true);
+  });
+  it('passes explicit network values through', () => {
+    expect(effectiveNetwork({ network: false })).toBe(false);
+    expect(effectiveNetwork({ network: true })).toBe(true);
+  });
+});
+
 describe('turnTier (admin vs guest per-turn tier + thread split)', () => {
-  it('no guestMode → no split; both roles get the admin tier', () => {
-    expect(turnTier({ mode: 'full' }, true)).toEqual({ mode: 'full', role: 'admin', split: false });
-    expect(turnTier({ mode: 'full' }, false)).toEqual({ mode: 'full', role: 'guest', split: false });
+  it('missing guestMode uses the ordinary-user default and splits from full admins', () => {
+    expect(turnTier({ mode: 'full' }, true)).toEqual({ mode: 'full', role: 'admin', split: true });
+    expect(turnTier({ mode: 'full' }, false)).toEqual({ mode: 'write', role: 'guest', split: true });
   });
   it('guestMode equal to mode → still no split', () => {
     expect(turnTier({ mode: 'qa', guestMode: 'qa' }, false).split).toBe(false);
@@ -125,10 +136,11 @@ describe('permission cards', () => {
     expect(json).toContain('"initial_option":"qa"'); // guest
   });
 
-  it('unset guestMode pre-selects the admin tier for the guest dropdown (no split)', () => {
-    const json = JSON.stringify(buildPermissionCard({ name: 'P', mode: 'qa', network: true }));
+  it('unset guestMode and network pre-select the group defaults', () => {
+    const json = JSON.stringify(buildPermissionCard({ name: 'P', mode: 'full' }));
     expect(json).toContain('"initial_option":"on"'); // network
-    // both dropdowns default to qa (guest falls back to admin tier)
-    expect((json.match(/"initial_option":"qa"/g) ?? []).length).toBe(2);
+    expect(json).toContain('"initial_option":"full"'); // admin
+    expect(json).toContain('"initial_option":"write"'); // ordinary users
+    expect(json).toContain('开（默认）');
   });
 });

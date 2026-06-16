@@ -11,6 +11,49 @@ import { isCardIdNotReady } from './managed';
  */
 const STREAM_THROTTLE_MS = 150;
 
+const CHAT_MIN_GAP_MS = 250;
+const RATE_LIMIT_PENALTY_MS = 1_000;
+const TERMINAL_RL_RETRIES = 3;
+const RL_BACKOFF_BASE_MS = 1_000;
+
+class ChatPacer {
+  private nextAt = 0;
+
+  async wait(): Promise<void> {
+    const now = Date.now();
+    const at = Math.max(now, this.nextAt);
+    this.nextAt = at + CHAT_MIN_GAP_MS;
+    if (at > now) await new Promise((r) => setTimeout(r, at - now));
+  }
+
+  penalize(): void {
+    this.nextAt = Math.max(this.nextAt, Date.now() + RATE_LIMIT_PENALTY_MS);
+  }
+
+  idle(now: number): boolean {
+    return this.nextAt < now - 60_000;
+  }
+}
+
+const chatPacers = new Map<string, ChatPacer>();
+function pacerFor(chatId: string): ChatPacer {
+  let p = chatPacers.get(chatId);
+  if (!p) {
+    if (chatPacers.size >= 512) {
+      const now = Date.now();
+      for (const [k, v] of chatPacers) if (v.idle(now)) chatPacers.delete(k);
+    }
+    p = new ChatPacer();
+    chatPacers.set(chatId, p);
+  }
+  return p;
+}
+
+function isRateLimited(err: unknown): boolean {
+  const e = err as { code?: number; response?: { status?: number; data?: { code?: number } } };
+  return e?.response?.status === 429 || e?.response?.data?.code === 99991400 || e?.code === 99991400;
+}
+
 /**
  * A run card backed by a single CardKit 2.0 entity. The whole card is
  * re-rendered from {@link RunState} each tick and pushed via
@@ -50,6 +93,7 @@ export class RunCardStream {
   // Baselines for the pump's route decision (structure unchanged + answer grew?).
   private lastStructureSig = '';
   private lastAnswerText = '';
+  private pacer: ChatPacer | null = null;
 
   get messageId(): string {
     return this._messageId;
@@ -100,15 +144,17 @@ export class RunCardStream {
           answer.startsWith(this.lastAnswerText)
         ) {
           // Structure unchanged, answer grew by append → native typewriter.
-          await this.streamElement(this.pumpChannel, answerEid, answer);
-          this.lastAnswerText = answer;
+          if (await this.streamElement(this.pumpChannel, answerEid, answer)) {
+            this.lastAnswerText = answer;
+          }
         } else {
           // First frame or structure changed → whole-card update re-establishes the
           // (answer-blanked) baseline; the answer element streams via
           // cardElement.content from here, carrying current text so nothing is lost.
-          await this.streamCard(this.pumpChannel, card, true);
-          this.lastStructureSig = sig;
-          this.lastAnswerText = answer ?? '';
+          if (await this.streamCard(this.pumpChannel, card, true)) {
+            this.lastStructureSig = sig;
+            this.lastAnswerText = answer ?? '';
+          }
         }
         // RTT (~hundreds of ms) usually spaces pushes on its own; this floor only
         // bites if a round-trip is unusually fast, keeping us under Feishu's
@@ -124,8 +170,9 @@ export class RunCardStream {
   /** Element-level streaming push (cardkit.v1.cardElement.content): the answer
    * element's accumulated full text. Feishu diffs the prefix and types the delta
    * per the card's streaming_config. Needs streaming_mode on the card. */
-  private async streamElement(channel: LarkChannel, elementId: string, content: string): Promise<void> {
-    if (!this.cardId) return;
+  private async streamElement(channel: LarkChannel, elementId: string, content: string): Promise<boolean> {
+    if (!this.cardId) return false;
+    await this.pacer?.wait();
     const t0 = Date.now();
     try {
       await channel.rawClient.cardkit.v1.cardElement.content({
@@ -137,8 +184,12 @@ export class RunCardStream {
       this.elPushes++;
       this.totalRttMs += rtt;
       if (rtt > this.maxRttMs) this.maxRttMs = rtt;
+      return true;
     } catch (err) {
-      log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq });
+      const rl = isRateLimited(err);
+      if (rl) this.pacer?.penalize();
+      log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, rateLimited: rl });
+      return false;
     }
   }
 
@@ -150,6 +201,7 @@ export class RunCardStream {
     initialCard: CardObject,
     opts: { replyTo?: string; replyInThread?: boolean },
   ): Promise<string> {
+    this.pacer = pacerFor(chatId);
     const data = JSON.stringify(initialCard);
     const attempt = async (): Promise<{ cardId: string; messageId: string }> => {
       const created = await channel.rawClient.cardkit.v1.card.create({
@@ -195,28 +247,34 @@ export class RunCardStream {
   }
 
   /** Throttled whole-card stream update. Skips identical/too-soon pushes;
-   * `force` flushes regardless (still de-duped on content). */
-  async streamCard(channel: LarkChannel, fullCard: CardObject, force = false): Promise<void> {
-    if (!this.cardId) return;
+   * `force` flushes regardless (still de-duped on content). Returns true when
+   * the frame is already current or was delivered. */
+  async streamCard(channel: LarkChannel, fullCard: CardObject, force = false): Promise<boolean> {
+    if (!this.cardId) return false;
     const data = JSON.stringify(fullCard);
-    if (data === this.lastContent) return;
+    if (data === this.lastContent) return true;
     const now = Date.now();
-    if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return;
+    if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return false;
     this.lastPush = now;
-    this.lastContent = data;
+    await this.pacer?.wait();
     const t0 = Date.now();
     try {
       await channel.rawClient.cardkit.v1.card.update({
         path: { card_id: this.cardId },
         data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
       });
+      this.lastContent = data;
       const rtt = Date.now() - t0;
       this.pushCount++;
       this.cardPushes++;
       this.totalRttMs += rtt;
       if (rtt > this.maxRttMs) this.maxRttMs = rtt;
+      return true;
     } catch (err) {
-      log.fail('card', err, { phase: 'run-stream', cardId: this.cardId, seq: this.seq });
+      const rl = isRateLimited(err);
+      if (rl) this.pacer?.penalize();
+      log.fail('card', err, { phase: 'run-stream', cardId: this.cardId, seq: this.seq, rateLimited: rl });
+      return false;
     }
   }
 
@@ -225,25 +283,27 @@ export class RunCardStream {
   async updateCard(channel: LarkChannel, fullCard: CardObject): Promise<void> {
     if (!this.cardId) return;
     const data = JSON.stringify(fullCard);
-    this.lastContent = data;
     const push = async (): Promise<void> => {
       await channel.rawClient.cardkit.v1.card.update({
         path: { card_id: this.cardId },
         data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
       });
+      this.lastContent = data;
     };
-    try {
-      await push();
-    } catch (err) {
-      // A terminal update fired right as a ⏹ click is still in its callback
-      // window hits err 200810 ("card in ongoing interaction"). Wait out the
-      // 3s window and retry once.
-      log.fail('card', err, { phase: 'run-update', cardId: this.cardId, seq: this.seq, retry: true });
-      await new Promise((r) => setTimeout(r, 3200));
+    for (let i = 0; ; i++) {
+      await this.pacer?.wait();
       try {
         await push();
-      } catch (err2) {
-        log.fail('card', err2, { phase: 'run-update-retry', cardId: this.cardId, seq: this.seq });
+        return;
+      } catch (err) {
+        const rl = isRateLimited(err);
+        if (rl) this.pacer?.penalize();
+        if (i >= (rl ? TERMINAL_RL_RETRIES : 1)) {
+          log.fail('card', err, { phase: 'run-update-retry', cardId: this.cardId, seq: this.seq, rateLimited: rl });
+          return;
+        }
+        log.fail('card', err, { phase: 'run-update', cardId: this.cardId, seq: this.seq, retry: true, rateLimited: rl });
+        await new Promise((r) => setTimeout(r, rl ? RL_BACKOFF_BASE_MS * 2 ** i : 3200));
       }
     }
   }

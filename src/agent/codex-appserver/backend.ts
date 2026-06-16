@@ -504,10 +504,10 @@ function mapTurn(turn: Turn): HistoryTurn {
         tools.push({ title: `联网搜索：${item.query}` });
         break;
       case 'mcpToolCall':
-        tools.push({ title: `${item.server} / ${item.tool}`, failed: item.status === 'failed' || Boolean(item.error) });
+        tools.push({ title: `MCP：${item.server} / ${item.tool}`, failed: item.status === 'failed' || Boolean(item.error) });
         break;
       case 'dynamicToolCall':
-        tools.push({ title: item.tool, failed: item.status === 'failed' || item.success === false });
+        tools.push({ title: item.namespace ? `工具调用：${item.namespace} / ${item.tool}` : `工具调用：${item.tool}`, failed: item.status === 'failed' || item.success === false });
         break;
       // plan / contextCompaction / review-mode / image* — omitted from the digest
       default:

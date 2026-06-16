@@ -36,11 +36,18 @@ describe('DM project settings card', () => {
     const card = buildProjectSettingsCard({
       ...project(1),
       mcpServers: withFoodMcpServers(undefined),
+    }, {
+      foodMcpTokens: [
+        { title: '瑞幸咖啡', envVar: 'LUCKIN_MCP_TOKEN', secretId: 'mcp:LUCKIN_MCP_TOKEN', configured: true },
+        { title: '麦当劳', envVar: 'MCD_MCP_TOKEN', secretId: 'mcp:MCD_MCP_TOKEN', configured: false },
+      ],
     });
     const json = JSON.stringify(card);
 
     expect(json).toContain('餐饮 MCP');
     expect(json).toContain('停用瑞幸/麦当劳');
+    expect(json).toContain('瑞幸咖啡已配置');
+    expect(json).toContain('麦当劳未配置');
     expect(json).toContain('LUCKIN_MCP_TOKEN');
     expect(json).toContain('MCD_MCP_TOKEN');
     expect(json).toContain('mcp:LUCKIN_MCP_TOKEN');

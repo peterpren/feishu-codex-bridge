@@ -58,6 +58,13 @@ export interface AppAccess {
   allowedChats?: string[];
 }
 
+export interface PersonalAuthPreferences {
+  /** OAuth redirect URI registered in Feishu developer console. Default is local manual callback. */
+  redirectUri?: string;
+  /** Extra OAuth scopes requested from each user. Defaults cover read-only docs/wiki search. */
+  scopes?: string[];
+}
+
 export interface AppPreferences {
   /** reply rendering for IM messages. Default 'card'. */
   messageReply?: MessageReplyMode;
@@ -77,6 +84,8 @@ export interface AppPreferences {
   agentStopGraceMs?: number;
   /** Absolute local root directory that this bot may create/bind projects under. */
   localWorkspaceRoot?: string;
+  /** Per-user Feishu OAuth gateway settings. */
+  personalAuth?: PersonalAuthPreferences;
 }
 
 export interface AppConfig {
@@ -147,6 +156,25 @@ export function getRunIdleTimeoutMs(cfg: AppConfig): number | undefined {
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return 120_000;
   const clamped = Math.min(Math.max(Math.floor(raw), 10), 1800);
   return clamped * 1000;
+}
+
+export const DEFAULT_PERSONAL_AUTH_REDIRECT_URI = 'http://127.0.0.1:9768/callback';
+
+export const DEFAULT_PERSONAL_AUTH_SCOPES = [
+  'offline_access',
+  'auth:user.id:read',
+  'search:docs:read',
+  'wiki:wiki:readonly',
+  'docx:document:readonly',
+] as const;
+
+export function getPersonalAuthRedirectUri(cfg: AppConfig): string {
+  return cfg.preferences?.personalAuth?.redirectUri?.trim() || DEFAULT_PERSONAL_AUTH_REDIRECT_URI;
+}
+
+export function getPersonalAuthScopes(cfg: AppConfig): string[] {
+  const extra = cfg.preferences?.personalAuth?.scopes ?? [];
+  return [...new Set([...DEFAULT_PERSONAL_AUTH_SCOPES, ...extra].map((s) => s.trim()).filter(Boolean))];
 }
 
 /**

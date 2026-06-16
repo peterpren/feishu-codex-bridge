@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
@@ -57,9 +58,19 @@ async function read(): Promise<SessionRecord[]> {
   }
 }
 
+let opChain: Promise<unknown> = Promise.resolve();
+function withLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = opChain.then(fn, fn);
+  opChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 async function write(sessions: SessionRecord[]): Promise<void> {
   await mkdir(dirname(paths.sessionsFile), { recursive: true });
-  const tmp = `${paths.sessionsFile}.tmp-${process.pid}`;
+  const tmp = `${paths.sessionsFile}.tmp-${process.pid}-${randomUUID()}`;
   const body: StoreFile = { version: FILE_VERSION, sessions };
   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   await rename(tmp, paths.sessionsFile);
@@ -75,25 +86,32 @@ export async function getSession(threadId: string): Promise<SessionRecord | unde
 
 /** Insert or replace a session by threadId. */
 export async function upsertSession(rec: SessionRecord): Promise<void> {
-  const sessions = await read();
-  const idx = sessions.findIndex((s) => s.threadId === rec.threadId);
-  if (idx === -1) sessions.push(rec);
-  else sessions[idx] = rec;
-  await write(sessions);
+  return withLock(async () => {
+    const sessions = await read();
+    const idx = sessions.findIndex((s) => s.threadId === rec.threadId);
+    if (idx === -1) sessions.push(rec);
+    else sessions[idx] = rec;
+    await write(sessions);
+  });
 }
 
 /** Patch fields of an existing session; no-op if it doesn't exist. */
 export async function patchSession(
   threadId: string,
-  patch: Partial<Omit<SessionRecord, 'threadId'>>,
+  patch:
+    | Partial<Omit<SessionRecord, 'threadId'>>
+    | ((s: SessionRecord) => Partial<Omit<SessionRecord, 'threadId'>>),
 ): Promise<void> {
-  const sessions = await read();
-  const rec = sessions.find((s) => s.threadId === threadId);
-  if (!rec) return;
-  const target = rec as unknown as Record<string, unknown>;
-  for (const [k, v] of Object.entries(patch)) {
-    if (v !== undefined) target[k] = v;
-  }
-  rec.updatedAt = Date.now();
-  await write(sessions);
+  return withLock(async () => {
+    const sessions = await read();
+    const rec = sessions.find((s) => s.threadId === threadId);
+    if (!rec) return;
+    const actual = typeof patch === 'function' ? patch(rec) : patch;
+    const target = rec as unknown as Record<string, unknown>;
+    for (const [k, v] of Object.entries(actual)) {
+      if (v !== undefined) target[k] = v;
+    }
+    rec.updatedAt = Date.now();
+    await write(sessions);
+  });
 }

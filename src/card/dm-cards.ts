@@ -19,11 +19,19 @@ import {
 import type { PermissionMode } from '../agent/types';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
+import { summarizeEventDiagnosis, type EventDiagnosis } from '../utils/event-diagnosis';
 import { isIsolatedTopicWorkspace } from '../project/topic-workspace';
 import { localWorkspaceRootLabel } from '../project/workspace-root';
 import { PRODUCT_NAME, REPOSITORY_URL } from '../core/branding';
 import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject, type SelectOption } from './cards';
 import { relativeTime } from './command-cards';
+
+export interface FoodMcpTokenStatus {
+  title: string;
+  envVar?: string;
+  secretId?: string;
+  configured: boolean;
+}
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
  * deep link to a specific thread/topic, so this lands in the group and the
@@ -294,6 +302,10 @@ export interface DoctorInfo {
   missingCloudDocFolderScopes?: string[];
   /** 一键开通页，预选云文档目录隔离需要的 scope。 */
   cloudDocFolderScopeGrantUrl: string;
+  /** 事件订阅自动诊断结果；undefined = 本次未检查成。 */
+  eventDiagnosis?: EventDiagnosis;
+  /** 开放平台「事件与回调」配置页。 */
+  eventConfigUrl?: string;
 }
 
 /** Friendly label for a long-connection state; unknown states show raw. */
@@ -341,10 +353,30 @@ function scopeDiagnosis(i: DoctorInfo): CardElement[] {
   ];
 }
 
+function eventSubscriptionDiagnosis(i: DoctorInfo): CardElement[] {
+  const out: CardElement[] = [md('**事件订阅**')];
+  if (!i.eventDiagnosis) {
+    out.push(
+      md('- 状态：⚠️ 未检查'),
+      note('需要在开放平台「事件配置」订阅 `im.message.receive_v1` 并发布版本；卡片回传仍需在「回调配置」勾选 `card.action.trigger`。'),
+    );
+    if (i.eventConfigUrl) out.push(actions([linkButton('⚙️ 去事件与回调', i.eventConfigUrl)]));
+    return out;
+  }
+
+  out.push(md(`- 状态：${summarizeEventDiagnosis(i.eventDiagnosis)}`));
+  if (i.eventDiagnosis.missingOptional?.length) {
+    out.push(note(`可选事件未订阅：\n${i.eventDiagnosis.missingOptional.map((e) => `· ${e}`).join('\n')}`));
+  }
+  out.push(note('卡片按钮回传 `card.action.trigger` 属于「回调配置」，不在版本 API 的 events 列表里，仍需人工核对。'));
+  if (i.eventDiagnosis.state !== 'ok' && i.eventConfigUrl) out.push(actions([linkButton('⚙️ 去事件与回调', i.eventConfigUrl)]));
+  return out;
+}
+
 /**
  * 「加入存量群」诊断块：这俩 scope 是 opt-in（不在 REQUIRED_SCOPES 里，所以
- * 启动/凭据校验都不会提示），事件又没法查——存量用户最容易漏。这里把 scope
- * 状态显式渲染出来、缺失时给「去开通」按钮，并恒附一条无法自动检测的事件提醒。
+ * 启动/凭据校验都不会提示）。这里把 scope 状态显式渲染出来、缺失时给「去开通」
+ * 按钮；事件订阅状态则复用版本 API 的诊断结果。
  */
 function joinFeatureDiagnosis(i: DoctorInfo): CardElement[] {
   const out: CardElement[] = [md('**加入存量群（可选）**')];
@@ -359,12 +391,14 @@ function joinFeatureDiagnosis(i: DoctorInfo): CardElement[] {
       actions([linkButton('🔑 一键开通这两项权限', i.joinScopeGrantUrl)]),
     );
   }
-  out.push(
-    note(
-      '⚠️ 还需在后台「事件与回调」手动订阅 `im.chat.member.bot.added_v1`（被拉进群→推送绑定卡）和 ' +
-        '`im.chat.member.bot.deleted_v1`（被移出群→自动解绑）—— 飞书无查询接口，这里无法自动检测。',
-    ),
-  );
+  const events = new Set(i.eventDiagnosis?.events ?? []);
+  if (i.eventDiagnosis?.events) {
+    const added = events.has('im.chat.member.bot.added_v1');
+    const deleted = events.has('im.chat.member.bot.deleted_v1');
+    out.push(md(`- 事件：${added && deleted ? '✅ 已订阅' : '⚠️ 未完整订阅'}（added: ${added ? '已订阅' : '缺失'} / deleted: ${deleted ? '已订阅' : '缺失'}）`));
+  } else {
+    out.push(note('⚠️ 还需在后台「事件与回调」订阅 `im.chat.member.bot.added_v1` 和 `im.chat.member.bot.deleted_v1`。'));
+  }
   return out;
 }
 
@@ -406,6 +440,7 @@ function codexDiagnosePrompt(i: DoctorInfo): string {
     `- codex 可用：${i.codexOk ? '是' : '否'}`,
     `- 飞书长连接：${i.conn}`,
     `- 飞书权限：${scopeStatusText(i)}`,
+    `- 事件订阅：${i.eventDiagnosis ? summarizeEventDiagnosis(i.eventDiagnosis) : '未检查'}`,
     '',
     '【请你做的事】',
     '1. 读取并分析日志，找出最近的报错或异常堆栈：',
@@ -441,6 +476,8 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
       md(`- 飞书长连接：${connLabel(i.conn)}`),
       ...scopeDiagnosis(i),
       note(`${PRODUCT_NAME} v${i.bridgeVer}　·　Node ${i.node}　·　${i.platform}`),
+      hr(),
+      ...eventSubscriptionDiagnosis(i),
       hr(),
       ...joinFeatureDiagnosis(i),
       hr(),
@@ -913,6 +950,7 @@ export function buildProjectSettingsCard(
     | 'mcpServers'
     | 'topicWorkspace'
   >,
+  opts: { foodMcpTokens?: FoodMcpTokenStatus[] } = {},
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
@@ -921,6 +959,10 @@ export function buildProjectSettingsCard(
   const hasFoodMcp = foodMcpEnabled(project);
   const foodEnvVars = FOOD_MCP_SERVERS.map((server) => server.bearerTokenEnvVar).filter(Boolean).join(' / ');
   const foodSecretIds = FOOD_MCP_SERVERS.map((server) => server.bearerTokenSecretId).filter(Boolean).join(' / ');
+  const foodTokenStatus =
+    opts.foodMcpTokens && opts.foodMcpTokens.length
+      ? `Token 状态：${opts.foodMcpTokens.map((item) => `${item.title}${item.configured ? '已配置' : '未配置'}`).join(' / ')}`
+      : 'Token 状态：未检测';
   return card(
     [
       md(`**项目设置** · ${project.name}`),
@@ -943,6 +985,7 @@ export function buildProjectSettingsCard(
       actions([
         button(hasFoodMcp ? '停用瑞幸/麦当劳' : '启用瑞幸/麦当劳', { a: DM.foodMcpSet, v: hasFoodMcp ? 'off' : 'on', n: project.name }, hasFoodMcp ? 'danger' : 'primary'),
       ]),
+      note(foodTokenStatus),
       note(`Token 从环境变量或本地密钥库读取：${foodEnvVars}；密钥库 ${foodSecretIds}。启用后下一轮/新会话生效，付款仍需人工确认。`),
       hr(),
       md('✋ 免@（不用 @ 也回复）'),

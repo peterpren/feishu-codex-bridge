@@ -6,6 +6,7 @@ import { runStart, runStop, runRestart, runStatus, runLogs } from './commands/da
 import { runUpdate } from './commands/update';
 import { runBotInit, runBotList, runBotUse, runBotRm } from './commands/bot';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
+import { runFoodMcpProbe, runFoodMcpSetProject, runFoodMcpSetToken, runFoodMcpStatus } from './commands/food-mcp';
 
 const program = new Command();
 
@@ -100,6 +101,40 @@ program
   .description('本地自检：codex / 登录 / lark-cli / 当前机器人配置')
   .action(async () => {
     await runDoctor();
+  });
+
+const foodMcp = program.command('food-mcp').description('瑞幸/麦当劳 MCP 配置状态');
+foodMcp
+  .command('status')
+  .description('检查 Token 是否配置、哪些项目已启用餐饮 MCP')
+  .action(async () => {
+    await runFoodMcpStatus();
+  });
+foodMcp
+  .command('set-token <brand>')
+  .description('按品牌写入本地 Token（brand: luckin 或 mcd；值从 stdin 读）')
+  .action(async (brand: string) => {
+    await runFoodMcpSetToken(brand);
+  });
+foodMcp
+  .command('probe')
+  .description('只连接瑞幸/麦当劳 MCP 并列工具清单，不调用下单工具')
+  .action(async () => {
+    await runFoodMcpProbe();
+  });
+foodMcp
+  .command('enable-project <project>')
+  .description('为项目启用瑞幸/麦当劳 MCP')
+  .option('--bot <name>', '多机器人下指定 bot 名或 appId')
+  .action(async (project: string, options: { bot?: string }) => {
+    await runFoodMcpSetProject(project, true, options);
+  });
+foodMcp
+  .command('disable-project <project>')
+  .description('为项目停用瑞幸/麦当劳 MCP')
+  .option('--bot <name>', '多机器人下指定 bot 名或 appId')
+  .action(async (project: string, options: { bot?: string }) => {
+    await runFoodMcpSetProject(project, false, options);
   });
 
 // Internal plumbing — the `secrets-getter` wrapper execs `secrets get` to

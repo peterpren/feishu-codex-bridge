@@ -3,14 +3,20 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { paths, useBotDir } from '../../config/paths';
 import { ensureRegistry, currentBot } from '../../config/bots';
+import { loadConfig } from '../../config/store';
+import { isComplete } from '../../config/schema';
+import { resolveAppSecret } from '../../config/secret-resolver';
+import { buildEventConfigUrl } from '../../config/scopes';
 import { resolveCodexBin, codexVersion } from '../../agent/codex-appserver/locate';
 import { spawnProcessSync } from '../../platform/spawn';
 import { PRODUCT_NAME } from '../../core/branding';
+import { diagnoseEventSubscription, summarizeEventDiagnosis } from '../../utils/event-diagnosis';
 
 interface Check {
   name: string;
   ok: boolean;
   detail: string;
+  warn?: boolean;
 }
 
 /**
@@ -61,6 +67,7 @@ export async function runDoctor(): Promise<void> {
       ok: true,
       detail: `当前机器人「${cur.name}」(${cur.appId})  共 ${reg.bots.length} 个`,
     });
+    checks.push(await checkEventSubscription());
   } else if (cur) {
     checks.push({ name: 'bridge 配置', ok: false, detail: `配置文件缺失：${paths.configFile}` });
   } else {
@@ -74,11 +81,27 @@ export async function runDoctor(): Promise<void> {
   // render
   console.log(`\n🩺 ${PRODUCT_NAME} 自检\n`);
   for (const c of checks) {
-    console.log(`  ${c.ok ? '✅' : '❌'} ${c.name.padEnd(12)} ${c.detail}`);
+    console.log(`  ${c.ok ? (c.warn ? '⚠️' : '✅') : '❌'} ${c.name.padEnd(12)} ${c.detail}`);
   }
   const failed = checks.filter((c) => !c.ok).length;
   console.log(`\n${failed === 0 ? '全部通过 ✓' : `${failed} 项需处理`}\n`);
   process.exitCode = failed === 0 ? 0 : 1;
+}
+
+async function checkEventSubscription(): Promise<Check> {
+  try {
+    const cfg = await loadConfig();
+    if (!isComplete(cfg)) return { name: '事件订阅', ok: false, detail: '配置缺失或损坏，无法读取应用凭据' };
+    const app = cfg.accounts.app;
+    const secret = await resolveAppSecret(cfg);
+    const d = await diagnoseEventSubscription(app.id, secret, app.tenant);
+    const detail = `${summarizeEventDiagnosis(d)}  配置页：${buildEventConfigUrl(app.id, app.tenant)}`;
+    if (d.state === 'ok') return { name: '事件订阅', ok: true, detail };
+    if (d.state === 'unchecked') return { name: '事件订阅', ok: true, warn: true, detail };
+    return { name: '事件订阅', ok: false, detail };
+  } catch (err) {
+    return { name: '事件订阅', ok: true, warn: true, detail: `未能自动检查：${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 function tryExec(cmd: string, args: string[]): string | null {

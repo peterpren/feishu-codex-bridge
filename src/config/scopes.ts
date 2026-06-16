@@ -99,6 +99,13 @@ export const CLOUD_DOC_FOLDER_SCOPES = [
  */
 export const CONTACT_SCOPES = ['contact:user.base:readonly'] as const;
 
+/**
+ * Optional scope for reading the app's published versions, used only to diagnose
+ * whether event subscriptions have actually been published. It must not block
+ * the daemon-install gate.
+ */
+export const APP_VERSION_SCOPES = ['application:application.app_version:readonly'] as const;
+
 /** Everything the one-click grant URL pre-selects: required + opt-in extras. */
 export const GRANT_SCOPES = [
   ...REQUIRED_SCOPES,
@@ -106,6 +113,7 @@ export const GRANT_SCOPES = [
   ...JOIN_GROUP_SCOPES,
   ...CLOUD_DOC_FOLDER_SCOPES,
   ...CONTACT_SCOPES,
+  ...APP_VERSION_SCOPES,
 ] as const;
 
 /**
@@ -139,6 +147,7 @@ export const SCOPE_LABELS: Record<string, string> = {
   'docs:document.comment:create': '发表文档评论回复',
   'wiki:wiki:readonly': '读取知识库节点',
   'contact:user.base:readonly': '读取成员姓名（管理员 / 白名单展示）',
+  'application:application.app_version:readonly': '读取应用版本信息（自动诊断事件订阅）',
 };
 
 /** `<中文说明>（<token>）` for a known scope, else the raw token. */

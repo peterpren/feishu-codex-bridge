@@ -110,6 +110,7 @@ async function notifyRestartComplete(channel: LarkChannel, cfg: AppConfig): Prom
 
   const targets = [...new Set([resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])].filter((x): x is string => Boolean(x)))];
   const runTargets = (notice.runs ?? []).filter((run) => run.appId === appId);
+  const sendGenericNotice = shouldSendGenericRestartNotice(notice);
   let sent = 0;
   let runSent = 0;
   for (const run of runTargets) {
@@ -120,26 +121,38 @@ async function notifyRestartComplete(channel: LarkChannel, cfg: AppConfig): Prom
     }
   }
 
-  for (const openId of targets) {
-    try {
-      await channel.rawClient.im.v1.message.create({
-        params: { receive_id_type: 'open_id' },
-        data: {
-          receive_id: openId,
-          msg_type: 'text',
-          content: JSON.stringify({ text: restartNoticeText(appId, notice) }),
-        },
-      });
-      sent++;
-    } catch (err) {
-      log.fail('ws', err, { phase: 'restart-notice-send', appId, openId: openId.slice(-6) });
+  if (sendGenericNotice) {
+    for (const openId of targets) {
+      try {
+        await channel.rawClient.im.v1.message.create({
+          params: { receive_id_type: 'open_id' },
+          data: {
+            receive_id: openId,
+            msg_type: 'text',
+            content: JSON.stringify({ text: restartNoticeText(appId, notice) }),
+          },
+        });
+        sent++;
+      } catch (err) {
+        log.fail('ws', err, { phase: 'restart-notice-send', appId, openId: openId.slice(-6) });
+      }
     }
   }
 
-  if (sent > 0 || (targets.length === 0 && runTargets.length === 0)) {
+  if (sent > 0 || (sendGenericNotice && targets.length === 0 && runTargets.length === 0)) {
     await markRestartNoticeSent(appId, notice.id);
-    log.info('ws', 'restart-notice-sent', { appId, sent, runSent });
+    log.info('ws', 'restart-notice-sent', { appId, reason: notice.reason, sent, runSent, generic: sendGenericNotice });
+    return;
   }
+
+  if (!sendGenericNotice && runTargets.length === 0) {
+    await markRestartNoticeSent(appId, notice.id);
+    log.info('ws', 'restart-notice-skipped', { appId, reason: notice.reason });
+  }
+}
+
+export function shouldSendGenericRestartNotice(notice: Pick<RestartNotice, 'reason'>): boolean {
+  return notice.reason === 'version_update';
 }
 
 async function sendRestartRunNotice(channel: LarkChannel, notice: RestartNotice, run: RestartInterruptedRun): Promise<boolean> {

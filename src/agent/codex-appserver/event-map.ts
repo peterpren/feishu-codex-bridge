@@ -1,6 +1,8 @@
 import type { AgentEvent } from '../types';
 import type { ServerNotification, ThreadItem } from './protocol';
 
+const TOOL_DETAIL_MAX = 600;
+
 /**
  * Map one app-server ServerNotification to a normalized AgentEvent.
  * Returns null for notifications we don't surface (M1 subset).
@@ -49,11 +51,29 @@ function mapItemStart(item: ThreadItem): AgentEvent | null {
     case 'webSearch':
       return { type: 'tool_use', itemId: item.id, title: '联网搜索' };
     case 'mcpToolCall':
+      return {
+        type: 'tool_use',
+        itemId: item.id,
+        title: `MCP：${item.server} / ${item.tool}`,
+        detail: toolArgsDetail(item.arguments),
+      };
     case 'dynamicToolCall':
-      return { type: 'tool_use', itemId: item.id, title: '工具调用' };
+      return {
+        type: 'tool_use',
+        itemId: item.id,
+        title: item.namespace ? `工具调用：${item.namespace} / ${item.tool}` : `工具调用：${item.tool}`,
+        detail: toolArgsDetail(item.arguments),
+      };
     default:
       return null;
   }
+}
+
+function toolArgsDetail(args: unknown): string | undefined {
+  if (args === null || args === undefined) return undefined;
+  const raw = typeof args === 'string' ? args : JSON.stringify(args);
+  if (!raw || raw === '{}' || raw === '[]') return undefined;
+  return `参数：${raw.length > TOOL_DETAIL_MAX ? `${raw.slice(0, TOOL_DETAIL_MAX)}…` : raw}`;
 }
 
 function mapItemComplete(item: ThreadItem): AgentEvent | null {

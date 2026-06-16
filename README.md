@@ -211,7 +211,22 @@ feishu-codex-bridge stop|restart|status|logs   后台 daemon 生命周期
 feishu-codex-bridge update             更新到最新版并自动重启 daemon（--check 只查不装）
 feishu-codex-bridge bot init|list|use|rm       多飞书机器人：注册 / 列表 / 切当前 / 移除
 feishu-codex-bridge doctor             本地自检：codex / 登录 / lark-cli / 当前机器人
+feishu-codex-bridge food-mcp status    瑞幸/麦当劳 MCP Token、项目启用与 bot 授权状态
+feishu-codex-bridge food-mcp probe     只连接餐饮 MCP 并列工具清单，不调用下单工具
+feishu-codex-bridge food-mcp enable-project <项目名>   为项目启用餐饮 MCP（多 bot 可加 --bot）
 ```
+
+餐饮 MCP 的 Token 存本机密钥库，不要发到飞书或聊天里：
+
+```bash
+feishu-codex-bridge food-mcp set-token luckin
+feishu-codex-bridge food-mcp set-token mcd
+feishu-codex-bridge restart
+feishu-codex-bridge food-mcp status
+feishu-codex-bridge food-mcp probe
+```
+
+`set-token` 会在终端隐藏输入；自动化脚本仍可用 stdin 传入。
 
 ---
 

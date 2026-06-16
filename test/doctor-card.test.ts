@@ -157,6 +157,31 @@ describe('buildDoctorCard — 飞书权限自检', () => {
   });
 });
 
+describe('buildDoctorCard — 事件订阅自检', () => {
+  const EVENT_URL = 'https://open.feishu.cn/app/cli_x/event';
+
+  it('surfaces event diagnosis and carries it into the copy-paste prompt', () => {
+    const card = buildDoctorCard(
+      info({
+        eventDiagnosis: {
+          state: 'missing',
+          version: '1.0.0',
+          events: ['application.bot.menu_v6'],
+          missingRequired: ['im.message.receive_v1'],
+          missingOptional: ['drive.notice.comment_add_v1'],
+        },
+        eventConfigUrl: EVENT_URL,
+      }),
+    );
+    const json = JSON.stringify(card);
+    expect(json).toContain('事件订阅');
+    expect(json).toContain('im.message.receive_v1');
+    expect(json).toContain('drive.notice.comment_add_v1');
+    expect(collectUrls(card)).toContain(EVENT_URL);
+    expect(codeBlock(card)).toContain('事件订阅');
+  });
+});
+
 describe('buildDoctorCard — 加入存量群（opt-in scope 提示）', () => {
   const JOIN_GRANT = 'https://open.feishu.cn/app/cli_x/auth?q=im%3Achat%3Areadonly%2Cim%3Achat.members%3Awrite_only';
 

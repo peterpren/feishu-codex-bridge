@@ -110,10 +110,45 @@ describe('mapNotification', () => {
       itemId: 'search-1',
       title: '联网搜索',
     });
-    expect(mapNotification(itemStarted({ type: 'mcpToolCall', id: 'mcp-1' } as ThreadItem))).toEqual({
+    expect(
+      mapNotification(
+        itemStarted({
+          type: 'mcpToolCall',
+          id: 'mcp-1',
+          server: 'mcd-mcp',
+          tool: 'create_order',
+          status: 'inProgress',
+          arguments: { sku: 'burger', count: 1 },
+          result: null,
+          error: null,
+          durationMs: null,
+        } as ThreadItem),
+      ),
+    ).toEqual({
       type: 'tool_use',
       itemId: 'mcp-1',
-      title: '工具调用',
+      title: 'MCP：mcd-mcp / create_order',
+      detail: '参数：{"sku":"burger","count":1}',
+    });
+    expect(
+      mapNotification(
+        itemStarted({
+          type: 'dynamicToolCall',
+          id: 'dyn-1',
+          namespace: 'browser',
+          tool: 'click',
+          arguments: { selector: '#ok' },
+          status: 'inProgress',
+          contentItems: null,
+          success: null,
+          durationMs: null,
+        } as ThreadItem),
+      ),
+    ).toEqual({
+      type: 'tool_use',
+      itemId: 'dyn-1',
+      title: '工具调用：browser / click',
+      detail: '参数：{"selector":"#ok"}',
     });
     expect(mapNotification(itemCompleted({ type: 'dynamicToolCall', id: 'dyn-1' } as ThreadItem))).toEqual({
       type: 'tool_result',

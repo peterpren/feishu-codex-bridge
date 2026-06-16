@@ -70,6 +70,7 @@ import {
   DM,
   GS,
   type DoctorInfo,
+  type FoodMcpTokenStatus,
 } from '../card/dm-cards';
 import { resolveCodexBin, codexVersion } from '../agent/codex-appserver/locate';
 import { fetchUsageBundle, UsageError } from '../agent/codex-appserver/usage';
@@ -95,13 +96,15 @@ import { recordRestartInterruptedRuns, type RestartInterruptedRun } from '../ser
 import { bridgeVersion } from '../core/version';
 import { paths } from '../config/paths';
 import { getSecret } from '../config/keystore';
-import { buildScopeGrantUrl, CLOUD_DOC_FOLDER_SCOPES, JOIN_GROUP_SCOPES } from '../config/scopes';
+import { buildEventConfigUrl, buildScopeGrantUrl, CLOUD_DOC_FOLDER_SCOPES, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
+import { diagnoseEventSubscription } from '../utils/event-diagnosis';
 import {
   defaultNoMention,
   effectiveMode,
   effectiveNetwork,
   enabledProjectMcpServers,
+  FOOD_MCP_SERVERS,
   getProjectByChatId,
   getProjectByName,
   listProjects,
@@ -148,6 +151,18 @@ import { fetchQuotedMessage, fetchThreadContext, weaveQuote, weaveThreadHistory 
 import { textRequestsCloudDocFolder } from './cloud-doc-intent';
 import { pickBridgeDefaults } from './model-defaults';
 import { deriveTopicTitle, formatTopicTitleMessage, normalizeManualTopicTitle, type TopicRequester } from './topic-title';
+import {
+  completePersonalAuth,
+  createPersonalAuthLink,
+  disconnectPersonalAuth,
+  personalAuthStatus,
+} from '../personal/oauth';
+import {
+  detectPersonalDataIntent,
+  fetchPersonalDataBundle,
+  formatPersonalDataForPrompt,
+  parsePersonalDataCommand,
+} from '../personal/gateway';
 import {
   mentionedPrivateParticipants,
   parsePrivateTaskText,
@@ -285,6 +300,36 @@ interface RunReaction {
   done: () => void;
 }
 
+export class RecentIdCache {
+  private readonly entries = new Map<string, number>();
+
+  constructor(
+    private readonly maxEntries = 4096,
+    private readonly ttlMs = 10 * 60_000,
+  ) {}
+
+  /** Returns true when this id was already seen within the TTL. */
+  seen(id: string): boolean {
+    const now = Date.now();
+    this.prune(now);
+    const prev = this.entries.get(id);
+    if (prev !== undefined && now - prev < this.ttlMs) return true;
+    this.entries.set(id, now);
+    while (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.entries.delete(oldest);
+    }
+    return false;
+  }
+
+  private prune(now: number): void {
+    for (const [id, ts] of this.entries) {
+      if (now - ts >= this.ttlMs) this.entries.delete(id);
+    }
+  }
+}
+
 export interface Orchestrator {
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
@@ -335,6 +380,7 @@ export function createOrchestrator(
   const docLocks = new Map<string, Promise<void>>();
   const sema = new Semaphore(getMaxConcurrentRuns(cfg));
   const idleMs = getRunIdleTimeoutMs(cfg) ?? 0;
+  const seenInbound = new RecentIdCache();
   // pendingPolicy is read per-message (settings card can change it live)
   /** pending /resume cards, keyed by the card's messageId */
   const resumePending = new Map<string, ResumeCardState>();
@@ -572,6 +618,15 @@ export function createOrchestrator(
 
   // ── inbound messages ──────────────────────────────────────────────
   const onMessage = async (msg: NormalizedMessage): Promise<void> => {
+    if (seenInbound.seen(`message:${msg.messageId}`)) {
+      log.info('intake', 'dedupe', {
+        chatType: msg.chatType,
+        threadId: msg.threadId ?? null,
+        msgId: msg.messageId,
+      });
+      return;
+    }
+
     log.info('intake', 'recv', {
       chatType: msg.chatType,
       mentionedBot: msg.mentionedBot,
@@ -579,7 +634,19 @@ export function createOrchestrator(
       preview: msg.content.slice(0, 40),
     });
 
+    const text = msg.content.trim();
+    const cmd = parseCommand(text);
+
     if (msg.chatType === 'p2p') {
+      if (cmd === 'connect') {
+        if (!(await allowConnectHere(msg, text, undefined, false))) return;
+        await handleConnectCommand(msg, text, false);
+        return;
+      }
+      if (cmd === 'me') {
+        await handlePersonalStatusCommand(msg, text, false);
+        return;
+      }
       await handleDmConsole(channel, cfg, msg);
       return;
     }
@@ -610,13 +677,20 @@ export function createOrchestrator(
       return;
     }
 
-    const text = msg.content.trim();
-    const cmd = parseCommand(text);
-
     // Single-session group: the whole group is one session keyed by chatId. No
     // topics — reply by quoting (引用回复); runs serialize per chatId (active[chatId]).
     // Commands: /settings (群设置) + /model. /resume has no topic list here.
     if ((project?.kind ?? 'multi') === 'single') {
+      const ts = turnSession(msg.chatId, project, msg.senderId);
+      if (cmd === 'connect') {
+        if (!(await allowConnectHere(msg, text, project, false))) return;
+        await handleConnectCommand(msg, text, false);
+        return;
+      }
+      if (cmd === 'me') {
+        await handlePersonalDataCommand(msg, text, project, ts);
+        return;
+      }
       if (cmd === 'help') {
         await postHelpCard(msg, project.private ? 'private' : 'single', false, project);
         return;
@@ -625,9 +699,8 @@ export function createOrchestrator(
         await postGroupSettings(msg, project);
         return;
       }
-      const ts = turnSession(msg.chatId, project, msg.senderId);
       if (cmd === 'model') {
-        await postModelCard(msg, ts.sessionKey);
+        await postModelCard(msg, ts.sessionKey, false);
         return;
       }
       if (cmd === 'context') {
@@ -654,6 +727,7 @@ export function createOrchestrator(
           .catch(() => undefined);
         return;
       }
+      if (await handlePersonalDataIntent(msg, text, project, ts)) return;
       handleTurn(msg, text, ts.sessionKey, true, project, ts);
       return;
     }
@@ -662,6 +736,17 @@ export function createOrchestrator(
     // /rename are topic-scoped commands; /settings + /resume aren't topic-scoped,
     // so they fall through as normal turns.
     if (msg.threadId) {
+      if (cmd === 'connect') {
+        if (!(await allowConnectHere(msg, text, project, true))) return;
+        await handleConnectCommand(msg, text, true);
+        return;
+      }
+      if (cmd === 'me') {
+        await channel
+          .send(msg.chatId, { markdown: '`/me` 个人飞书资料只在私密协作群里启用。请先用 `/private` 拉一个私密群。' }, { replyTo: msg.messageId, replyInThread: true })
+          .catch(() => undefined);
+        return;
+      }
       if (cmd === 'help') {
         await postHelpCard(msg, 'topic', true, project);
         return;
@@ -673,7 +758,7 @@ export function createOrchestrator(
         return;
       }
       if (cmd === 'model') {
-        await postModelCard(msg, ts.sessionKey);
+        await postModelCard(msg, ts.sessionKey, true);
         return;
       }
       if (cmd === 'context') {
@@ -696,6 +781,17 @@ export function createOrchestrator(
     // directly creates a topic + runs.
     if (cmd === 'help') {
       await postHelpCard(msg, 'main', false, project);
+      return;
+    }
+    if (cmd === 'connect') {
+      if (!(await allowConnectHere(msg, text, project, false))) return;
+      await handleConnectCommand(msg, text, false);
+      return;
+    }
+    if (cmd === 'me') {
+      await channel
+        .send(msg.chatId, { markdown: '`/me` 个人飞书资料只在私密协作群里启用。请先用 `/private` 拉一个私密群。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
       return;
     }
     if (cmd === 'resume') {
@@ -726,7 +822,18 @@ export function createOrchestrator(
   };
 
   /** Parse a leading slash command; null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'rename' | 'private' | 'context' | 'compact' | null {
+  function parseCommand(text: string):
+    | 'resume'
+    | 'model'
+    | 'settings'
+    | 'help'
+    | 'rename'
+    | 'private'
+    | 'context'
+    | 'compact'
+    | 'connect'
+    | 'me'
+    | null {
     const m = /^\/([\w-]+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
     return name === 'resume' ||
@@ -736,7 +843,9 @@ export function createOrchestrator(
       name === 'rename' ||
       name === 'private' ||
       name === 'context' ||
-      name === 'compact'
+      name === 'compact' ||
+      name === 'connect' ||
+      name === 'me'
       ? name
       : null;
   }
@@ -825,6 +934,198 @@ export function createOrchestrator(
     if (isAdmin(cfg, openId)) return true;
     if (!project.private) return false;
     return (await privateRequesterOpenId(project)) === openId;
+  }
+
+  function connectArg(text: string): string {
+    return text.replace(/^\/connect\b/i, '').trim();
+  }
+
+  function isConnectStatusOrRevoke(text: string): boolean {
+    const arg = connectArg(text);
+    return /^(status|状态|revoke|disconnect|解绑|取消授权)$/i.test(arg);
+  }
+
+  async function allowConnectHere(msg: NormalizedMessage, text: string, project: Project | undefined, inThread: boolean): Promise<boolean> {
+    if (project?.private || isConnectStatusOrRevoke(text)) return true;
+    const target = msg.chatType === 'p2p' ? '先到项目群里使用 `/private` 创建一个私密协作群' : '先用 `/private` 创建私密协作群';
+    await channel
+      .send(
+        msg.chatId,
+        { markdown: `个人飞书授权请在私密协作群里完成。请${target}，再在那个私密群里发送 \`/connect\`。` },
+        { replyTo: msg.messageId, replyInThread: inThread },
+      )
+      .catch(() => undefined);
+    return false;
+  }
+
+  async function handleConnectCommand(msg: NormalizedMessage, text: string, inThread: boolean): Promise<void> {
+    const arg = connectArg(text);
+    const reply = (markdown: string): Promise<void> =>
+      channel
+        .send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: inThread })
+        .then(() => undefined, () => undefined);
+
+    if (/^(status|状态)$/i.test(arg)) {
+      await reply(formatPersonalAuthStatus(await personalAuthStatus(cfg, msg.senderId)));
+      return;
+    }
+    if (/^(revoke|disconnect|解绑|取消授权)$/i.test(arg)) {
+      const removed = await disconnectPersonalAuth(cfg, msg.senderId);
+      await reply(removed ? '✅ 已解除你的个人飞书授权。' : '你还没有绑定个人飞书授权。');
+      return;
+    }
+    if (arg) {
+      try {
+        const record = await completePersonalAuth(channel, cfg, msg.senderId, arg);
+        await reply(
+          `✅ 已绑定你的个人飞书权限${record.name ? `：${record.name}` : ''}。\n\n后续在私密协作群里可以直接自然语言提需求，例如：\n· 帮我查一下我飞书里有没有玉豆相关资料\n· 基于我上周的会议纪要，整理一下待办`,
+        );
+      } catch (err) {
+        await reply(`❌ 绑定失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    const link = await createPersonalAuthLink(cfg, msg.senderId, msg.chatId);
+    await reply(
+      [
+        '🔐 **绑定个人飞书权限**',
+        '',
+        '1. 打开下面链接并完成授权：',
+        link.url,
+        '',
+        '2. 授权后浏览器会跳到一个回调地址。如果页面显示“无法连接服务器”，这是测试版的正常现象，说明授权 code 已经写进地址栏。',
+        '',
+        '3. 不要刷新页面，把地址栏里的完整 URL 复制回来，发送：',
+        '`/connect 回调URL`',
+        '',
+        `回调地址需要先在飞书开放平台配置：\`${link.redirectUri}\``,
+        `本次 state：\`${link.state}\`，10 分钟内有效。`,
+      ].join('\n'),
+    );
+  }
+
+  async function handlePersonalStatusCommand(msg: NormalizedMessage, text: string, inThread: boolean): Promise<void> {
+    const parsed = parsePersonalDataCommand(text);
+    if (parsed.kind === 'status') {
+      await channel
+        .send(msg.chatId, { markdown: formatPersonalAuthStatus(await personalAuthStatus(cfg, msg.senderId)) }, { replyTo: msg.messageId, replyInThread: inThread })
+        .catch(() => undefined);
+      return;
+    }
+    await channel
+      .send(
+        msg.chatId,
+        {
+          markdown:
+            '`/me` 是调试入口。正式使用时，请先在私密协作群发送 `/connect` 绑定权限，然后直接自然语言提需求，例如“帮我查一下我飞书里的预算复盘资料”。',
+        },
+        { replyTo: msg.messageId, replyInThread: inThread },
+      )
+      .catch(() => undefined);
+  }
+
+  async function handlePersonalDataCommand(
+    msg: NormalizedMessage,
+    text: string,
+    project: Project,
+    perm: { sessionKey: string } & TurnPerm,
+  ): Promise<void> {
+    const reply = (markdown: string): Promise<void> =>
+      channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId }).then(() => undefined, () => undefined);
+    const parsed = parsePersonalDataCommand(text);
+    if (parsed.kind === 'status') {
+      await reply(formatPersonalAuthStatus(await personalAuthStatus(cfg, msg.senderId)));
+      return;
+    }
+    if (parsed.kind === 'help') {
+      await reply('`/me` 是调试入口。正式使用时，在私密协作群里先 `/connect`，然后直接自然语言提需求。\n\n调试用法：\n· `/me docs 关键词`\n· `/me minutes 关键词`\n· `/me status`');
+      return;
+    }
+    if (!project.private) {
+      await reply('`/me` 个人飞书资料只在私密协作群里启用。请先在项目群用 `/private` 拉一个私密群。');
+      return;
+    }
+    if (!parsed.kind || !['docs', 'minutes'].includes(parsed.kind)) {
+      await reply('用法：`/me docs 关键词` 或 `/me minutes 关键词`。');
+      return;
+    }
+    try {
+      const bundle = await fetchPersonalDataBundle(channel, cfg, {
+        kind: parsed.kind,
+        query: parsed.query,
+        appId: cfg.accounts.app.id,
+        openId: msg.senderId,
+        chatId: msg.chatId,
+        messageId: msg.messageId,
+        projectName: project.name,
+      });
+      const label = parsed.kind === 'minutes' ? '会议纪要/妙记' : '个人文档';
+      const prompt = [
+        `用户要求基于其个人飞书权限查询${label}：${parsed.query || '(未指定关键词)'}`,
+        '',
+        formatPersonalDataForPrompt(bundle),
+        '',
+        '请基于以上搜索结果和正文摘录回答。若结果不足以回答，直接说明还需要用户补充更明确的关键词或文档链接。',
+      ].join('\n');
+      await handleTurn(msg, prompt, perm.sessionKey, true, project, perm);
+    } catch (err) {
+      await reply(`❌ 个人飞书资料读取失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handlePersonalDataIntent(
+    msg: NormalizedMessage,
+    text: string,
+    project: Project,
+    perm: { sessionKey: string } & TurnPerm,
+  ): Promise<boolean> {
+    if (!project.private) return false;
+    const intent = detectPersonalDataIntent(text);
+    if (!intent) return false;
+
+    const reply = (markdown: string): Promise<void> =>
+      channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId }).then(() => undefined, () => undefined);
+    const status = await personalAuthStatus(cfg, msg.senderId);
+    if (!status.connected) {
+      await reply('这条需求需要读取你的个人飞书资料。请先在本私密协作群发送 `/connect` 完成授权；授权后再直接用自然语言提需求。');
+      return true;
+    }
+
+    try {
+      const bundle = await fetchPersonalDataBundle(channel, cfg, {
+        kind: intent.kind,
+        query: intent.query,
+        appId: cfg.accounts.app.id,
+        openId: msg.senderId,
+        chatId: msg.chatId,
+        messageId: msg.messageId,
+        projectName: project.name,
+      });
+      const label = intent.kind === 'minutes' ? '会议纪要/妙记' : '个人文档';
+      const prompt = [
+        `用户原始需求：${text}`,
+        '',
+        `Bridge 已按当前发言人的个人飞书权限查询${label}。`,
+        '',
+        formatPersonalDataForPrompt(bundle),
+        '',
+        '请基于用户原始需求、当前会话上下文，以及以上个人飞书搜索结果回答。若结果不足以支撑结论，直接说明需要更明确的关键词、文档链接或会议范围。',
+      ].join('\n');
+      await handleTurn(msg, prompt, perm.sessionKey, true, project, perm);
+    } catch (err) {
+      await reply(`❌ 个人飞书资料读取失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    return true;
+  }
+
+  function formatPersonalAuthStatus(status: Awaited<ReturnType<typeof personalAuthStatus>>): string {
+    if (!status.connected) return '还没有绑定个人飞书权限。发送 `/connect` 获取授权链接。';
+    const lines = [`✅ 已绑定个人飞书权限${status.name ? `：${status.name}` : ''}`];
+    if (status.accessExpiresAt) lines.push(`Access Token 到期：${new Date(status.accessExpiresAt).toLocaleString('zh-CN', { hour12: false })}`);
+    if (status.refreshExpiresAt) lines.push(`Refresh Token 到期：${new Date(status.refreshExpiresAt).toLocaleString('zh-CN', { hour12: false })}`);
+    lines.push('', '解除绑定：`/connect revoke`');
+    return lines.join('\n');
   }
 
   /** A turn's resolved permission, by sender role. `roleSuffix` is set only when
@@ -1499,7 +1800,7 @@ export function createOrchestrator(
 
   /** @bot /model: post the model/effort picker for the session keyed by
    * `sessionKey` (topic threadId for multi, chatId for single). */
-  async function postModelCard(msg: NormalizedMessage, sessionKey: string): Promise<void> {
+  async function postModelCard(msg: NormalizedMessage, sessionKey: string, inThread: boolean): Promise<void> {
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const [models, rec] = await Promise.all([listModels(), getSession(sessionKey)]);
       const def = pickDefault(models);
@@ -1513,7 +1814,7 @@ export function createOrchestrator(
         serviceTier: rec?.serviceTier ?? def.serviceTier,
         createdAt: Date.now(),
       };
-      const res = await sendManagedCard(channel, msg.chatId, buildModelCard(state), msg.messageId, true);
+      const res = await sendManagedCard(channel, msg.chatId, buildModelCard(state), msg.messageId, inThread);
       pruneModelPending();
       modelPending.set(res.messageId, state);
       log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort, serviceTier: state.serviceTier ?? null });
@@ -2146,6 +2447,29 @@ export function createOrchestrator(
     return buildProjectListCard(projects, byChat);
   };
 
+  type ProjectSettingsInput = Parameters<typeof buildProjectSettingsCard>[0];
+
+  async function foodMcpTokenStatus(): Promise<FoodMcpTokenStatus[]> {
+    return Promise.all(
+      FOOD_MCP_SERVERS.map(async (server) => {
+        const envVar = server.bearerTokenEnvVar?.trim();
+        const secretId = server.bearerTokenSecretId?.trim();
+        const configuredByEnv = Boolean(envVar && process.env[envVar]);
+        const configuredBySecret = Boolean(secretId && (await getSecret(secretId).catch(() => undefined)));
+        return {
+          title: server.title ?? server.name,
+          envVar,
+          secretId,
+          configured: configuredByEnv || configuredBySecret,
+        };
+      }),
+    );
+  }
+
+  async function projectSettingsCard(project: ProjectSettingsInput): Promise<object> {
+    return buildProjectSettingsCard(project, { foodMcpTokens: await foodMcpTokenStatus() });
+  }
+
   dispatcher
     .on(DM.menu, ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
@@ -2300,6 +2624,9 @@ export function createOrchestrator(
       const scopeCheck = secret
         ? await validateAppCredentials(app.id, secret, app.tenant).catch(() => undefined)
         : undefined;
+      const eventDiagnosis = secret
+        ? await diagnoseEventSubscription(app.id, secret, app.tenant).catch(() => undefined)
+        : undefined;
       const missingScopes = scopeCheck?.missingScopes;
       const missingJoinScopes = scopeCheck?.missingJoinScopes;
       const missingCloudDocFolderScopes = scopeCheck?.missingCloudDocFolderScopes;
@@ -2325,6 +2652,8 @@ export function createOrchestrator(
         joinScopeGrantUrl: buildScopeGrantUrl(app.id, app.tenant, JOIN_GROUP_SCOPES),
         missingCloudDocFolderScopes,
         cloudDocFolderScopeGrantUrl: buildScopeGrantUrl(app.id, app.tenant, CLOUD_DOC_FOLDER_SCOPES),
+        eventDiagnosis,
+        eventConfigUrl: buildEventConfigUrl(app.id, app.tenant),
       };
       // A reply card (not a patch of the menu) so the diagnosis persists below
       // the console; re-open the menu by messaging the bot.
@@ -2580,7 +2909,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        return p ? buildProjectSettingsCard(p) : buildDmMenuCard();
+        return p ? projectSettingsCard(p) : buildDmMenuCard();
       });
     })
     .on(DM.cloudDocFolderForm, ({ evt, value }) => {
@@ -2610,7 +2939,7 @@ export function createOrchestrator(
           }
           await updateProject(name, { cloudDocFolder });
           const fresh = await getProjectByName(name);
-          result = fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
+          result = fresh ? await projectSettingsCard(fresh) : buildDmMenuCard();
         } catch (err) {
           result = buildCloudDocFolderFormCard(p, { value: raw, error: err instanceof Error ? err.message : String(err) });
         }
@@ -2625,7 +2954,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         await updateProject(name, { cloudDocFolder: undefined });
         const fresh = await getProjectByName(name);
-        return fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
+        return fresh ? projectSettingsCard(fresh) : buildDmMenuCard();
       });
     })
     .on(DM.foodMcpSet, ({ evt, value }) => {
@@ -2641,7 +2970,7 @@ export function createOrchestrator(
         await evictLiveSessionsForChat(p.chatId);
         log.info('console', 'food-mcp', { project: name, enabled });
         const fresh = await getProjectByName(name);
-        return fresh ? buildProjectSettingsCard(fresh) : buildDmMenuCard();
+        return fresh ? projectSettingsCard(fresh) : buildDmMenuCard();
       });
     })
     .on(DM.setNoMentionDm, ({ evt, value }) => {
@@ -2652,7 +2981,7 @@ export function createOrchestrator(
         const p = await getProjectByName(name);
         if (!p) return buildDmMenuCard();
         await updateProject(name, { noMention: on });
-        return buildProjectSettingsCard({ ...p, noMention: on });
+        return projectSettingsCard({ ...p, noMention: on });
       });
     })
     .on(DM.setAutoCompactDm, ({ evt, value }) => {
@@ -2665,7 +2994,7 @@ export function createOrchestrator(
         await updateProject(name, { autoCompact: on });
         await evictLiveSessionsForChat(p.chatId);
         log.info('console', 'project-autocompact', { project: name, on });
-        return buildProjectSettingsCard({ ...p, autoCompact: on });
+        return projectSettingsCard({ ...p, autoCompact: on });
       });
     })
     // 🔐 权限：打开下拉表单子卡（管理员档 + 普通用户档 + 联网，选完提交）。
@@ -2694,7 +3023,7 @@ export function createOrchestrator(
         log.info('console', 'permission', { project: name, mode, guestMode, network });
         const fresh = await getProjectByName(name); // 写后回读，卡片与盘上一致
         if (!fresh) return;
-        await sendManagedCard(channel, evt.chatId, buildProjectSettingsCard(fresh)).catch((e) =>
+        await sendManagedCard(channel, evt.chatId, await projectSettingsCard(fresh)).catch((e) =>
           log.fail('console', e, { phase: 'permission-result' }),
         );
       })();
@@ -3197,6 +3526,16 @@ export function createOrchestrator(
    */
   const onComment = async (evt: CommentEvent): Promise<void> => {
     await withTrace({ chatId: 'comment' }, async () => {
+      const dedupeKey = `comment:${evt.fileToken}:${evt.commentId}:${evt.replyId ?? ''}`;
+      if (seenInbound.seen(dedupeKey)) {
+        log.info('comment', 'dedupe', {
+          doc: evt.fileToken,
+          commentId: evt.commentId,
+          replyId: evt.replyId ?? null,
+        });
+        return;
+      }
+
       log.info('comment', 'enter', {
         doc: evt.fileToken,
         fileType: evt.fileType,

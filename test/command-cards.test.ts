@@ -122,6 +122,11 @@ describe('buildHelpCard 权限过滤', () => {
     const json = JSON.stringify(buildHelpCard('private', false, true));
     expect(json).toContain('/rename 新群名');
     expect(json).toContain('/settings');
+    expect(json).toContain('/connect');
+    expect(json).toContain('自然语言提需求');
+    expect(json).toContain('/me status');
+    expect(json).not.toContain('/me docs');
+    expect(json).not.toContain('/me minutes');
     expect(json).toContain('本群默认需 @');
   });
 

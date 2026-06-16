@@ -8,6 +8,7 @@ import {
   recordRestartInterruptedRuns,
   restartNoticeForApp,
 } from '../src/service/restart-notice';
+import { shouldSendGenericRestartNotice } from '../src/bot/bridge';
 
 const dirs: string[] = [];
 
@@ -25,6 +26,11 @@ afterEach(async () => {
 });
 
 describe('restart notice marker', () => {
+  it('only sends generic admin notice for version update restarts', () => {
+    expect(shouldSendGenericRestartNotice({ reason: 'version_update' })).toBe(true);
+    expect(shouldSendGenericRestartNotice({ reason: 'manual_restart' })).toBe(false);
+  });
+
   it('is visible once per app within the restart window', async () => {
     const dir = await tempDir();
     const now = new Date('2026-06-11T08:00:00.000Z');

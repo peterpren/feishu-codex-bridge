@@ -50,6 +50,14 @@ export const paths = {
   get runsDir(): string {
     return join(currentBotDir, 'runs');
   },
+  /** personal Feishu OAuth metadata（当前 bot；token 明文在 keystore，不在此文件） */
+  get personalAuthFile(): string {
+    return join(currentBotDir, 'personal-auth.json');
+  },
+  /** personal-data gateway audit logs（当前 bot，按日期写 JSONL） */
+  get personalAuditDir(): string {
+    return join(currentBotDir, 'personal-audit');
+  },
   secretsFile: join(appDir, 'secrets.enc'),
   keystoreSaltFile: join(appDir, '.keystore.salt'),
   npmCacheDir: join(appDir, 'npm-cache'),

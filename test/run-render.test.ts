@@ -120,6 +120,14 @@ describe('buildRunCard', () => {
     expect(json).not.toContain('npm test');
     expect(json).toContain('text only');
   });
+
+  it('renders tool detail in the expanded running panel', () => {
+    const rs = run([{ type: 'tool_use', itemId: 'mcp-1', title: 'MCP：mcd-mcp / create_order', detail: '参数：{"sku":"burger"}' }]);
+    const json = JSON.stringify(buildRunCard({ rs }));
+
+    expect(json).toContain('MCP：mcd-mcp / create_order');
+    expect(json).toContain('参数：{\\\"sku\\\":\\\"burger\\\"}');
+  });
 });
 
 describe('buildRunCard — terminal collapse', () => {

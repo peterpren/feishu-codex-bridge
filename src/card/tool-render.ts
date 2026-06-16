@@ -17,12 +17,13 @@ export function toolHeaderText(tool: ToolEntry): string {
 
 /** Panel body: the command's output as a code block (Error on non-zero exit). */
 export function toolBodyMd(tool: ToolEntry): string {
+  const detail = tool.detail ? truncate(tool.detail, OUTPUT_MAX) : '';
   if (!tool.output) {
-    return tool.status === 'running' ? '_运行中…_' : '';
+    return [detail, tool.status === 'running' ? '_运行中…_' : ''].filter(Boolean).join('\n\n');
   }
   const out = truncate(tool.output, OUTPUT_MAX);
   const label = tool.status === 'error' ? 'Error' : 'Output';
-  const body = `**${label}**\n\`\`\`\n${out}\n\`\`\``;
+  const body = [detail, `**${label}**\n\`\`\`\n${out}\n\`\`\``].filter(Boolean).join('\n\n');
   if (body.length <= BODY_TOTAL_MAX) return body;
   return `${body.slice(0, BODY_TOTAL_MAX)}…\n\n_（已截断，完整内容见日志）_`;
 }

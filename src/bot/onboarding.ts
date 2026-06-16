@@ -6,6 +6,7 @@ import { resolveAppSecret } from '../config/secret-resolver';
 import { runRegistrationWizard } from './wizard';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
+import { diagnoseEventSubscription, summarizeEventDiagnosis, type EventDiagnosis } from '../utils/event-diagnosis';
 import { resolveCodexBin } from '../agent/codex-appserver/locate';
 import { openUrl } from '../utils/open-url';
 import { log } from '../core/logger';
@@ -17,6 +18,8 @@ export interface OnboardResult {
   secret: string;
   /** required scopes still ungranted at validation time (undefined = couldn't check). */
   missingScopes?: string[];
+  /** Event subscription diagnosis from the app version API. */
+  events?: EventDiagnosis;
 }
 
 /** Verify codex CLI is present (needed to run AND to spawn the per-session app-server). */
@@ -75,7 +78,7 @@ export async function ensureOnboarded(
   }
   const r = await validateAndReport(cfg);
   if (r === null) return null;
-  return { cfg, secret: r.secret, missingScopes: r.missingScopes };
+  return { cfg, secret: r.secret, missingScopes: r.missingScopes, events: r.events };
 }
 
 /**
@@ -123,13 +126,17 @@ export async function registerNewBot(desiredName?: string): Promise<OnboardResul
   console.log(`✓ 已创建机器人「${name}」  bot: ${v.botName ?? '-'}  appId: ${app.id}`);
   log.info('onboard', 'bot-created', { name, appId: app.id, bot: v.botName ?? null });
   showScopeGrant(cfg, v.missingScopes);
+  const events = await diagnoseEventSubscription(app.id, app.secret, app.tenant);
+  showEventDiagnosis(cfg, events);
 
   const secret = await resolveAppSecret(cfg);
-  return { cfg, secret, missingScopes: v.missingScopes };
+  return { cfg, secret, missingScopes: v.missingScopes, events };
 }
 
 /** Resolve secret, validate credentials, print result + scope-grant link. */
-async function validateAndReport(cfg: AppConfig): Promise<{ secret: string; missingScopes?: string[] } | null> {
+async function validateAndReport(
+  cfg: AppConfig,
+): Promise<{ secret: string; missingScopes?: string[]; events?: EventDiagnosis } | null> {
   const secret = await resolveAppSecret(cfg);
   const v = await validateAppCredentials(cfg.accounts.app.id, secret, cfg.accounts.app.tenant);
   if (!v.ok) {
@@ -140,15 +147,18 @@ async function validateAndReport(cfg: AppConfig): Promise<{ secret: string; miss
   console.log(`✓ 凭据校验通过  bot: ${v.botName ?? '-'}  appId: ${cfg.accounts.app.id}`);
   log.info('onboard', 'credentials-ok', { appId: cfg.accounts.app.id, bot: v.botName ?? null });
   showScopeGrant(cfg, v.missingScopes);
-  return { secret, missingScopes: v.missingScopes };
+  const events = await diagnoseEventSubscription(cfg.accounts.app.id, secret, cfg.accounts.app.tenant);
+  showEventDiagnosis(cfg, events);
+  return { secret, missingScopes: v.missingScopes, events };
 }
 
 /**
  * Interactive gate used by `start` before daemonizing: don't install a launchd
  * service for a bot that can't actually receive messages. Blocks until the
  * operator has (1) granted the missing scopes — re-checked live against the
- * Feishu API, scopes take effect immediately — and (2) confirmed they've
- * subscribed events + published a version (neither has an API to verify).
+ * Feishu API, scopes take effect immediately — and (2) confirmed event/callback
+ * setup. Event subscriptions are read via the app-version API; callbacks still
+ * need manual confirmation.
  * No-op off a TTY (scripted re-install of an already-ready bot). Returns false
  * only on a credential error.
  */
@@ -172,14 +182,18 @@ export async function confirmReadyForDaemon(result: OnboardResult): Promise<bool
   }
   console.log('✓ 权限已开通。');
 
-  // Events AND callbacks have no API at all (not even a read to verify), and no
-  // deep-preselect — only scopes have those. So this is the one truly-manual,
-  // un-checkable step: print exact click-paths and trust the operator's Enter.
+  const events = await diagnoseEventSubscription(app.id, result.secret, app.tenant);
+  result.events = events;
+  console.log(`\n事件订阅检测：${summarizeEventDiagnosis(events)}`);
+
+  // Events can be read via the app-version API, but callback configuration still
+  // has no read/write API and no deep-preselect. Print exact click-paths and
+  // trust the operator's Enter for card.action.trigger.
   // The classic trap: card.action.trigger is a *callback* (回调配置 tab), NOT an
   // event — searching for it under 「添加事件」 finds nothing. Spell out the tabs.
   const eventUrl = buildEventConfigUrl(app.id, app.tenant);
   const opened = openUrl(eventUrl);
-  console.log('\n最后这几步飞书没有 API/深链可代办（连查询订阅状态的接口都没有），需你手动点：\n');
+  console.log('\n最后这几步飞书没有写入 API/深链可代办，需你手动点：\n');
   console.log(`  【1】事件与回调（${opened ? '已自动打开' : '打开下面链接'}）：${eventUrl}`);
   console.log('       这页顶部有三个标签：「事件配置」「回调配置」「加密策略」。');
   console.log('       • 切到「事件配置」标签 → 「订阅方式」改「长连接」→ 点「添加事件」搜并勾选：');
@@ -236,6 +250,25 @@ function showScopeGrant(cfg: AppConfig, missingScopes: string[] | undefined): vo
   } else if (missingScopes === undefined) {
     log.info('onboard', 'scope-check-skipped', { reason: 'scope list unavailable' });
   }
+}
+
+function showEventDiagnosis(cfg: AppConfig, events: EventDiagnosis): void {
+  const summary = summarizeEventDiagnosis(events);
+  if (events.state === 'ok') {
+    console.log(`✓ 事件订阅检测：${summary}`);
+    if (events.missingOptional?.length) {
+      console.log(`  可选事件未订阅：${events.missingOptional.join('  ')}`);
+    }
+    return;
+  }
+
+  const url = buildEventConfigUrl(cfg.accounts.app.id, cfg.accounts.app.tenant);
+  const rule = '─'.repeat(64);
+  console.log(`\n${rule}`);
+  console.log(`⚠️  事件订阅检测：${summary}`);
+  console.log('   核心事件缺失或版本未发布时，@机器人不会有反应。');
+  console.log(`   事件与回调页：${url}`);
+  console.log(`${rule}\n`);
 }
 
 export type { BotEntry };

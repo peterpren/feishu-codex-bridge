@@ -24,7 +24,9 @@ describe('bot workspace root', () => {
     const base = await temp('bridge-root-');
     const root = join(base, 'finance');
 
-    await expect(normalizeWorkspaceRoot(root)).resolves.toBe(await realpath(root));
+    const normalized = await normalizeWorkspaceRoot(root);
+
+    expect(normalized).toBe(await realpath(root));
   });
 
   it('requires a configured workspace root before resolving project cwd', async () => {

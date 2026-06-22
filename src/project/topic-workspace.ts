@@ -1,6 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { Project, TopicWorkspaceMode } from './registry';
+import { seedAgentsFile } from './agents-file';
 
 export function defaultTopicWorkspaceMode(
   project: Pick<Project, 'kind' | 'topicWorkspace'> | undefined,
@@ -41,5 +42,6 @@ export async function prepareSessionCwd(
   if (!project || opts.flat || !isIsolatedTopicWorkspace(project)) return projectCwd;
   const cwd = topicWorkspacePath(project, sessionKey);
   await mkdir(cwd, { recursive: true });
+  await seedAgentsFile(cwd, projectCwd);
   return cwd;
 }

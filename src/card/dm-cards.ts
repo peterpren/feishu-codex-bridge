@@ -6,14 +6,12 @@ import {
   type AppConfig,
 } from '../config/schema';
 import {
-  FOOD_MCP_SERVERS,
   cloudDocFolderLabel,
   cloudDocFolderPermissionLabel,
   defaultNoMention,
   effectiveGuestMode,
   effectiveMode,
   effectiveNetwork,
-  foodMcpEnabled,
   type Project,
 } from '../project/registry';
 import type { PermissionMode } from '../agent/types';
@@ -25,13 +23,6 @@ import { localWorkspaceRootLabel } from '../project/workspace-root';
 import { PRODUCT_NAME, REPOSITORY_URL } from '../core/branding';
 import { actions, button, card, form, hr, input, linkButton, md, note, selectMenu, submitButton, type CardElement, type CardObject, type SelectOption } from './cards';
 import { relativeTime } from './command-cards';
-
-export interface FoodMcpTokenStatus {
-  title: string;
-  envVar?: string;
-  secretId?: string;
-  configured: boolean;
-}
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
  * deep link to a specific thread/topic, so this lands in the group and the
@@ -947,22 +938,13 @@ export function buildProjectSettingsCard(
     | 'network'
     | 'autoCompact'
     | 'cloudDocFolder'
-    | 'mcpServers'
     | 'topicWorkspace'
   >,
-  opts: { foodMcpTokens?: FoodMcpTokenStatus[] } = {},
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
   const autoCompact = project.autoCompact !== false;
   const hasCloudDocFolder = Boolean(project.cloudDocFolder?.token);
-  const hasFoodMcp = foodMcpEnabled(project);
-  const foodEnvVars = FOOD_MCP_SERVERS.map((server) => server.bearerTokenEnvVar).filter(Boolean).join(' / ');
-  const foodSecretIds = FOOD_MCP_SERVERS.map((server) => server.bearerTokenSecretId).filter(Boolean).join(' / ');
-  const foodTokenStatus =
-    opts.foodMcpTokens && opts.foodMcpTokens.length
-      ? `Token 状态：${opts.foodMcpTokens.map((item) => `${item.title}${item.configured ? '已配置' : '未配置'}`).join(' / ')}`
-      : 'Token 状态：未检测';
   return card(
     [
       md(`**项目设置** · ${project.name}`),
@@ -980,13 +962,6 @@ export function buildProjectSettingsCard(
       hr(),
       actions([button('🔐 权限', { a: DM.permission, n: project.name }, 'primary')]),
       note(`当前 ${permissionSummary(project)}　·　codex 沙箱可访问的范围（管理员 / 普通用户可分设）。`),
-      hr(),
-      md('🍔 餐饮 MCP'),
-      actions([
-        button(hasFoodMcp ? '停用瑞幸/麦当劳' : '启用瑞幸/麦当劳', { a: DM.foodMcpSet, v: hasFoodMcp ? 'off' : 'on', n: project.name }, hasFoodMcp ? 'danger' : 'primary'),
-      ]),
-      note(foodTokenStatus),
-      note(`Token 从环境变量或本地密钥库读取：${foodEnvVars}；密钥库 ${foodSecretIds}。启用后下一轮/新会话生效，付款仍需人工确认。`),
       hr(),
       md('✋ 免@（不用 @ 也回复）'),
       actions([

@@ -70,7 +70,6 @@ import {
   DM,
   GS,
   type DoctorInfo,
-  type FoodMcpTokenStatus,
 } from '../card/dm-cards';
 import { resolveCodexBin, codexVersion } from '../agent/codex-appserver/locate';
 import { fetchUsageBundle, UsageError } from '../agent/codex-appserver/usage';
@@ -104,7 +103,6 @@ import {
   effectiveMode,
   effectiveNetwork,
   enabledProjectMcpServers,
-  FOOD_MCP_SERVERS,
   getProjectByChatId,
   getProjectByName,
   listProjects,
@@ -113,8 +111,6 @@ import {
   removeProject,
   turnTier,
   updateProject,
-  withFoodMcpServers,
-  withoutFoodMcpServers,
   type CloudDocFolder,
   type Project,
 } from '../project/registry';
@@ -2449,25 +2445,8 @@ export function createOrchestrator(
 
   type ProjectSettingsInput = Parameters<typeof buildProjectSettingsCard>[0];
 
-  async function foodMcpTokenStatus(): Promise<FoodMcpTokenStatus[]> {
-    return Promise.all(
-      FOOD_MCP_SERVERS.map(async (server) => {
-        const envVar = server.bearerTokenEnvVar?.trim();
-        const secretId = server.bearerTokenSecretId?.trim();
-        const configuredByEnv = Boolean(envVar && process.env[envVar]);
-        const configuredBySecret = Boolean(secretId && (await getSecret(secretId).catch(() => undefined)));
-        return {
-          title: server.title ?? server.name,
-          envVar,
-          secretId,
-          configured: configuredByEnv || configuredBySecret,
-        };
-      }),
-    );
-  }
-
   async function projectSettingsCard(project: ProjectSettingsInput): Promise<object> {
-    return buildProjectSettingsCard(project, { foodMcpTokens: await foodMcpTokenStatus() });
+    return buildProjectSettingsCard(project);
   }
 
   dispatcher
@@ -2960,17 +2939,11 @@ export function createOrchestrator(
     .on(DM.foodMcpSet, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      const enabled = value.v === 'on';
       patch(evt, async () => {
         const p = await getProjectByName(name);
         if (!p) return buildDmMenuCard();
-        await updateProject(name, (current) => ({
-          mcpServers: enabled ? withFoodMcpServers(current.mcpServers) : withoutFoodMcpServers(current.mcpServers),
-        }));
-        await evictLiveSessionsForChat(p.chatId);
-        log.info('console', 'food-mcp', { project: name, enabled });
-        const fresh = await getProjectByName(name);
-        return fresh ? projectSettingsCard(fresh) : buildDmMenuCard();
+        log.info('console', 'food-mcp-ignored', { project: name });
+        return projectSettingsCard(p);
       });
     })
     .on(DM.setNoMentionDm, ({ evt, value }) => {

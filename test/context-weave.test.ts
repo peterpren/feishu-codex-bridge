@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import {
+  extractCardText,
   extractMessageText,
   fetchQuotedMessage,
   fetchThreadContext,
@@ -35,14 +36,68 @@ describe('extractMessageText', () => {
     expect(extractMessageText('image', JSON.stringify({ image_key: 'k' }))).toBe('[图片]');
     expect(extractMessageText('file', JSON.stringify({ file_name: 'a.log' }))).toBe('[文件：a.log]');
     expect(extractMessageText('file', JSON.stringify({}))).toBe('[文件]');
-    expect(extractMessageText('interactive', JSON.stringify({}))).toBe('[卡片消息]');
     expect(extractMessageText('merge_forward', JSON.stringify({}))).toBe('[合并转发消息]');
+  });
+
+  it('reads a card body from interactive message.get content', () => {
+    const content = JSON.stringify({
+      title: '部署清单',
+      elements: [
+        [{ tag: 'text', text: '环境' }, { tag: 'text', text: '：生产' }],
+        [{ tag: 'note', elements: [{ tag: 'text', text: '低峰期执行' }] }],
+        [{ tag: 'button', text: '确认', type: 'primary' }],
+      ],
+    });
+    expect(extractMessageText('interactive', content)).toBe('部署清单\n环境：生产\n低峰期执行\n[按钮：确认]');
+  });
+
+  it('keeps only the title for degraded CardKit content', () => {
+    const content = JSON.stringify({
+      title: '部署清单 v3',
+      elements: [[{ tag: 'img', image_key: 'x' }, { tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]],
+    });
+    expect(extractMessageText('interactive', content)).toBe('部署清单 v3');
+  });
+
+  it('falls back for interactive messages with no readable text', () => {
+    expect(extractMessageText('interactive', JSON.stringify({}))).toBe('[卡片消息]');
+    expect(extractMessageText('interactive', JSON.stringify({ elements: [[{ tag: 'img', image_key: 'x' }]] }))).toBe('[卡片消息]');
   });
 
   it('falls back on missing or bad JSON', () => {
     expect(extractMessageText('text', undefined)).toBe('[text 消息]');
     expect(extractMessageText('text', 'not json')).toBe('[text 消息]');
     expect(extractMessageText('whatever', JSON.stringify({}))).toBe('[whatever 消息]');
+  });
+});
+
+describe('extractCardText', () => {
+  it('joins title and readable card lines', () => {
+    const card = {
+      title: '发布通知',
+      elements: [
+        [{ tag: 'text', text: '请' }, { tag: 'at', user_name: '张三' }, { tag: 'text', text: ' 审批' }],
+        [{ tag: 'a', text: '查看文档', href: 'http://x' }],
+        [{ tag: 'a', href: 'http://only-href' }],
+      ],
+    };
+    expect(extractCardText(card)).toBe('发布通知\n请@张三 审批\n查看文档\nhttp://only-href');
+  });
+
+  it('reads text objects as well as bare strings', () => {
+    const card = { title: { tag: 'plain_text', content: '标题' }, elements: [[{ tag: 'text', text: { content: '正文' } }]] };
+    expect(extractCardText(card)).toBe('标题\n正文');
+  });
+
+  it('drops client upgrade placeholder lines', () => {
+    const card = { title: 'T', elements: [[{ tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]] };
+    expect(extractCardText(card)).toBe('T');
+  });
+
+  it('returns empty text for non-card values', () => {
+    expect(extractCardText({})).toBe('');
+    expect(extractCardText(null)).toBe('');
+    expect(extractCardText('nope')).toBe('');
   });
 });
 
@@ -104,13 +159,13 @@ describe('weaveThreadHistory', () => {
   });
 });
 
-function fakeChannel(items: unknown[], capture?: (params: unknown) => void): LarkChannel {
+function fakeChannel(items: unknown[], capture?: (params: unknown) => void, getItems = items): LarkChannel {
   return {
     rawClient: {
       im: {
         v1: {
           message: {
-            get: async () => ({ data: { items } }),
+            get: async () => ({ data: { items: getItems } }),
             list: async (payload: { params: unknown }) => {
               capture?.(payload.params);
               return { data: { items } };
@@ -143,6 +198,32 @@ describe('fetchQuotedMessage', () => {
   it('returns undefined for missing or deleted messages', async () => {
     expect(await fetchQuotedMessage(fakeChannel([{ message_id: 'x', deleted: true }]), 'x')).toBeUndefined();
     expect(await fetchQuotedMessage(fakeChannel([]), 'x')).toBeUndefined();
+  });
+
+  it('expands forwarded message children in quotes', async () => {
+    const q = await fetchQuotedMessage(
+      fakeChannel(
+        [
+          {
+            message_id: 'om_fwd',
+            msg_type: 'merge_forward',
+            create_time: '1700000000000',
+            sender: { id: 'ou_a', sender_type: 'user', sender_name: 'A' },
+            body: { content: JSON.stringify({}) },
+          },
+        ],
+        undefined,
+        [
+          { message_id: 'om_fwd', msg_type: 'merge_forward', sender: { id: 'ou_a', sender_type: 'user', sender_name: 'A' }, body: { content: JSON.stringify({}) } },
+          { message_id: 'om_1', msg_type: 'text', sender: { id: 'ou_b', sender_type: 'user', sender_name: 'B' }, body: { content: JSON.stringify({ text: '品牌：余额宝' }) } },
+          { message_id: 'om_2', msg_type: 'text', sender: { id: 'ou_c', sender_type: 'user', sender_name: 'C' }, body: { content: JSON.stringify({ text: '权益需求 1' }) } },
+        ],
+      ),
+      'om_fwd',
+    );
+    expect(q?.text).toContain('[合并转发消息]');
+    expect(q?.text).toContain('1. B：品牌：余额宝');
+    expect(q?.text).toContain('2. C：权益需求 1');
   });
 });
 
@@ -183,5 +264,40 @@ describe('fetchThreadContext', () => {
     }));
     const out = await fetchThreadContext(fakeChannel(many), 'omt_x', { limit: 3 });
     expect(out.map((m) => m.text)).toEqual(['m7', 'm8', 'm9']);
+  });
+
+  it('expands forwarded message children in thread history', async () => {
+    const out = await fetchThreadContext(
+      fakeChannel(
+        [
+          {
+            message_id: 'om_fwd',
+            msg_type: 'merge_forward',
+            create_time: '2000',
+            sender: { id: 'ou_a', sender_type: 'user', sender_name: 'A' },
+            body: { content: JSON.stringify({}) },
+          },
+          {
+            message_id: 'om_trigger',
+            msg_type: 'text',
+            create_time: '3000',
+            sender: { id: 'ou_a', sender_type: 'user', sender_name: 'A' },
+            body: { content: JSON.stringify({ text: '@bot 判断一下' }) },
+          },
+        ],
+        undefined,
+        [
+          { message_id: 'om_fwd', msg_type: 'merge_forward', sender: { id: 'ou_a', sender_type: 'user', sender_name: 'A' }, body: { content: JSON.stringify({}) } },
+          { message_id: 'om_1', msg_type: 'text', sender: { id: 'ou_b', sender_type: 'user', sender_name: 'B' }, body: { content: JSON.stringify({ text: '品牌：余额宝 艺人：王勉' }) } },
+          { message_id: 'om_2', msg_type: 'post', sender: { id: 'ou_c', sender_type: 'user', sender_name: 'C' }, body: { content: JSON.stringify({ content: [[{ tag: 'text', text: '金融app类 商务推广' }]] }) } },
+        ],
+      ),
+      'omt_x',
+      { excludeMessageId: 'om_trigger' },
+    );
+    expect(out).toHaveLength(1);
+    const [first] = out;
+    expect(first?.text).toContain('1. B：品牌：余额宝 艺人：王勉');
+    expect(first?.text).toContain('2. C：金融app类 商务推广');
   });
 });

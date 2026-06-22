@@ -21,6 +21,7 @@ import { setAnnouncement } from './announcement';
 import { onboardGroup } from './onboarding';
 import { resolveProjectCwd } from './workspace-root';
 import { privateProjectName, privateWorkspacePath } from './private-project';
+import { seedAgentsFile } from './agents-file';
 
 export interface CreateProjectInput {
   name: string;
@@ -104,6 +105,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     existingPath: input.existingPath,
     workspaceRoot: input.workspaceRoot,
   });
+  await seedAgentsFile(cwd, input.workspaceRoot).catch((err) => log.fail('project', err, { phase: 'seed-agents' }));
 
   // 2. create the bound group — bot stays as owner (no owner_id passed); the
   //    creator is invited as a member here, then promoted to admin in 2b so the
@@ -176,6 +178,7 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     existingPath: input.existingPath,
     workspaceRoot: input.workspaceRoot,
   });
+  await seedAgentsFile(cwd, input.workspaceRoot).catch((err) => log.fail('project', err, { phase: 'seed-agents-join' }));
 
   const project: Project = {
     name,
@@ -216,6 +219,7 @@ export async function createPrivateProject(channel: LarkChannel, input: CreatePr
   const extraOpenIds = [...new Set((input.participantOpenIds ?? []).filter((id) => id && id !== input.ownerOpenId))];
   const cwd = privateWorkspacePath(input.parent, sourceId);
   await mkdir(cwd, { recursive: true });
+  await seedAgentsFile(cwd, input.parent.cwd).catch((err) => log.fail('project', err, { phase: 'private-seed-agents' }));
 
   const res = await channel.rawClient.im.v1.chat.create({
     params: { user_id_type: 'open_id' },

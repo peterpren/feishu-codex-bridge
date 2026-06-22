@@ -1,7 +1,7 @@
 {
   "name": "peterpren-feishu-codex-bridge",
   "displayName": "feishu-codex bridge",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "description": "feishu-codex bridge links Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
   "type": "module",
   "bin": {

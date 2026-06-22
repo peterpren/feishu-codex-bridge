@@ -18,6 +18,7 @@ import {
 } from '../config/schema';
 import { saveConfig } from '../config/store';
 import { CardDispatcher } from '../card/dispatcher';
+import type { SelectOption } from '../card/cards';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import { finalMessageText, finalizeIfRunning, initialState, markIdleTimeout, reduce, type RunState } from '../card/run-state';
@@ -409,8 +410,22 @@ export function createOrchestrator(
     return modelsCache;
   }
 
-  function pickDefault(models: ModelInfo[]): { model: string; effort: ReasoningEffort; serviceTier?: ServiceTier } {
-    return pickBridgeDefaults(models);
+  function pickDefault(models: ModelInfo[], project?: Project): { model: string; effort: ReasoningEffort; serviceTier?: ServiceTier } {
+    return pickBridgeDefaults(models, project);
+  }
+
+  function projectModelOptions(models: ModelInfo[]): SelectOption[] {
+    return models.filter((m) => !m.hidden).map((m) => ({ label: m.displayName || m.id, value: m.id }));
+  }
+
+  async function newProjectForm(opts: Parameters<typeof buildNewProjectFormCard>[0] = {}): Promise<object> {
+    const models = await listModels().catch(() => []);
+    return buildNewProjectFormCard({ ...opts, modelOptions: projectModelOptions(models) });
+  }
+
+  async function joinGroupForm(opts: Parameters<typeof buildJoinGroupFormCard>[0]): Promise<object> {
+    const models = await listModels().catch(() => []);
+    return buildJoinGroupFormCard({ ...opts, modelOptions: projectModelOptions(models) });
   }
 
   function projectCloudDocAdmins(extraOpenId?: string): string[] {
@@ -696,7 +711,7 @@ export function createOrchestrator(
         return;
       }
       if (cmd === 'model') {
-        await postModelCard(msg, ts.sessionKey, false);
+        await postModelCard(msg, ts.sessionKey, false, project);
         return;
       }
       if (cmd === 'context') {
@@ -754,7 +769,7 @@ export function createOrchestrator(
         return;
       }
       if (cmd === 'model') {
-        await postModelCard(msg, ts.sessionKey, true);
+        await postModelCard(msg, ts.sessionKey, true, project);
         return;
       }
       if (cmd === 'context') {
@@ -1283,6 +1298,9 @@ export function createOrchestrator(
         const priorLastSeenAt = rec?.lastSeenAt;
         let runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder);
         let runCloudDocFolderError = rec?.cloudDocFolderError;
+        let launchModel = rec?.model;
+        let launchEffort = rec?.effort;
+        let launchServiceTier = rec?.serviceTier;
         if (needsCloudDoc && !runCloudDocFolder && rec) {
           const requesterName =
             rec.topicRequesterName ?? (await resolveNames(channel, [rec.topicRequesterOpenId ?? msg.senderId])).get(rec.topicRequesterOpenId ?? msg.senderId);
@@ -1315,8 +1333,15 @@ export function createOrchestrator(
                 })
               : {};
           sessionCwd = cwd;
+          const { model, effort, serviceTier } = pickDefault(await listModels(), project);
+          launchModel = model;
+          launchEffort = effort;
+          launchServiceTier = serviceTier;
           thread = await backend.startThread({
             cwd,
+            model,
+            effort,
+            serviceTier,
             mode: perm.mode,
             network: perm.network,
             autoCompact: perm.autoCompact,
@@ -1331,6 +1356,9 @@ export function createOrchestrator(
             chatId: msg.chatId,
             cwd,
             codexThreadId: thread.codexThreadId,
+            model,
+            effort,
+            serviceTier,
             summary: topicTitle,
             topicRequesterOpenId: msg.senderId,
             topicRequesterName: requesterName,
@@ -1343,6 +1371,9 @@ export function createOrchestrator(
         }
         rec = await getSession(sessionKey);
         sessionCwd = rec?.cwd ?? sessionCwd;
+        launchModel = rec?.model ?? launchModel;
+        launchEffort = rec?.effort ?? launchEffort;
+        launchServiceTier = rec?.serviceTier ?? launchServiceTier;
         runCloudDocFolder = usableCloudDocFolder(rec?.cloudDocFolder) ?? runCloudDocFolder;
         runCloudDocFolderError = rec?.cloudDocFolderError ?? runCloudDocFolderError;
         const rawInput = preloadedInput ?? (await collectTurnInput(msg, text, sessionCwd ?? (flat ? project?.cwd : fallbackCwd) ?? fallbackCwd));
@@ -1361,6 +1392,9 @@ export function createOrchestrator(
             firstText: input.text ?? text,
             images: input.images,
             knownThreadId: sessionKey,
+            model: launchModel,
+            effort: launchEffort,
+            serviceTier: launchServiceTier,
             cwd: sessionCwd ?? (flat ? project?.cwd : undefined),
             projectName: project?.name,
             cloudDocFolder: runCloudDocFolder,
@@ -1496,7 +1530,7 @@ export function createOrchestrator(
       const perm = turnPerm(project, msg.senderId);
       // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
       if (project) void refreshBranch(channel, project).catch(() => undefined);
-      const { model, effort, serviceTier } = pickDefault(await listModels());
+      const { model, effort, serviceTier } = pickDefault(await listModels(), project);
       const firstText = text || '你好，我们开始吧。';
       const topicTitle = deriveTopicTitle(firstText);
       const requesterName = (await resolveNames(channel, [msg.senderId])).get(msg.senderId);
@@ -1624,7 +1658,7 @@ export function createOrchestrator(
               requesterName,
             })
           : {};
-        const { model, effort, serviceTier } = pickDefault(await listModels());
+        const { model, effort, serviceTier } = pickDefault(await listModels(), privateProject);
         const perm = turnPerm(privateProject, msg.senderId);
         const thread = await backend.startThread({
           cwd: privateProject.cwd,
@@ -1796,10 +1830,10 @@ export function createOrchestrator(
 
   /** @bot /model: post the model/effort picker for the session keyed by
    * `sessionKey` (topic threadId for multi, chatId for single). */
-  async function postModelCard(msg: NormalizedMessage, sessionKey: string, inThread: boolean): Promise<void> {
+  async function postModelCard(msg: NormalizedMessage, sessionKey: string, inThread: boolean, project?: Project): Promise<void> {
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const [models, rec] = await Promise.all([listModels(), getSession(sessionKey)]);
-      const def = pickDefault(models);
+      const def = pickDefault(models, project);
       const state: ModelCardState = {
         chatId: msg.chatId,
         threadId: sessionKey,
@@ -2459,7 +2493,7 @@ export function createOrchestrator(
         patch(evt, buildWorkspaceRootFormCard({ error: '请先设置本地工作根目录，再新建项目' }));
         return;
       }
-      patch(evt, buildNewProjectFormCard());
+      patch(evt, () => newProjectForm());
     })
     .on(DM.newProjectSubmit, ({ evt, formValue, value }) => {
       const op = evt.operator?.openId;
@@ -2467,6 +2501,7 @@ export function createOrchestrator(
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
       const cloudDocFolderIn = String((formValue?.cloud_doc_folder as string) ?? '').trim();
+      const defaultModelIn = String((formValue?.default_model as string) ?? '').trim();
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // A submitted form locks its card_id (its buttons — retry/返回 on an error
       // re-render — stop firing, and an in-place update no-ops). So the result
@@ -2474,8 +2509,8 @@ export function createOrchestrator(
       // so the submit callback acks immediately (createProject is slow).
       void (async () => {
         let result;
-        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '项目名不能为空' });
-        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '无法识别操作者身份' });
+        if (!name) result = await newProjectForm({ cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '项目名不能为空' });
+        else if (!op) result = await newProjectForm({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '无法识别操作者身份' });
         else {
           try {
             const cloudDocFolder = parseCloudDocFolder(cloudDocFolderIn);
@@ -2485,13 +2520,14 @@ export function createOrchestrator(
               existingPath: cwdIn || undefined,
               workspaceRoot: cfg.preferences?.localWorkspaceRoot,
               kind,
+              defaultModel: defaultModelIn || undefined,
               cloudDocFolder,
               ...cloudDocAccess(op),
             });
             log.info('console', 'new-project', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = buildNewProjectFormCard({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: err instanceof Error ? err.message : String(err) });
+            result = await newProjectForm({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: err instanceof Error ? err.message : String(err) });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -2505,6 +2541,7 @@ export function createOrchestrator(
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
       const cloudDocFolderIn = String((formValue?.cloud_doc_folder as string) ?? '').trim();
+      const defaultModelIn = String((formValue?.default_model as string) ?? '').trim();
       const chatId = typeof value.chatId === 'string' ? value.chatId : '';
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // Same fresh-card pattern as DM.newProjectSubmit: a submitted form locks
@@ -2513,9 +2550,9 @@ export function createOrchestrator(
       void (async () => {
         let result;
         if (!chatId)
-          result = buildJoinGroupFormCard({ chatId: '', name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '缺少群标识，请重新从进群通知里打开绑定卡' });
-        else if (!name) result = buildJoinGroupFormCard({ chatId, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '项目名不能为空' });
-        else if (!op) result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: '无法识别操作者身份' });
+          result = await joinGroupForm({ chatId: '', name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '缺少群标识，请重新从进群通知里打开绑定卡' });
+        else if (!name) result = await joinGroupForm({ chatId, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '项目名不能为空' });
+        else if (!op) result = await joinGroupForm({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '无法识别操作者身份' });
         else {
           try {
             const cloudDocFolder = parseCloudDocFolder(cloudDocFolderIn);
@@ -2526,13 +2563,14 @@ export function createOrchestrator(
               existingPath: cwdIn || undefined,
               workspaceRoot: cfg.preferences?.localWorkspaceRoot,
               kind,
+              defaultModel: defaultModelIn || undefined,
               cloudDocFolder,
               ...cloudDocAccess(op),
             });
             log.info('console', 'join-group', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, error: err instanceof Error ? err.message : String(err) });
+            result = await joinGroupForm({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: err instanceof Error ? err.message : String(err) });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -3733,7 +3771,7 @@ export function createOrchestrator(
       await sendManagedCard(
         channel,
         op,
-        buildJoinGroupFormCard({ chatId: evt.chatId, name }),
+        await joinGroupForm({ chatId: evt.chatId, name }),
         undefined,
         false,
         'open_id',

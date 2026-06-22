@@ -22,6 +22,7 @@ import { onboardGroup } from './onboarding';
 import { resolveProjectCwd } from './workspace-root';
 import { privateProjectName, privateWorkspacePath } from './private-project';
 import { seedAgentsFile } from './agents-file';
+import { seedKnowledgePack } from './knowledge-pack';
 
 export interface CreateProjectInput {
   name: string;
@@ -39,6 +40,8 @@ export interface CreateProjectInput {
   guestMode?: PermissionMode;
   /** allow the sandboxed shell to reach the network (default true). */
   network?: boolean;
+  /** default Codex model for new sessions/topics in this project. */
+  defaultModel?: string;
   /** default Feishu Drive folder for cloud docs created in this project */
   cloudDocFolder?: CloudDocFolder;
   /** open_ids that should keep full access to the parent cloud-doc folder. */
@@ -66,6 +69,8 @@ export interface JoinGroupInput {
   guestMode?: PermissionMode;
   /** allow the sandboxed shell to reach the network (default true). */
   network?: boolean;
+  /** default Codex model for new sessions/topics in this project. */
+  defaultModel?: string;
   /** default Feishu Drive folder for cloud docs created in this project */
   cloudDocFolder?: CloudDocFolder;
   /** open_ids that should keep full access to the parent cloud-doc folder. */
@@ -106,6 +111,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     workspaceRoot: input.workspaceRoot,
   });
   await seedAgentsFile(cwd, input.workspaceRoot).catch((err) => log.fail('project', err, { phase: 'seed-agents' }));
+  await seedKnowledgePack(cwd, input.workspaceRoot).catch((err) => log.fail('project', err, { phase: 'seed-knowledge' }));
 
   // 2. create the bound group — bot stays as owner (no owner_id passed); the
   //    creator is invited as a member here, then promoted to admin in 2b so the
@@ -141,6 +147,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     mode: input.mode ?? DEFAULT_ADMIN_MODE,
     guestMode: input.guestMode ?? DEFAULT_GUEST_MODE,
     network: input.network ?? DEFAULT_NETWORK,
+    ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
     ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
@@ -179,6 +186,7 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     workspaceRoot: input.workspaceRoot,
   });
   await seedAgentsFile(cwd, input.workspaceRoot).catch((err) => log.fail('project', err, { phase: 'seed-agents-join' }));
+  await seedKnowledgePack(cwd, input.workspaceRoot).catch((err) => log.fail('project', err, { phase: 'seed-knowledge-join' }));
 
   const project: Project = {
     name,
@@ -192,6 +200,7 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     mode: input.mode ?? DEFAULT_ADMIN_MODE,
     guestMode: input.guestMode ?? DEFAULT_GUEST_MODE,
     network: input.network ?? DEFAULT_NETWORK,
+    ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
     ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
@@ -220,6 +229,7 @@ export async function createPrivateProject(channel: LarkChannel, input: CreatePr
   const cwd = privateWorkspacePath(input.parent, sourceId);
   await mkdir(cwd, { recursive: true });
   await seedAgentsFile(cwd, input.parent.cwd).catch((err) => log.fail('project', err, { phase: 'private-seed-agents' }));
+  await seedKnowledgePack(cwd, input.parent.cwd).catch((err) => log.fail('project', err, { phase: 'private-seed-knowledge' }));
 
   const res = await channel.rawClient.im.v1.chat.create({
     params: { user_id_type: 'open_id' },
@@ -260,6 +270,7 @@ export async function createPrivateProject(channel: LarkChannel, input: CreatePr
     mode: effectiveMode(input.parent),
     guestMode: effectiveGuestMode(input.parent),
     network: effectiveNetwork(input.parent),
+    ...(input.parent.defaultModel ? { defaultModel: input.parent.defaultModel } : {}),
     cloudDocFolder: input.parent.cloudDocFolder,
     ...(input.parent.mcpServers?.length ? { mcpServers: input.parent.mcpServers.map((server) => ({ ...server })) } : {}),
     private: true,

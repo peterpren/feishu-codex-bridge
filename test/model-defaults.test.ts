@@ -39,4 +39,26 @@ describe('pickBridgeDefaults', () => {
       serviceTier: 'standard',
     });
   });
+
+  it('uses the project default model when it is available', () => {
+    const defaults = pickBridgeDefaults(
+      [
+        model('gpt-5.5'),
+        model('gpt-6', { supportedEfforts: ['high'], defaultEffort: 'high' }),
+      ],
+      { defaultModel: 'gpt-6' },
+    );
+
+    expect(defaults).toEqual({
+      model: 'gpt-6',
+      effort: 'high',
+      serviceTier: 'standard',
+    });
+  });
+
+  it('falls back to the bridge default when the project default is unavailable', () => {
+    const defaults = pickBridgeDefaults([model('gpt-5.5'), model('gpt-6')], { defaultModel: 'missing-model' });
+
+    expect(defaults.model).toBe('gpt-5.5');
+  });
 });

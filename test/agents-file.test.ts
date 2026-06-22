@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import { findNearestAgentsFile, seedAgentsFile } from '../src/project/agents-file';
+import { findNearestKnowledgeDir, seedKnowledgePack } from '../src/project/knowledge-pack';
 
 describe('agents-file seeding', () => {
   it('copies the nearest parent AGENTS.md into a new project cwd', async () => {
@@ -39,5 +40,21 @@ describe('agents-file seeding', () => {
     await writeFile(join(botRoot, 'AGENTS.md'), 'bot\n', 'utf8');
 
     await expect(findNearestAgentsFile(project)).resolves.toBe(join(botRoot, 'AGENTS.md'));
+  });
+
+  it('copies a parent knowledge pack into the new workspace', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'bridge-knowledge-'));
+    const botRoot = join(root, 'bot');
+    const projectsRoot = join(botRoot, 'projects');
+    const cwd = join(projectsRoot, 'project-a');
+    await mkdir(join(botRoot, 'knowledge'), { recursive: true });
+    await writeFile(join(botRoot, 'knowledge', 'rules.md'), 'rules\n', 'utf8');
+    await writeFile(join(botRoot, 'knowledge', '.secret'), 'secret\n', 'utf8');
+
+    const result = await seedKnowledgePack(cwd, projectsRoot);
+
+    expect(result).toMatchObject({ copiedFiles: 1, skippedFiles: 1, sourceDir: join(botRoot, 'knowledge') });
+    await expect(readFile(join(cwd, 'knowledge', 'rules.md'), 'utf8')).resolves.toBe('rules\n');
+    await expect(findNearestKnowledgeDir(projectsRoot)).resolves.toBe(join(botRoot, 'knowledge'));
   });
 });

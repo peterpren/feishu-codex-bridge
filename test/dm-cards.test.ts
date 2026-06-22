@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildProjectListCard, buildProjectSettingsCard } from '../src/card/dm-cards';
+import { buildNewProjectFormCard, buildProjectListCard, buildProjectSettingsCard } from '../src/card/dm-cards';
 import type { Project } from '../src/project/registry';
 
 function project(i: number): Project {
@@ -40,5 +40,18 @@ describe('DM project settings card', () => {
     expect(json).not.toContain('麦当劳');
     expect(json).not.toContain('LUCKIN_MCP_TOKEN');
     expect(json).not.toContain('MCD_MCP_TOKEN');
+  });
+});
+
+describe('DM new project card', () => {
+  it('prefers GPT-5.5 as the initial project default model when available', () => {
+    const card = buildNewProjectFormCard({
+      modelOptions: [
+        { label: 'GPT-6', value: 'gpt-6' },
+        { label: 'GPT-5.5', value: 'gpt-5.5' },
+      ],
+    });
+
+    expect(JSON.stringify(card)).toContain('"initial_option":"gpt-5.5"');
   });
 });

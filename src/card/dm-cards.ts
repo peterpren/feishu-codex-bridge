@@ -146,6 +146,17 @@ export interface UpdateCardState {
 
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
 const MAX_PROJECT_LIST_ITEMS = 20;
+const DEFAULT_PROJECT_MODEL = 'gpt-5.5';
+const FALLBACK_MODEL_OPTIONS: SelectOption[] = [{ label: 'GPT-5.5', value: DEFAULT_PROJECT_MODEL }];
+
+function modelLabel(model: string | undefined): string {
+  return model?.trim() || DEFAULT_PROJECT_MODEL;
+}
+
+function initialProjectModel(options: SelectOption[], selected: string | undefined): string | undefined {
+  if (selected && options.some((o) => o.value === selected)) return selected;
+  return options.find((o) => o.value === DEFAULT_PROJECT_MODEL)?.value ?? options[0]?.value;
+}
 
 /**
  * Version-update console card. A single builder renders every phase so the same
@@ -492,15 +503,30 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
 
 /** Interactive new-project form: project name + optional CWD/cloud-doc folder, submit/cancel. */
 export function buildNewProjectFormCard(
-  opts: { name?: string; cwd?: string; cloudDocFolder?: string; error?: string } = {},
+  opts: {
+    name?: string;
+    cwd?: string;
+    cloudDocFolder?: string;
+    defaultModel?: string;
+    modelOptions?: SelectOption[];
+    error?: string;
+  } = {},
 ): CardObject {
   const elements = [];
+  const modelOptions = opts.modelOptions?.length ? opts.modelOptions : FALLBACK_MODEL_OPTIONS;
+  const defaultModel = initialProjectModel(modelOptions, opts.defaultModel);
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   elements.push(
     md('填项目名（必填）。**本地文件夹路径留空** = 在本 Bot 的工作根目录下自动新建空白项目；**填绝对路径** = 绑定根目录内已有文件夹。'),
     form('new_project', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
       input({ name: 'cwd', label: '本地文件夹路径（选填，必须在 Bot 工作根目录内）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      selectMenu({
+        name: 'default_model',
+        placeholder: '默认模型',
+        options: modelOptions,
+        initial: defaultModel,
+      }),
       input({
         name: 'cloud_doc_folder',
         label: '飞书云文档保存文件夹（选填）',
@@ -527,9 +553,19 @@ export function buildNewProjectFormCard(
  * handler binds *this* group instead of creating a new one.
  */
 export function buildJoinGroupFormCard(
-  opts: { chatId: string; name?: string; cwd?: string; cloudDocFolder?: string; error?: string },
+  opts: {
+    chatId: string;
+    name?: string;
+    cwd?: string;
+    cloudDocFolder?: string;
+    defaultModel?: string;
+    modelOptions?: SelectOption[];
+    error?: string;
+  },
 ): CardObject {
   const elements: CardElement[] = [];
+  const modelOptions = opts.modelOptions?.length ? opts.modelOptions : FALLBACK_MODEL_OPTIONS;
+  const defaultModel = initialProjectModel(modelOptions, opts.defaultModel);
   if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
   elements.push(
     md('我已被加入这个群。填一下要绑定的项目信息即可开始用。'),
@@ -537,6 +573,12 @@ export function buildJoinGroupFormCard(
     form('join_group', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
       input({ name: 'cwd', label: '本地文件夹路径（选填，必须在 Bot 工作根目录内）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      selectMenu({
+        name: 'default_model',
+        placeholder: '默认模型',
+        options: modelOptions,
+        initial: defaultModel,
+      }),
       input({
         name: 'cloud_doc_folder',
         label: '飞书云文档保存文件夹（选填）',
@@ -564,6 +606,7 @@ export function buildNewProjectDoneCard(p: Project): CardObject {
   const elements: CardElement[] = [
     md(`✅ ${verb} **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
     note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
+    note(`🧠 默认模型：${modelLabel(p.defaultModel)}`),
     ...(isIsolatedTopicWorkspace(p) ? [note('🧵 多话题：每个话题有独立本地工作区，只有发起人/管理员可驱动')] : []),
     note(`☁️ 云文档目录：${cloudDocFolderLabel(p.cloudDocFolder)}`),
     ...(p.cloudDocFolder?.token ? [note(`🔐 权限隔离：${cloudDocFolderPermissionLabel(p.cloudDocFolder)}`)] : []),
@@ -600,6 +643,7 @@ export function buildProjectListCard(
     const meta = [
       p.chatId ? kindLabel(p.kind) : '⚠️ 未绑定群',
       (p.origin ?? 'created') === 'joined' ? '已加入' : undefined,
+      `默认模型：${modelLabel(p.defaultModel)}`,
       `免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`,
       isIsolatedTopicWorkspace(p) ? '话题工作区：独立' : undefined,
       sessions.length ? `话题 ${sessions.length}` : '暂无话题',
@@ -937,6 +981,7 @@ export function buildProjectSettingsCard(
     | 'guestMode'
     | 'network'
     | 'autoCompact'
+    | 'defaultModel'
     | 'cloudDocFolder'
     | 'topicWorkspace'
   >,
@@ -949,6 +994,7 @@ export function buildProjectSettingsCard(
     [
       md(`**项目设置** · ${project.name}`),
       note(`${kindLabel(kind)}${project.cwd ? `   ·   📂 \`${project.cwd}\`` : ''}`),
+      note(`🧠 默认模型：${modelLabel(project.defaultModel)}`),
       ...(isIsolatedTopicWorkspace(project) ? [note('🧵 多话题工作区：独立（发起人/管理员可驱动）')] : []),
       note(`☁️ 云文档目录：${cloudDocFolderLabel(project.cloudDocFolder)}`),
       ...(hasCloudDocFolder ? [note(`🔐 权限隔离：${cloudDocFolderPermissionLabel(project.cloudDocFolder)}`)] : []),

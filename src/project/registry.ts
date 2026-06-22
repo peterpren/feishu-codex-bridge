@@ -92,6 +92,8 @@ export interface Project {
   network?: boolean;
   /** Codex auto-compacts old context near the model window. Missing = on. */
   autoCompact?: boolean;
+  /** Default Codex model for new sessions/topics in this project. Missing = bridge default. */
+  defaultModel?: string;
   /** Multi-topic file boundary. 'isolated' gives each topic its own writable cwd;
    * 'shared' keeps the legacy behavior where every topic writes the project cwd.
    * Missing = isolated for multi-topic groups, shared for single-session groups. */

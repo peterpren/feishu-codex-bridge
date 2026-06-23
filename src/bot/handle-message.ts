@@ -418,6 +418,14 @@ export function createOrchestrator(
     return models.filter((m) => !m.hidden).map((m) => ({ label: m.displayName || m.id, value: m.id }));
   }
 
+  function projectDefaultEffort(value: unknown): ReasoningEffort | undefined {
+    return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' ? value : undefined;
+  }
+
+  function projectDefaultServiceTier(value: unknown): ServiceTier | undefined {
+    return value === 'fast' || value === 'standard' ? value : undefined;
+  }
+
   async function newProjectForm(opts: Parameters<typeof buildNewProjectFormCard>[0] = {}): Promise<object> {
     const models = await listModels().catch(() => []);
     return buildNewProjectFormCard({ ...opts, modelOptions: projectModelOptions(models) });
@@ -2502,6 +2510,8 @@ export function createOrchestrator(
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
       const cloudDocFolderIn = String((formValue?.cloud_doc_folder as string) ?? '').trim();
       const defaultModelIn = String((formValue?.default_model as string) ?? '').trim();
+      const defaultEffortIn = projectDefaultEffort(formValue?.default_effort);
+      const defaultServiceTierIn = projectDefaultServiceTier(formValue?.default_service_tier);
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // A submitted form locks its card_id (its buttons — retry/返回 on an error
       // re-render — stop firing, and an in-place update no-ops). So the result
@@ -2509,8 +2519,9 @@ export function createOrchestrator(
       // so the submit callback acks immediately (createProject is slow).
       void (async () => {
         let result;
-        if (!name) result = await newProjectForm({ cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '项目名不能为空' });
-        else if (!op) result = await newProjectForm({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '无法识别操作者身份' });
+        const formState = { name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, defaultEffort: defaultEffortIn, defaultServiceTier: defaultServiceTierIn };
+        if (!name) result = await newProjectForm({ ...formState, error: '项目名不能为空' });
+        else if (!op) result = await newProjectForm({ ...formState, error: '无法识别操作者身份' });
         else {
           try {
             const cloudDocFolder = parseCloudDocFolder(cloudDocFolderIn);
@@ -2521,13 +2532,15 @@ export function createOrchestrator(
               workspaceRoot: cfg.preferences?.localWorkspaceRoot,
               kind,
               defaultModel: defaultModelIn || undefined,
+              defaultEffort: defaultEffortIn,
+              defaultServiceTier: defaultServiceTierIn,
               cloudDocFolder,
               ...cloudDocAccess(op),
             });
             log.info('console', 'new-project', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = await newProjectForm({ name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: err instanceof Error ? err.message : String(err) });
+            result = await newProjectForm({ ...formState, error: err instanceof Error ? err.message : String(err) });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -2542,6 +2555,8 @@ export function createOrchestrator(
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
       const cloudDocFolderIn = String((formValue?.cloud_doc_folder as string) ?? '').trim();
       const defaultModelIn = String((formValue?.default_model as string) ?? '').trim();
+      const defaultEffortIn = projectDefaultEffort(formValue?.default_effort);
+      const defaultServiceTierIn = projectDefaultServiceTier(formValue?.default_service_tier);
       const chatId = typeof value.chatId === 'string' ? value.chatId : '';
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // Same fresh-card pattern as DM.newProjectSubmit: a submitted form locks
@@ -2549,10 +2564,11 @@ export function createOrchestrator(
       // as a 留痕. Detached so the click acks immediately (join is slow).
       void (async () => {
         let result;
+        const formState = { chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, defaultEffort: defaultEffortIn, defaultServiceTier: defaultServiceTierIn };
         if (!chatId)
-          result = await joinGroupForm({ chatId: '', name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '缺少群标识，请重新从进群通知里打开绑定卡' });
-        else if (!name) result = await joinGroupForm({ chatId, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '项目名不能为空' });
-        else if (!op) result = await joinGroupForm({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: '无法识别操作者身份' });
+          result = await joinGroupForm({ ...formState, chatId: '', error: '缺少群标识，请重新从进群通知里打开绑定卡' });
+        else if (!name) result = await joinGroupForm({ ...formState, error: '项目名不能为空' });
+        else if (!op) result = await joinGroupForm({ ...formState, error: '无法识别操作者身份' });
         else {
           try {
             const cloudDocFolder = parseCloudDocFolder(cloudDocFolderIn);
@@ -2564,13 +2580,15 @@ export function createOrchestrator(
               workspaceRoot: cfg.preferences?.localWorkspaceRoot,
               kind,
               defaultModel: defaultModelIn || undefined,
+              defaultEffort: defaultEffortIn,
+              defaultServiceTier: defaultServiceTierIn,
               cloudDocFolder,
               ...cloudDocAccess(op),
             });
             log.info('console', 'join-group', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = await joinGroupForm({ chatId, name, cwd: cwdIn, cloudDocFolder: cloudDocFolderIn, defaultModel: defaultModelIn, error: err instanceof Error ? err.message : String(err) });
+            result = await joinGroupForm({ ...formState, error: err instanceof Error ? err.message : String(err) });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>

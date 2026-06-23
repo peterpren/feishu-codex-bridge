@@ -66,7 +66,9 @@ describe('cloud doc folder cards', () => {
     expect(settings).toContain('清空目录');
     expect(settings).toContain('权限隔离');
     expect(settings).toContain('已配置管理员/机器人权限');
-    expect(settings).toContain('默认模型');
+    expect(settings).toContain('默认配置');
+    expect(settings).toContain('推理：中');
+    expect(settings).toContain('速度：标准');
 
     const form = JSON.stringify(buildCloudDocFolderFormCard(project));
     expect(form).toContain('cloud_doc_folder');
@@ -75,7 +77,9 @@ describe('cloud doc folder cards', () => {
     const done = JSON.stringify(buildNewProjectDoneCard(project));
     expect(done).toContain('云文档目录');
     expect(done).toContain('fldcnABC123');
-    expect(done).toContain('默认模型');
+    expect(done).toContain('默认配置');
+    expect(done).toContain('推理：中');
+    expect(done).toContain('速度：标准');
   });
 });
 

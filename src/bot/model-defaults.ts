@@ -6,7 +6,7 @@ export const BRIDGE_DEFAULT_SERVICE_TIER: ServiceTier = 'standard';
 
 export function pickBridgeDefaults(
   models: ModelInfo[],
-  project?: { defaultModel?: string },
+  project?: { defaultModel?: string; defaultEffort?: ReasoningEffort; defaultServiceTier?: ServiceTier },
 ): {
   model: string;
   effort: ReasoningEffort;
@@ -14,14 +14,15 @@ export function pickBridgeDefaults(
 } {
   const visible = models.filter((m) => !m.hidden);
   const requested = project?.defaultModel?.trim();
+  const requestedEffort = project?.defaultEffort ?? BRIDGE_DEFAULT_EFFORT;
   const def = (requested ? visible.find((m) => m.id === requested) : undefined)
     ?? visible.find((m) => m.id === BRIDGE_DEFAULT_MODEL_ID)
     ?? visible[0]
     ?? models[0];
-  const supportsDefaultEffort = !def?.supportedEfforts.length || def.supportedEfforts.includes(BRIDGE_DEFAULT_EFFORT);
+  const supportsRequestedEffort = !def?.supportedEfforts.length || def.supportedEfforts.includes(requestedEffort);
   return {
     model: def?.id ?? BRIDGE_DEFAULT_MODEL_ID,
-    effort: supportsDefaultEffort ? BRIDGE_DEFAULT_EFFORT : (def?.defaultEffort ?? BRIDGE_DEFAULT_EFFORT),
-    serviceTier: BRIDGE_DEFAULT_SERVICE_TIER,
+    effort: supportsRequestedEffort ? requestedEffort : (def?.defaultEffort ?? BRIDGE_DEFAULT_EFFORT),
+    serviceTier: project?.defaultServiceTier ?? BRIDGE_DEFAULT_SERVICE_TIER,
   };
 }

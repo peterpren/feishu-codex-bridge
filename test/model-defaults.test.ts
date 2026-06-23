@@ -46,10 +46,23 @@ describe('pickBridgeDefaults', () => {
         model('gpt-5.5'),
         model('gpt-6', { supportedEfforts: ['high'], defaultEffort: 'high' }),
       ],
-      { defaultModel: 'gpt-6' },
+      { defaultModel: 'gpt-6', defaultEffort: 'high', defaultServiceTier: 'fast' },
     );
 
     expect(defaults).toEqual({
+      model: 'gpt-6',
+      effort: 'high',
+      serviceTier: 'fast',
+    });
+  });
+
+  it('falls back to the selected model default effort if the project effort is unsupported', () => {
+    const defaults = pickBridgeDefaults(
+      [model('gpt-5.5'), model('gpt-6', { supportedEfforts: ['high'], defaultEffort: 'high' })],
+      { defaultModel: 'gpt-6', defaultEffort: 'xhigh' },
+    );
+
+    expect(defaults).toMatchObject({
       model: 'gpt-6',
       effort: 'high',
       serviceTier: 'standard',

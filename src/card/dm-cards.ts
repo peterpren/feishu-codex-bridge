@@ -14,7 +14,7 @@ import {
   effectiveNetwork,
   type Project,
 } from '../project/registry';
-import type { PermissionMode } from '../agent/types';
+import type { PermissionMode, ReasoningEffort, ServiceTier } from '../agent/types';
 import type { SessionRecord } from '../bot/session-store';
 import { labelScope } from '../config/scopes';
 import { summarizeEventDiagnosis, type EventDiagnosis } from '../utils/event-diagnosis';
@@ -147,15 +147,57 @@ export interface UpdateCardState {
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
 const MAX_PROJECT_LIST_ITEMS = 20;
 const DEFAULT_PROJECT_MODEL = 'gpt-5.5';
+const DEFAULT_PROJECT_EFFORT: ReasoningEffort = 'medium';
+const DEFAULT_PROJECT_SERVICE_TIER: ServiceTier = 'standard';
 const FALLBACK_MODEL_OPTIONS: SelectOption[] = [{ label: 'GPT-5.5', value: DEFAULT_PROJECT_MODEL }];
+const PROJECT_EFFORT_OPTIONS: SelectOption[] = [
+  { label: '推理：低', value: 'low' },
+  { label: '推理：中', value: 'medium' },
+  { label: '推理：高', value: 'high' },
+  { label: '推理：超高', value: 'xhigh' },
+];
+const PROJECT_SERVICE_TIER_OPTIONS: SelectOption[] = [
+  { label: '速度：标准', value: 'standard' },
+  { label: '速度：快速', value: 'fast' },
+];
+
+const EFFORT_LABEL: Record<ReasoningEffort, string> = {
+  none: '无',
+  minimal: '极简',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '超高',
+};
+
+function serviceTierLabel(tier: ServiceTier | undefined): string {
+  if (tier === 'fast') return '快速';
+  return '标准';
+}
 
 function modelLabel(model: string | undefined): string {
   return model?.trim() || DEFAULT_PROJECT_MODEL;
 }
 
+function effortLabel(effort: ReasoningEffort | undefined): string {
+  return EFFORT_LABEL[effort ?? DEFAULT_PROJECT_EFFORT];
+}
+
+function modelConfigLabel(project: Pick<Project, 'defaultModel' | 'defaultEffort' | 'defaultServiceTier'>): string {
+  return `${modelLabel(project.defaultModel)} / 推理：${effortLabel(project.defaultEffort)} / 速度：${serviceTierLabel(project.defaultServiceTier)}`;
+}
+
 function initialProjectModel(options: SelectOption[], selected: string | undefined): string | undefined {
   if (selected && options.some((o) => o.value === selected)) return selected;
   return options.find((o) => o.value === DEFAULT_PROJECT_MODEL)?.value ?? options[0]?.value;
+}
+
+function initialProjectEffort(selected: ReasoningEffort | string | undefined): ReasoningEffort {
+  return PROJECT_EFFORT_OPTIONS.some((o) => o.value === selected) ? (selected as ReasoningEffort) : DEFAULT_PROJECT_EFFORT;
+}
+
+function initialProjectServiceTier(selected: ServiceTier | undefined): ServiceTier {
+  return selected === 'fast' ? 'fast' : DEFAULT_PROJECT_SERVICE_TIER;
 }
 
 /**
@@ -508,6 +550,8 @@ export function buildNewProjectFormCard(
     cwd?: string;
     cloudDocFolder?: string;
     defaultModel?: string;
+    defaultEffort?: ReasoningEffort | string;
+    defaultServiceTier?: ServiceTier;
     modelOptions?: SelectOption[];
     error?: string;
   } = {},
@@ -515,23 +559,38 @@ export function buildNewProjectFormCard(
   const elements = [];
   const modelOptions = opts.modelOptions?.length ? opts.modelOptions : FALLBACK_MODEL_OPTIONS;
   const defaultModel = initialProjectModel(modelOptions, opts.defaultModel);
+  const defaultEffort = initialProjectEffort(opts.defaultEffort);
+  const defaultServiceTier = initialProjectServiceTier(opts.defaultServiceTier);
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   elements.push(
     md('填项目名（必填）。**本地文件夹路径留空** = 在本 Bot 的工作根目录下自动新建空白项目；**填绝对路径** = 绑定根目录内已有文件夹。'),
     form('new_project', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
       input({ name: 'cwd', label: '本地文件夹路径（选填，必须在 Bot 工作根目录内）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({
+        name: 'cloud_doc_folder',
+        label: '飞书云文档保存文件夹（选填）',
+        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
+        value: opts.cloudDocFolder,
+      }),
+      md('**默认模型选择**'),
       selectMenu({
         name: 'default_model',
         placeholder: '默认模型',
         options: modelOptions,
         initial: defaultModel,
       }),
-      input({
-        name: 'cloud_doc_folder',
-        label: '飞书云文档保存文件夹（选填）',
-        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
-        value: opts.cloudDocFolder,
+      selectMenu({
+        name: 'default_effort',
+        placeholder: '默认推理',
+        options: PROJECT_EFFORT_OPTIONS,
+        initial: defaultEffort,
+      }),
+      selectMenu({
+        name: 'default_service_tier',
+        placeholder: '默认速度',
+        options: PROJECT_SERVICE_TIER_OPTIONS,
+        initial: defaultServiceTier,
       }),
       note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
       note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话和工作区（发起人/管理员可驱动）；💬 单会话群 = 整群一个会话、连续上下文。'),
@@ -559,6 +618,8 @@ export function buildJoinGroupFormCard(
     cwd?: string;
     cloudDocFolder?: string;
     defaultModel?: string;
+    defaultEffort?: ReasoningEffort | string;
+    defaultServiceTier?: ServiceTier;
     modelOptions?: SelectOption[];
     error?: string;
   },
@@ -566,6 +627,8 @@ export function buildJoinGroupFormCard(
   const elements: CardElement[] = [];
   const modelOptions = opts.modelOptions?.length ? opts.modelOptions : FALLBACK_MODEL_OPTIONS;
   const defaultModel = initialProjectModel(modelOptions, opts.defaultModel);
+  const defaultEffort = initialProjectEffort(opts.defaultEffort);
+  const defaultServiceTier = initialProjectServiceTier(opts.defaultServiceTier);
   if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
   elements.push(
     md('我已被加入这个群。填一下要绑定的项目信息即可开始用。'),
@@ -573,17 +636,30 @@ export function buildJoinGroupFormCard(
     form('join_group', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
       input({ name: 'cwd', label: '本地文件夹路径（选填，必须在 Bot 工作根目录内）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({
+        name: 'cloud_doc_folder',
+        label: '飞书云文档保存文件夹（选填）',
+        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
+        value: opts.cloudDocFolder,
+      }),
+      md('**默认模型选择**'),
       selectMenu({
         name: 'default_model',
         placeholder: '默认模型',
         options: modelOptions,
         initial: defaultModel,
       }),
-      input({
-        name: 'cloud_doc_folder',
-        label: '飞书云文档保存文件夹（选填）',
-        placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
-        value: opts.cloudDocFolder,
+      selectMenu({
+        name: 'default_effort',
+        placeholder: '默认推理',
+        options: PROJECT_EFFORT_OPTIONS,
+        initial: defaultEffort,
+      }),
+      selectMenu({
+        name: 'default_service_tier',
+        placeholder: '默认速度',
+        options: PROJECT_SERVICE_TIER_OPTIONS,
+        initial: defaultServiceTier,
       }),
       note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
       note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话和工作区（发起人/管理员可驱动）；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
@@ -606,7 +682,7 @@ export function buildNewProjectDoneCard(p: Project): CardObject {
   const elements: CardElement[] = [
     md(`✅ ${verb} **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
     note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
-    note(`🧠 默认模型：${modelLabel(p.defaultModel)}`),
+    note(`🧠 默认配置：${modelConfigLabel(p)}`),
     ...(isIsolatedTopicWorkspace(p) ? [note('🧵 多话题：每个话题有独立本地工作区，只有发起人/管理员可驱动')] : []),
     note(`☁️ 云文档目录：${cloudDocFolderLabel(p.cloudDocFolder)}`),
     ...(p.cloudDocFolder?.token ? [note(`🔐 权限隔离：${cloudDocFolderPermissionLabel(p.cloudDocFolder)}`)] : []),
@@ -643,7 +719,7 @@ export function buildProjectListCard(
     const meta = [
       p.chatId ? kindLabel(p.kind) : '⚠️ 未绑定群',
       (p.origin ?? 'created') === 'joined' ? '已加入' : undefined,
-      `默认模型：${modelLabel(p.defaultModel)}`,
+      `默认配置：${modelConfigLabel(p)}`,
       `免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`,
       isIsolatedTopicWorkspace(p) ? '话题工作区：独立' : undefined,
       sessions.length ? `话题 ${sessions.length}` : '暂无话题',
@@ -982,6 +1058,8 @@ export function buildProjectSettingsCard(
     | 'network'
     | 'autoCompact'
     | 'defaultModel'
+    | 'defaultEffort'
+    | 'defaultServiceTier'
     | 'cloudDocFolder'
     | 'topicWorkspace'
   >,
@@ -994,7 +1072,7 @@ export function buildProjectSettingsCard(
     [
       md(`**项目设置** · ${project.name}`),
       note(`${kindLabel(kind)}${project.cwd ? `   ·   📂 \`${project.cwd}\`` : ''}`),
-      note(`🧠 默认模型：${modelLabel(project.defaultModel)}`),
+      note(`🧠 默认配置：${modelConfigLabel(project)}`),
       ...(isIsolatedTopicWorkspace(project) ? [note('🧵 多话题工作区：独立（发起人/管理员可驱动）')] : []),
       note(`☁️ 云文档目录：${cloudDocFolderLabel(project.cloudDocFolder)}`),
       ...(hasCloudDocFolder ? [note(`🔐 权限隔离：${cloudDocFolderPermissionLabel(project.cloudDocFolder)}`)] : []),

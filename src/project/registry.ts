@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
-import type { McpServerConfig, PermissionMode } from '../agent/types';
+import type { McpServerConfig, PermissionMode, ReasoningEffort, ServiceTier } from '../agent/types';
 
 export type CloudDocCreateAs = 'user' | 'bot';
 
@@ -94,6 +94,10 @@ export interface Project {
   autoCompact?: boolean;
   /** Default Codex model for new sessions/topics in this project. Missing = bridge default. */
   defaultModel?: string;
+  /** Default reasoning effort for new sessions/topics in this project. Missing = bridge default. */
+  defaultEffort?: ReasoningEffort;
+  /** Default speed/service tier for new sessions/topics in this project. Missing = bridge default. */
+  defaultServiceTier?: ServiceTier;
   /** Multi-topic file boundary. 'isolated' gives each topic its own writable cwd;
    * 'shared' keeps the legacy behavior where every topic writes the project cwd.
    * Missing = isolated for multi-topic groups, shared for single-session groups. */

@@ -15,7 +15,7 @@ import {
   type CloudDocFolder,
   type Project,
 } from './registry';
-import type { PermissionMode } from '../agent/types';
+import type { PermissionMode, ReasoningEffort, ServiceTier } from '../agent/types';
 import { grantProjectCloudDocFolderAccess, permissionRecord } from './cloud-doc-permission';
 import { setAnnouncement } from './announcement';
 import { onboardGroup } from './onboarding';
@@ -42,6 +42,10 @@ export interface CreateProjectInput {
   network?: boolean;
   /** default Codex model for new sessions/topics in this project. */
   defaultModel?: string;
+  /** default Codex reasoning effort for new sessions/topics in this project. */
+  defaultEffort?: ReasoningEffort;
+  /** default Codex speed/service tier for new sessions/topics in this project. */
+  defaultServiceTier?: ServiceTier;
   /** default Feishu Drive folder for cloud docs created in this project */
   cloudDocFolder?: CloudDocFolder;
   /** open_ids that should keep full access to the parent cloud-doc folder. */
@@ -71,6 +75,10 @@ export interface JoinGroupInput {
   network?: boolean;
   /** default Codex model for new sessions/topics in this project. */
   defaultModel?: string;
+  /** default Codex reasoning effort for new sessions/topics in this project. */
+  defaultEffort?: ReasoningEffort;
+  /** default Codex speed/service tier for new sessions/topics in this project. */
+  defaultServiceTier?: ServiceTier;
   /** default Feishu Drive folder for cloud docs created in this project */
   cloudDocFolder?: CloudDocFolder;
   /** open_ids that should keep full access to the parent cloud-doc folder. */
@@ -148,6 +156,8 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     guestMode: input.guestMode ?? DEFAULT_GUEST_MODE,
     network: input.network ?? DEFAULT_NETWORK,
     ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
+    ...(input.defaultEffort ? { defaultEffort: input.defaultEffort } : {}),
+    ...(input.defaultServiceTier ? { defaultServiceTier: input.defaultServiceTier } : {}),
     ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
@@ -201,6 +211,8 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     guestMode: input.guestMode ?? DEFAULT_GUEST_MODE,
     network: input.network ?? DEFAULT_NETWORK,
     ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
+    ...(input.defaultEffort ? { defaultEffort: input.defaultEffort } : {}),
+    ...(input.defaultServiceTier ? { defaultServiceTier: input.defaultServiceTier } : {}),
     ...(input.cloudDocFolder ? { cloudDocFolder: input.cloudDocFolder } : {}),
   };
   await addProject(project);
@@ -271,6 +283,8 @@ export async function createPrivateProject(channel: LarkChannel, input: CreatePr
     guestMode: effectiveGuestMode(input.parent),
     network: effectiveNetwork(input.parent),
     ...(input.parent.defaultModel ? { defaultModel: input.parent.defaultModel } : {}),
+    ...(input.parent.defaultEffort ? { defaultEffort: input.parent.defaultEffort } : {}),
+    ...(input.parent.defaultServiceTier ? { defaultServiceTier: input.parent.defaultServiceTier } : {}),
     cloudDocFolder: input.parent.cloudDocFolder,
     ...(input.parent.mcpServers?.length ? { mcpServers: input.parent.mcpServers.map((server) => ({ ...server })) } : {}),
     private: true,

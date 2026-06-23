@@ -44,14 +44,23 @@ describe('DM project settings card', () => {
 });
 
 describe('DM new project card', () => {
-  it('prefers GPT-5.5 as the initial project default model when available', () => {
+  it('prefers GPT-5.5, medium reasoning, and standard speed as the initial project defaults', () => {
     const card = buildNewProjectFormCard({
       modelOptions: [
         { label: 'GPT-6', value: 'gpt-6' },
         { label: 'GPT-5.5', value: 'gpt-5.5' },
       ],
     });
+    const json = JSON.stringify(card);
 
-    expect(JSON.stringify(card)).toContain('"initial_option":"gpt-5.5"');
+    expect(json).toContain('"name":"default_model"');
+    expect(json).toContain('"initial_option":"gpt-5.5"');
+    expect(json).toContain('"name":"default_effort"');
+    expect(json).toContain('"initial_option":"medium"');
+    expect(json).toContain('"name":"default_service_tier"');
+    expect(json).toContain('"initial_option":"standard"');
+    expect(json.indexOf('"name":"cloud_doc_folder"')).toBeLessThan(json.indexOf('"name":"default_model"'));
+    expect(json.indexOf('默认模型选择')).toBeGreaterThan(json.indexOf('"name":"cloud_doc_folder"'));
+    expect(json.indexOf('默认模型选择')).toBeLessThan(json.indexOf('"name":"default_model"'));
   });
 });

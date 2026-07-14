@@ -41,6 +41,13 @@ export function buildPlist(): string {
   const nodePath = process.execPath;
   const cliBinPath = resolveCliBinPath();
   const pathEnv = process.env.PATH ?? '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+  // launchd does not inherit a terminal's PATH reliably. Pin a detected
+  // bundled Codex binary so restarting the service cannot lose Codex just
+  // because ChatGPT.app lives outside the inherited environment.
+  const codexBin = process.env.CODEX_BIN || [
+    '/Applications/ChatGPT.app/Contents/Resources/codex',
+    '/Applications/Codex.app/Contents/Resources/codex',
+  ].find(existsSync);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -66,7 +73,10 @@ export function buildPlist(): string {
   <dict>
     <key>PATH</key>
     <string>${escapeXml(pathEnv)}</string>
-  </dict>
+${codexBin ? `    <key>CODEX_BIN</key>
+    <string>${escapeXml(codexBin)}</string>
+` : ''}  </dict>
+</dict>
 </dict>
 </plist>
 `;

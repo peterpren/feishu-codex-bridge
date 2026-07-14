@@ -93,6 +93,38 @@ describe('buildModelCard', () => {
     expect(json).not.toContain('effort：');
     expect(json).not.toContain('极高');
   });
+
+  it('renders the model-provided max/ultra efforts and priority fast tier', () => {
+    const modelState: ModelCardState = {
+      chatId: 'oc_x',
+      threadId: 'omt_x',
+      requesterOpenId: 'ou_x',
+      models: [
+        {
+          id: 'gpt-5.6-sol',
+          displayName: 'GPT-5.6-Sol',
+          description: '',
+          supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+          defaultEffort: 'low',
+          serviceTiers: [{ id: 'priority', name: 'Fast', description: '' }],
+          isDefault: true,
+          hidden: false,
+        },
+      ],
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+      serviceTier: 'priority',
+      createdAt: Date.now(),
+    };
+    const json = JSON.stringify(buildModelCard(modelState));
+
+    expect(json).toContain('GPT-5.6-Sol');
+    expect(json).toContain('推理：最高');
+    expect(json).toContain('推理：极高');
+    expect(json).toContain('速度：快速');
+    expect(json).toContain('"initial_option":"priority"');
+    expect(json).not.toContain('速度：Fast');
+  });
 });
 
 describe('buildHelpCard 权限过滤', () => {
@@ -116,6 +148,7 @@ describe('buildHelpCard 权限过滤', () => {
     expect(JSON.stringify(buildHelpCard('single', true, true))).toContain('/settings');
     expect(JSON.stringify(buildHelpCard('single', true, false))).toContain('/model');
     expect(JSON.stringify(buildHelpCard('single', true, false))).not.toContain('/rename');
+    expect(JSON.stringify(buildHelpCard('single', true, true))).toContain('/clear');
   });
 
   it('私密协作群：发起人或管理员可以看到 /rename 和 /settings', () => {
@@ -125,6 +158,7 @@ describe('buildHelpCard 权限过滤', () => {
     expect(json).toContain('/connect');
     expect(json).toContain('自然语言提需求');
     expect(json).toContain('/me status');
+    expect(json).toContain('/clear');
     expect(json).not.toContain('/me docs');
     expect(json).not.toContain('/me minutes');
     expect(json).toContain('本群默认需 @');

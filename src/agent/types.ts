@@ -6,7 +6,13 @@
 
 import type { CloudDocFolder } from '../project/registry';
 
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+/**
+ * Keep this in step with the app-server's model/list response. New Codex
+ * models can expose higher effort tiers before the generated protocol types
+ * in this repository are refreshed, so the Bridge must preserve them instead
+ * of silently downgrading a user's selection.
+ */
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 export type ServiceTier = string;
 
 export interface ServiceTierInfo {

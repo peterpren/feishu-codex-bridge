@@ -20,9 +20,26 @@ export function pickBridgeDefaults(
     ?? visible[0]
     ?? models[0];
   const supportsRequestedEffort = !def?.supportedEfforts.length || def.supportedEfforts.includes(requestedEffort);
+  const supportedServiceTiers = new Set(def?.serviceTiers.map((tier) => tier.id) ?? []);
+  const requestedServiceTier = project?.defaultServiceTier;
+  // Codex 0.144+ exposes the user-facing “快速” tier as `priority`; retain
+  // compatibility with projects created by older Bridge versions that stored
+  // `fast` while always passing the id accepted by the selected model.
+  const serviceTier =
+    requestedServiceTier === 'standard' || !requestedServiceTier
+      ? BRIDGE_DEFAULT_SERVICE_TIER
+      : supportedServiceTiers.size === 0
+        ? requestedServiceTier
+      : supportedServiceTiers.has(requestedServiceTier)
+        ? requestedServiceTier
+        : requestedServiceTier === 'fast' && supportedServiceTiers.has('priority')
+          ? 'priority'
+          : requestedServiceTier === 'priority' && supportedServiceTiers.has('fast')
+            ? 'fast'
+            : BRIDGE_DEFAULT_SERVICE_TIER;
   return {
     model: def?.id ?? BRIDGE_DEFAULT_MODEL_ID,
     effort: supportsRequestedEffort ? requestedEffort : (def?.defaultEffort ?? BRIDGE_DEFAULT_EFFORT),
-    serviceTier: project?.defaultServiceTier ?? BRIDGE_DEFAULT_SERVICE_TIER,
+    serviceTier,
   };
 }

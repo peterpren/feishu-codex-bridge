@@ -41,6 +41,7 @@ export const DM = {
   newProjectSubmit: 'dm.newProject.submit',
   joinGroupSubmit: 'dm.joinGroup.submit',
   projects: 'dm.projects',
+  projectsPage: 'dm.projects.page',
   settings: 'dm.settings',
   doctor: 'dm.doctor',
   reconnect: 'dm.reconnect',
@@ -145,16 +146,23 @@ export interface UpdateCardState {
 }
 
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
-const MAX_PROJECT_LIST_ITEMS = 20;
+const PROJECT_LIST_PAGE_SIZE = 8;
 const DEFAULT_PROJECT_MODEL = 'gpt-5.5';
 const DEFAULT_PROJECT_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_PROJECT_SERVICE_TIER: ServiceTier = 'standard';
-const FALLBACK_MODEL_OPTIONS: SelectOption[] = [{ label: 'GPT-5.5', value: DEFAULT_PROJECT_MODEL }];
+const FALLBACK_MODEL_OPTIONS: SelectOption[] = [
+  { label: 'GPT-5.6-Sol', value: 'gpt-5.6-sol' },
+  { label: 'GPT-5.6-Terra', value: 'gpt-5.6-terra' },
+  { label: 'GPT-5.6-Luna', value: 'gpt-5.6-luna' },
+  { label: 'GPT-5.5', value: DEFAULT_PROJECT_MODEL },
+];
 const PROJECT_EFFORT_OPTIONS: SelectOption[] = [
   { label: '推理：低', value: 'low' },
   { label: '推理：中', value: 'medium' },
   { label: '推理：高', value: 'high' },
   { label: '推理：超高', value: 'xhigh' },
+  { label: '推理：最高', value: 'max' },
+  { label: '推理：极高', value: 'ultra' },
 ];
 const PROJECT_SERVICE_TIER_OPTIONS: SelectOption[] = [
   { label: '速度：标准', value: 'standard' },
@@ -168,10 +176,12 @@ const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   medium: '中',
   high: '高',
   xhigh: '超高',
+  max: '最高',
+  ultra: '极高',
 };
 
 function serviceTierLabel(tier: ServiceTier | undefined): string {
-  if (tier === 'fast') return '快速';
+  if (tier === 'fast' || tier === 'priority') return '快速';
   return '标准';
 }
 
@@ -197,7 +207,17 @@ function initialProjectEffort(selected: ReasoningEffort | string | undefined): R
 }
 
 function initialProjectServiceTier(selected: ServiceTier | undefined): ServiceTier {
-  return selected === 'fast' ? 'fast' : DEFAULT_PROJECT_SERVICE_TIER;
+  // The project form intentionally keeps one human-facing “快速” option; the
+  // backend maps old `fast` projects to a model's `priority` service tier.
+  return selected === 'fast' || selected === 'priority' ? 'fast' : DEFAULT_PROJECT_SERVICE_TIER;
+}
+
+function withFallbackModelOptions(options: SelectOption[] | undefined): SelectOption[] {
+  const merged = new Map<string, SelectOption>();
+  for (const option of [...(options ?? []), ...FALLBACK_MODEL_OPTIONS]) {
+    if (!merged.has(option.value)) merged.set(option.value, option);
+  }
+  return [...merged.values()];
 }
 
 /**
@@ -557,7 +577,7 @@ export function buildNewProjectFormCard(
   } = {},
 ): CardObject {
   const elements = [];
-  const modelOptions = opts.modelOptions?.length ? opts.modelOptions : FALLBACK_MODEL_OPTIONS;
+  const modelOptions = withFallbackModelOptions(opts.modelOptions);
   const defaultModel = initialProjectModel(modelOptions, opts.defaultModel);
   const defaultEffort = initialProjectEffort(opts.defaultEffort);
   const defaultServiceTier = initialProjectServiceTier(opts.defaultServiceTier);
@@ -573,6 +593,7 @@ export function buildNewProjectFormCard(
         placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
         value: opts.cloudDocFolder,
       }),
+      note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
       md('**默认模型选择**'),
       selectMenu({
         name: 'default_model',
@@ -592,7 +613,6 @@ export function buildNewProjectFormCard(
         options: PROJECT_SERVICE_TIER_OPTIONS,
         initial: defaultServiceTier,
       }),
-      note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
       note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话和工作区（发起人/管理员可驱动）；💬 单会话群 = 整群一个会话、连续上下文。'),
       actions([
         submitButton('👥 创建·多话题群', { a: DM.newProjectSubmit, kind: 'multi' }, 'primary', 'submit_multi'),
@@ -625,7 +645,7 @@ export function buildJoinGroupFormCard(
   },
 ): CardObject {
   const elements: CardElement[] = [];
-  const modelOptions = opts.modelOptions?.length ? opts.modelOptions : FALLBACK_MODEL_OPTIONS;
+  const modelOptions = withFallbackModelOptions(opts.modelOptions);
   const defaultModel = initialProjectModel(modelOptions, opts.defaultModel);
   const defaultEffort = initialProjectEffort(opts.defaultEffort);
   const defaultServiceTier = initialProjectServiceTier(opts.defaultServiceTier);
@@ -642,6 +662,7 @@ export function buildJoinGroupFormCard(
         placeholder: 'https://xxx.feishu.cn/drive/folder/fldcnxxxx 或 fldcnxxxx',
         value: opts.cloudDocFolder,
       }),
+      note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
       md('**默认模型选择**'),
       selectMenu({
         name: 'default_model',
@@ -661,7 +682,6 @@ export function buildJoinGroupFormCard(
         options: PROJECT_SERVICE_TIER_OPTIONS,
         initial: defaultServiceTier,
       }),
-      note('该父文件夹只会配置管理员/机器人权限；多话题群会为每个话题自动创建子文件夹，并只授权话题发起人和管理员。'),
       note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话和工作区（发起人/管理员可驱动）；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
       actions([
         submitButton('👥 绑定·多话题群', { a: DM.joinGroupSubmit, kind: 'multi', chatId: opts.chatId }, 'primary', 'submit_multi'),
@@ -704,6 +724,7 @@ export function buildNewProjectDoneCard(p: Project): CardObject {
 export function buildProjectListCard(
   projects: Project[],
   sessionsByChat: Map<string, SessionRecord[]> = new Map(),
+  page = 0,
 ): CardObject {
   if (projects.length === 0) {
     return card(
@@ -712,7 +733,9 @@ export function buildProjectListCard(
     );
   }
   const elements: CardObject[] = [];
-  const visibleProjects = projects.slice(0, MAX_PROJECT_LIST_ITEMS);
+  const pageCount = Math.max(1, Math.ceil(projects.length / PROJECT_LIST_PAGE_SIZE));
+  const currentPage = Math.min(Math.max(0, page), pageCount - 1);
+  const visibleProjects = projects.slice(currentPage * PROJECT_LIST_PAGE_SIZE, (currentPage + 1) * PROJECT_LIST_PAGE_SIZE);
   for (const p of visibleProjects) {
     const sessions = (p.chatId ? sessionsByChat.get(p.chatId) : undefined) ?? [];
     const latest = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0];
@@ -743,14 +766,13 @@ export function buildProjectListCard(
     elements.push(actions(row));
   }
   elements.push(hr());
-  const hidden = projects.length - visibleProjects.length;
-  elements.push(
-    note(
-      hidden > 0
-        ? `共 ${projects.length} 个项目；为避免飞书卡片超限，本卡显示前 ${visibleProjects.length} 个。`
-        : `共 ${projects.length} 个项目`,
-    ),
-  );
+  elements.push(note(`共 ${projects.length} 个项目 · 第 ${currentPage + 1}/${pageCount} 页`));
+  if (pageCount > 1) {
+    const pager: CardObject[] = [];
+    if (currentPage > 0) pager.push(button('⬅️ 上一页', { a: DM.projectsPage, p: currentPage - 1 }));
+    if (currentPage < pageCount - 1) pager.push(button('下一页 ➡️', { a: DM.projectsPage, p: currentPage + 1 }));
+    elements.push(actions(pager));
+  }
   elements.push(actions([button('⬅️ 菜单', { a: DM.menu })]));
   return card(elements, { header: { title: '📁 项目列表', template: 'wathet' } });
 }

@@ -56,6 +56,15 @@ describe('pickBridgeDefaults', () => {
     });
   });
 
+  it('maps the legacy fast selection to a current model priority tier', () => {
+    const defaults = pickBridgeDefaults(
+      [model('gpt-5.6-sol', { serviceTiers: [{ id: 'priority', name: 'Fast', description: '' }] })],
+      { defaultModel: 'gpt-5.6-sol', defaultServiceTier: 'fast' },
+    );
+
+    expect(defaults.serviceTier).toBe('priority');
+  });
+
   it('falls back to the selected model default effort if the project effort is unsupported', () => {
     const defaults = pickBridgeDefaults(
       [model('gpt-5.5'), model('gpt-6', { supportedEfforts: ['high'], defaultEffort: 'high' })],

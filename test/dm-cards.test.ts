@@ -15,18 +15,19 @@ function project(i: number): Project {
 }
 
 describe('DM project list card', () => {
-  it('caps visible projects to avoid Feishu CardKit element limits', () => {
-    const card = buildProjectListCard(
-      Array.from({ length: 25 }, (_, i) => project(i + 1)),
-      new Map(),
-    );
-    const json = JSON.stringify(card);
+  it('paginates projects instead of hiding those beyond the card element limit', () => {
+    const projects = Array.from({ length: 25 }, (_, i) => project(i + 1));
+    const firstJson = JSON.stringify(buildProjectListCard(projects, new Map()));
+    const lastJson = JSON.stringify(buildProjectListCard(projects, new Map(), 3));
 
-    expect(json).toContain('项目 1');
-    expect(json).toContain('项目 20');
-    expect(json).not.toContain('项目 21');
-    expect(json).toContain('共 25 个项目');
-    expect(json).toContain('本卡显示前 20 个');
+    expect(firstJson).toContain('项目 1');
+    expect(firstJson).toContain('项目 8');
+    expect(firstJson).not.toContain('项目 9');
+    expect(firstJson).toContain('共 25 个项目 · 第 1/4 页');
+    expect(firstJson).toContain('下一页');
+    expect(lastJson).toContain('项目 25');
+    expect(lastJson).toContain('共 25 个项目 · 第 4/4 页');
+    expect(lastJson).toContain('上一页');
   });
 });
 
@@ -62,5 +63,8 @@ describe('DM new project card', () => {
     expect(json.indexOf('"name":"cloud_doc_folder"')).toBeLessThan(json.indexOf('"name":"default_model"'));
     expect(json.indexOf('默认模型选择')).toBeGreaterThan(json.indexOf('"name":"cloud_doc_folder"'));
     expect(json.indexOf('默认模型选择')).toBeLessThan(json.indexOf('"name":"default_model"'));
+    expect(json).toContain('GPT-5.6-Sol');
+    expect(json).toContain('推理：最高');
+    expect(json).toContain('推理：极高');
   });
 });

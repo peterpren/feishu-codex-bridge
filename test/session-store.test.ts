@@ -11,7 +11,7 @@ vi.mock('../src/config/paths', async () => {
   return { paths: { sessionsFile: join(dir, 'sessions.json') } };
 });
 
-import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from '../src/bot/session-store';
+import { getSession, listSessions, patchSession, removeSession, upsertSession, type SessionRecord } from '../src/bot/session-store';
 import { paths } from '../src/config/paths';
 
 afterAll(() => {
@@ -68,5 +68,14 @@ describe('session-store', () => {
     expect(got?.effort).toBeUndefined();
     await patchSession('nope', { model: 'x' });
     expect(await listSessions()).toHaveLength(1);
+  });
+
+  it('removes only the requested Bridge session mapping', async () => {
+    await upsertSession(rec('t1', 'cx1'));
+    await upsertSession(rec('t2', 'cx2'));
+    await removeSession('t1');
+
+    expect(await getSession('t1')).toBeUndefined();
+    expect((await getSession('t2'))?.codexThreadId).toBe('cx2');
   });
 });

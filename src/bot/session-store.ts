@@ -115,3 +115,15 @@ export async function patchSession(
     await write(sessions);
   });
 }
+
+/** Remove the Bridge mapping for one session without touching its Codex thread,
+ * local files, cloud documents, or Feishu message history. The next message
+ * starts a fresh Codex thread for the same group/topic. */
+export async function removeSession(threadId: string): Promise<void> {
+  return withLock(async () => {
+    const sessions = await read();
+    const next = sessions.filter((session) => session.threadId !== threadId);
+    if (next.length === sessions.length) return;
+    await write(next);
+  });
+}

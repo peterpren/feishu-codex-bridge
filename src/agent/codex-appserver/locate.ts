@@ -10,7 +10,7 @@ const IS_WIN = process.platform === 'win32';
  *   1. $CODEX_BIN (explicit override)
  *   2. PATH (`codex`, via `where`/`which`)
  *   3. bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
- *   4. macOS Codex.app bundled binary
+ *   4. macOS Codex.app / ChatGPT.app bundled binary
  * Returns null if none found.
  *
  * On Windows an npm-installed bin is a `codex.cmd`/`codex.exe` shim, never a
@@ -27,8 +27,17 @@ export function resolveCodexBin(): string | null {
     if (existsSync(cand)) return cand;
   }
 
-  const appBundle = '/Applications/Codex.app/Contents/Resources/codex';
-  if (process.platform === 'darwin' && existsSync(appBundle)) return appBundle;
+  if (process.platform === 'darwin') {
+    // Current ChatGPT desktop releases bundle the Codex CLI here. Older
+    // releases used a separate Codex.app, so probe both without relying on a
+    // launchd PATH that may not contain either app bundle.
+    for (const appBundle of [
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+      '/Applications/Codex.app/Contents/Resources/codex',
+    ]) {
+      if (existsSync(appBundle)) return appBundle;
+    }
+  }
 
   return null;
 }

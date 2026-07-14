@@ -47,6 +47,11 @@ import {
   buildContextCard,
 } from '../card/context-gauge';
 import { buildCleanCard, extractCardFences } from '../card/markdown-render';
+import {
+  buildCompletionReminderContent,
+  shouldSendCompletionReminder,
+  type CompletionReminderOutcome,
+} from '../card/completion-reminder';
 import { imageSources, uploadOutboundImages } from '../card/outbound-images';
 import { log, withTrace } from '../core/logger';
 import {
@@ -127,7 +132,7 @@ import {
   renameTopicCloudDocFolder,
 } from '../project/cloud-doc-permission';
 import { leaveChat, renameChat, transferOwnership } from '../project/group-ops';
-import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
+import { getSession, listSessions, patchSession, removeSession, upsertSession, type SessionRecord } from './session-store';
 import {
   appendRunRecord,
   finishedRunRecord,
@@ -378,6 +383,8 @@ export function createOrchestrator(
   const sema = new Semaphore(getMaxConcurrentRuns(cfg));
   const idleMs = getRunIdleTimeoutMs(cfg) ?? 0;
   const seenInbound = new RecentIdCache();
+  /** Terminal card ids already used for a native Feishu @ completion notice. */
+  const completionReminderSent = new RecentIdCache(4096, 24 * 60 * 60_000);
   // pendingPolicy is read per-message (settings card can change it live)
   /** pending /resume cards, keyed by the card's messageId */
   const resumePending = new Map<string, ResumeCardState>();
@@ -419,11 +426,13 @@ export function createOrchestrator(
   }
 
   function projectDefaultEffort(value: unknown): ReasoningEffort | undefined {
-    return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' ? value : undefined;
+    return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max' || value === 'ultra'
+      ? value
+      : undefined;
   }
 
   function projectDefaultServiceTier(value: unknown): ServiceTier | undefined {
-    return value === 'fast' || value === 'standard' ? value : undefined;
+    return value === 'fast' || value === 'priority' || value === 'standard' ? value : undefined;
   }
 
   async function newProjectForm(opts: Parameters<typeof buildNewProjectFormCard>[0] = {}): Promise<object> {
@@ -730,6 +739,10 @@ export function createOrchestrator(
         await runCompact(msg, ts.sessionKey, false, ts);
         return;
       }
+      if (cmd === 'clear') {
+        await clearSingleSession(msg, ts, project);
+        return;
+      }
       if (cmd === 'rename') {
         if (project.private) {
           await renamePrivateProject(msg, text, project);
@@ -788,6 +801,12 @@ export function createOrchestrator(
         await runCompact(msg, ts.sessionKey, true, ts);
         return;
       }
+      if (cmd === 'clear') {
+        await channel
+          .send(msg.chatId, { markdown: '`/clear` 只适用于私密协作群或单会话群。' }, { replyTo: msg.messageId, replyInThread: true })
+          .catch(() => undefined);
+        return;
+      }
       if (cmd === 'rename') {
         await renameTopic(msg, text);
         return;
@@ -825,6 +844,12 @@ export function createOrchestrator(
       startPrivateGroup(msg, text, project);
       return;
     }
+    if (cmd === 'clear') {
+      await channel
+        .send(msg.chatId, { markdown: '`/clear` 只适用于私密协作群或单会话群，不能在多话题群主群区使用。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
     if (cmd === 'model' || cmd === 'context' || cmd === 'compact') {
       await channel
         .send(msg.chatId, { markdown: `\`/${cmd}\` 需要在话题里使用（先 @我 开个话题）。` }, { replyTo: msg.messageId })
@@ -850,6 +875,7 @@ export function createOrchestrator(
     | 'private'
     | 'context'
     | 'compact'
+    | 'clear'
     | 'connect'
     | 'me'
     | null {
@@ -863,6 +889,7 @@ export function createOrchestrator(
       name === 'private' ||
       name === 'context' ||
       name === 'compact' ||
+      name === 'clear' ||
       name === 'connect' ||
       name === 'me'
       ? name
@@ -874,7 +901,7 @@ export function createOrchestrator(
   }
 
   /** Whether to respond to a non-@ message in a project group.
-   * Slash commands (/help /resume /settings /model /rename /private) respond without @
+   * Slash commands (/help /resume /settings /model /rename /private /clear) respond without @
    * because they're explicit. File messages inside an existing topic also
    * respond without @: Feishu file cards cannot @ the bot, and the topic actor
    * gate below still limits this to the topic owner/admin.
@@ -1946,6 +1973,50 @@ export function createOrchestrator(
     }
   }
 
+  /** Clear the current private/single-session mapping. This preserves Feishu
+   * history, local project files, cloud documents, and the underlying Codex
+   * history; the next user message simply begins a fresh Bridge session. */
+  async function clearSingleSession(
+    msg: NormalizedMessage,
+    turn: { sessionKey: string } & TurnPerm,
+    project: Project,
+  ): Promise<void> {
+    if (!(await canManageProjectSettings(project, msg.senderId))) {
+      const reason = project.private ? '仅私密群发起人或管理员可用。' : '仅 bot 管理员可用。';
+      await channel.send(msg.chatId, { markdown: `⚠️ \`/clear\` ${reason}` }, { replyTo: msg.messageId }).catch(() => undefined);
+      return;
+    }
+
+    // Private groups created by older releases persist their first turn at the
+    // bare chatId, while later turns may be admin/guest namespaced. Do not let
+    // /clear detach a still-running first turn.
+    const keys = new Set([turn.sessionKey, ...(project.private ? [project.chatId] : [])]);
+    if ([...keys].some((key) => active.has(key))) {
+      await channel.send(msg.chatId, { markdown: '⏳ 当前任务还在执行，结束或终止后再 `/clear`。' }, { replyTo: msg.messageId }).catch(() => undefined);
+      return;
+    }
+
+    let cleared = false;
+    for (const key of keys) {
+      const live = sessions.get(key);
+      if (live) {
+        sessions.delete(key);
+        void live.close().catch(() => undefined);
+        cleared = true;
+      }
+      if (await getSession(key)) {
+        await removeSession(key);
+        cleared = true;
+      }
+      lastUsage.delete(key);
+    }
+    const markdown = cleared
+      ? '✅ 已清空当前 Codex 上下文。飞书聊天记录、本地项目文件和飞书云文档均保留；下一条消息会开启新的会话。'
+      : '✅ 当前没有可清空的会话。下一条消息会开启新的 Codex 会话。';
+    await channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId }).catch(() => undefined);
+    log.info('intake', 'single-clear', { chatId: project.chatId, private: Boolean(project.private), cleared });
+  }
+
   async function renameTopic(msg: NormalizedMessage, text: string): Promise<void> {
     const threadId = msg.threadId;
     if (!threadId) return;
@@ -2196,9 +2267,9 @@ export function createOrchestrator(
         if (m && m.supportedEfforts.length && !m.supportedEfforts.includes(state.effort)) {
           state.effort = m.defaultEffort;
         }
-        if (state.serviceTier !== 'fast') {
-          state.serviceTier = 'standard';
-        }
+        const supportedTiers = new Set(m?.serviceTiers.map((tier) => tier.id) ?? []);
+        if (state.serviceTier === 'fast' && supportedTiers.has('priority')) state.serviceTier = 'priority';
+        else if (state.serviceTier !== 'standard' && !supportedTiers.has(state.serviceTier ?? '')) state.serviceTier = 'standard';
         await patchSession(state.threadId, { model: state.model, effort: state.effort, serviceTier: state.serviceTier });
         state.note = `✅ 已切换模型「${m?.displayName ?? option}」，下一轮生效`;
         return buildModelCard(state);
@@ -2208,7 +2279,10 @@ export function createOrchestrator(
       const state = authPending(modelPending, evt);
       if (!state || !option) return;
       settleUpdate(evt.messageId, async () => {
-        state.effort = option as ReasoningEffort;
+        const model = state.models.find((entry) => entry.id === state.model);
+        if (!model?.supportedEfforts.length || model.supportedEfforts.includes(option as ReasoningEffort)) {
+          state.effort = option as ReasoningEffort;
+        }
         await patchSession(state.threadId, { effort: state.effort });
         state.note = '✅ 已设置推理，下一轮生效';
         return buildModelCard(state);
@@ -2218,6 +2292,9 @@ export function createOrchestrator(
       const state = authPending(modelPending, evt);
       if (!state || !option) return;
       settleUpdate(evt.messageId, async () => {
+        const model = state.models.find((entry) => entry.id === state.model);
+        const allowed = option === 'standard' || Boolean(model?.serviceTiers.some((tier) => tier.id === option));
+        if (!allowed) return buildModelCard(state);
         state.serviceTier = option;
         await patchSession(state.threadId, { serviceTier: state.serviceTier });
         state.note = '✅ 已设置速度，下一轮生效';
@@ -2474,7 +2551,7 @@ export function createOrchestrator(
 
   // Build the project list card with each project's topics (sessions) grouped
   // by chatId, most-recent first — shared by the list/cancel/delete handlers.
-  const renderProjectList = async (): Promise<object> => {
+  const renderProjectList = async (page = 0): Promise<object> => {
     const [projects, sessions] = await Promise.all([listProjects(), listSessions()]);
     const byChat = new Map<string, SessionRecord[]>();
     for (const s of sessions) {
@@ -2482,7 +2559,7 @@ export function createOrchestrator(
       if (arr) arr.push(s);
       else byChat.set(s.chatId, [s]);
     }
-    return buildProjectListCard(projects, byChat);
+    return buildProjectListCard(projects, byChat, page);
   };
 
   type ProjectSettingsInput = Parameters<typeof buildProjectSettingsCard>[0];
@@ -2610,6 +2687,11 @@ export function createOrchestrator(
           log.fail('console', e, { phase: 'projects-list' });
         }
       })();
+    })
+    .on(DM.projectsPage, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const page = Number(value.p);
+      patch(evt, () => renderProjectList(Number.isInteger(page) && page >= 0 ? page : 0));
     })
     .on(DM.settings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt, buildSettingsCard(cfg));
@@ -3134,6 +3216,38 @@ export function createOrchestrator(
   }
 
   // ── shared run loop ───────────────────────────────────────────────
+  async function sendTaskCompletionReminder(input: {
+    cardMessageId: string;
+    requesterOpenId?: string;
+    outcome: CompletionReminderOutcome;
+    startedAt: number;
+    summary?: string;
+    replyInThread: boolean;
+  }): Promise<void> {
+    if (!input.requesterOpenId) return;
+    const elapsedMs = Math.max(0, Date.now() - input.startedAt);
+    if (!shouldSendCompletionReminder(input.outcome, elapsedMs)) return;
+    if (completionReminderSent.seen(input.cardMessageId)) return;
+    try {
+      await channel.rawClient.im.v1.message.reply({
+        path: { message_id: input.cardMessageId },
+        data: {
+          msg_type: 'post',
+          content: buildCompletionReminderContent({
+            requesterOpenId: input.requesterOpenId,
+            outcome: input.outcome,
+            elapsedMs,
+            summary: input.summary,
+          }),
+          reply_in_thread: input.replyInThread,
+        },
+      });
+      log.info('card', 'completion-reminder', { outcome: input.outcome, elapsedMs });
+    } catch (err) {
+      log.fail('card', err, { phase: 'completion-reminder', outcome: input.outcome });
+    }
+  }
+
   interface LaunchOpts {
     chatId: string;
     replyTo: string;
@@ -3506,7 +3620,18 @@ export function createOrchestrator(
           currentRun.events = evCount;
           currentRun.textChars = textChars;
         }
-        await finishCurrentRun(render.terminal());
+        const terminal = render.terminal();
+        await finishCurrentRun(terminal);
+        if (terminal === 'done' || terminal === 'error' || terminal === 'idle_timeout') {
+          await sendTaskCompletionReminder({
+            cardMessageId: finalMsgId,
+            requesterOpenId: opts.requesterOpenId ?? opts.topicRequesterOpenId,
+            outcome: terminal,
+            startedAt: tStart,
+            summary: opts.summary ?? opts.firstText,
+            replyInThread: !opts.flat,
+          });
+        }
         currentRun = undefined;
         state.restartNotice = undefined;
 

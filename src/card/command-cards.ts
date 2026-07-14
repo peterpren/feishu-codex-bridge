@@ -21,17 +21,36 @@ const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   medium: '中',
   high: '高',
   xhigh: '超高',
+  max: '最高',
+  ultra: '极高',
 };
-
-const DEFAULT_SERVICE_TIERS: ServiceTierInfo[] = [
-  { id: 'standard', name: '标准', description: '' },
-  { id: 'fast', name: '快速', description: '' },
-];
 
 function serviceTierLabel(tier: ServiceTierInfo): string {
   if (tier.id === 'standard') return '标准';
-  if (tier.id === 'fast') return '快速';
+  // Codex 0.144+ calls its paid fast tier "priority". Keep the Feishu UI
+  // aligned with Codex's Chinese client while passing through the real id.
+  if (tier.id === 'fast' || tier.id === 'priority') return '快速';
   return tier.name || tier.id;
+}
+
+function serviceTierOptions(model: ModelInfo | undefined): ServiceTierInfo[] {
+  const tiers = model?.serviceTiers ?? [];
+  const seen = new Set<string>();
+  const out: ServiceTierInfo[] = [];
+  for (const tier of [{ id: 'standard', name: '标准', description: '' }, ...tiers]) {
+    if (seen.has(tier.id)) continue;
+    seen.add(tier.id);
+    out.push(tier);
+  }
+  return out;
+}
+
+function initialServiceTier(value: ServiceTier | undefined, tiers: ServiceTierInfo[]): ServiceTier {
+  if (value && tiers.some((tier) => tier.id === value)) return value;
+  // Old Bridge sessions stored "fast". New Codex model/list returns
+  // "priority" for the same user-facing speed option.
+  if (value === 'fast' && tiers.some((tier) => tier.id === 'priority')) return 'priority';
+  return 'standard';
 }
 
 // ── /model ────────────────────────────────────────────────────────────────
@@ -56,7 +75,8 @@ export function buildModelCard(state: ModelCardState): CardObject {
   const visible = state.models.filter((m) => !m.hidden);
   const cur = state.models.find((m) => m.id === state.model);
   const efforts = cur?.supportedEfforts.length ? cur.supportedEfforts : (['low', 'medium', 'high'] as ReasoningEffort[]);
-  const serviceTier: ServiceTier = state.serviceTier === 'fast' ? 'fast' : 'standard';
+  const serviceTiers = serviceTierOptions(cur);
+  const serviceTier = initialServiceTier(state.serviceTier, serviceTiers);
   const elements = [
     md('🧠 **模型 / 推理 / 速度**'),
     note('选择后下一轮生效'),
@@ -78,7 +98,7 @@ export function buildModelCard(state: ModelCardState): CardObject {
         actionId: MC.speed,
         placeholder: '速度',
         initial: serviceTier,
-        options: DEFAULT_SERVICE_TIERS.map((tier) => ({ label: `速度：${serviceTierLabel(tier)}`, value: tier.id })),
+        options: serviceTiers.map((tier) => ({ label: `速度：${serviceTierLabel(tier)}`, value: tier.id })),
       }),
     ]),
   ];
@@ -218,7 +238,7 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
       '· `/context` → 查看上下文用量',
       '· `/compact` → 压缩上下文',
     ];
-    if (isAdmin) lines.push('· `/settings` → 群设置（免@ 开关）');
+    if (isAdmin) lines.push('· `/clear` → 清空当前 Codex 上下文', '· `/settings` → 群设置（免@ 开关）');
     lines.push('· `/help` → 这张速查卡');
     elements.push(md('💬 **单会话群** — 整群就是一个会话，上下文连续。'), hr(), md(lines.join('\n')));
   } else if (scope === 'private') {
@@ -232,7 +252,7 @@ export function buildHelpCard(scope: HelpScope, noMention?: boolean, isAdmin = f
       '· `/context` → 查看上下文用量',
       '· `/compact` → 压缩上下文',
     ];
-    if (isAdmin) lines.push('· `/settings` → 群设置（免@ 开关）');
+    if (isAdmin) lines.push('· `/clear` → 清空当前 Codex 上下文', '· `/settings` → 群设置（免@ 开关）');
     lines.push('· `/help` → 这张速查卡');
     elements.push(md('🔒 **私密协作群** — 独立会话，只在本群内继续。'), hr(), md(lines.join('\n')));
   } else if (scope === 'topic') {
